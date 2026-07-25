@@ -154,3 +154,19 @@ session tokens, hostile headers and paths, redirect handling, response
 reflection, exact endpoint allowlists, concurrent budgets, and the canary-only
 CLI demo. Keychain tests are deliberately manual because they require native
 user interaction and modify persistent user state.
+
+### Opt-in live OpenAI smoke test
+
+After storing a real key, run one small Responses API request through the
+hardened proxy:
+
+```bash
+scripts/test-openai-live.sh
+```
+
+This test requires native authorization, consumes API quota, and is never run
+in CI. It succeeds only when the model returns `MITHRIL_OK`. An
+`insufficient_quota` response exits with status 2: it confirms that Mithril
+reached OpenAI with an authenticated request, but not that model generation
+succeeded. Override the defaults with `MTL_TEST_MODEL`, `MTL_BIN`, or
+`MTL_CONFIG`.
