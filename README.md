@@ -112,6 +112,9 @@ secrets:
     connector: openai        # upstream cablato: api.openai.com
   - name: ANTHROPIC_API_KEY
     connector: anthropic
+
+budget:                      # opzionale, assente per default
+  max_requests: 500
 ```
 
 **Sorgente dei valori in v0:** un `.env` non committato, indicato al lancio.
@@ -123,6 +126,17 @@ capshell run --env .env -- codex
 Qualunque variabile presente nel `.env` e non dichiarata in `capshell.yaml`
 viene passata al figlio **invariata**. Capshell non indovina: tocca solo ciò che
 gli dici di toccare.
+
+### Il limite di consumo è opzionale
+
+Senza il blocco `budget`, Capshell impedisce che la chiave venga **rubata**, non
+che venga **usata**: l'agente può chiamare l'endpoint dichiarato finché la
+sessione vive. È comunque una differenza reale — una chiave esfiltrata è per
+sempre, un accesso brokerato muore con la sessione — ma va detta.
+
+Con `max_requests`, la richiesta N+1 viene rifiutata localmente. Il contatore si
+incrementa **prima** dell'inoltro: con richieste concorrenti, contare dopo lascia
+passare più di N.
 
 ---
 
@@ -153,10 +167,10 @@ automaticamente quando lo avvii. Accessibili solo all'utente umano.
 > il segreto non è in nessun file e il mascheramento diventa inutile: il keyring
 > **toglie** codice al progetto invece di aggiungerne.
 
-**M2 — controllo del consumo.** Contatore di richieste e byte per sessione,
-fail-closed. Senza questo Capshell impedisce che la chiave venga *rubata*, non
-che venga *usata*: la distinzione è reale (una chiave esfiltrata è per sempre,
-un accesso brokerato muore con la sessione) ma va detta, non nascosta.
+**M2 — controllo del consumo, oltre il contatore.** Il cap sulle richieste c'è
+già in v0. Restano da fare i byte inviati upstream e il costo per-token
+provider-specific: il numero di chiamate è un proxy debole per la spesa, 500
+richieste con contesto pieno valgono centinaia di dollari.
 
 **M3 — copertura e hardening.** Connector protocol-aware (AWS SigV4, client
 senza override del base URL come Stripe). Scansione pre-flight dei segreti
@@ -172,7 +186,7 @@ già dichiarate.
 ## Cosa resta possibile a un agente malevolo
 
 - **Usare** la chiave attraverso il proxy, verso l'endpoint dichiarato, finché
-  la sessione vive (fino a M2).
+  la sessione vive — senza limite, se non configuri `budget`.
 - **Esfiltrare** codice e dati codificandoli in un prompt. Non arginabile.
 - **Modificare o distruggere** i file su cui lavora. Usa git.
 - **Leggere altre credenziali** presenti sulla macchina, se non lo isoli.
