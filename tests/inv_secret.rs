@@ -1,121 +1,147 @@
-use capshell::config::Config;
-use capshell::{child_command, prepare, secret};
+use mithril::config::{connector, Config};
+use mithril::{child_command, prepare, secret};
 
-const KEY: &str = "sk-CANARY-CHIAVE-VERA-0123456789";
-
-const YAML: &str = r#"
-secrets:
-  - name: OPENAI_API_KEY
-    connector: openai
-  - name: ANTHROPIC_API_KEY
-    connector: anthropic
-"#;
+const KEY: &str = "sk-CANARY-REAL-KEY-0123456789";
+const YAML: &str = "connectors:\n  - openai\n  - anthropic\n";
 
 fn overrides() -> Vec<(String, String)> {
-    let cfg = Config::parse(YAML).unwrap();
-    prepare(&cfg, |_| Ok(KEY.to_string()))
+    let config = Config::parse(YAML).unwrap();
+    prepare(&config, |_| Ok(KEY.to_string()))
         .unwrap()
-        .env_overrides(41234)
+        .env_overrides(41234, "SESSIONTOKEN")
 }
 
-fn value(vars: &[(String, String)], name: &str) -> String {
-    vars.iter()
-        .find(|(k, _)| k == name)
-        .map(|(_, v)| v.clone())
+fn value<'a>(variables: &'a [(String, String)], name: &str) -> &'a str {
+    variables
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
         .unwrap_or_default()
 }
 
 #[test]
-fn l_agente_riceve_un_mock_non_il_valore_reale() {
-    let vars = overrides();
-
-    let openai = value(&vars, "OPENAI_API_KEY");
-    assert_ne!(openai, KEY);
-    assert!(
-        openai.starts_with("sk-"),
-        "il mock deve avere il formato del provider: {openai}"
-    );
-    assert!(value(&vars, "ANTHROPIC_API_KEY").starts_with("sk-ant-"));
-    assert!(vars.iter().all(|(_, v)| v != KEY));
+fn child_receives_provider_shaped_mocks_not_real_values() {
+    let variables = overrides();
+    assert!(value(&variables, "OPENAI_API_KEY").starts_with("sk-mtl"));
+    assert!(value(&variables, "ANTHROPIC_API_KEY").starts_with("sk-ant-mtl"));
+    assert!(variables.iter().all(|(_, value)| value != KEY));
 }
 
 #[test]
-fn i_base_url_puntano_al_proxy_con_tutti_gli_alias() {
-    let vars = overrides();
-
-    for var in ["OPENAI_BASE_URL", "OPENAI_API_BASE"] {
-        assert_eq!(value(&vars, var), "http://127.0.0.1:41234/openai", "{var}");
-    }
-    for var in ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL"] {
+fn base_urls_include_session_token_and_sdk_specific_prefix() {
+    let variables = overrides();
+    for name in ["OPENAI_BASE_URL", "OPENAI_API_BASE"] {
         assert_eq!(
-            value(&vars, var),
-            "http://127.0.0.1:41234/anthropic",
-            "{var}"
+            value(&variables, name),
+            "http://127.0.0.1:41234/SESSIONTOKEN/openai/v1"
+        );
+    }
+    for name in ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL"] {
+        assert_eq!(
+            value(&variables, name),
+            "http://127.0.0.1:41234/SESSIONTOKEN/anthropic"
         );
     }
 }
 
 #[test]
-fn due_segreti_sullo_stesso_connector_falliscono() {
-    let cfg = Config::parse(
-        "secrets:\n  - name: A\n    connector: openai\n  - name: B\n    connector: openai\n",
-    )
-    .unwrap();
-    assert!(prepare(&cfg, |_| Ok(KEY.to_string())).is_err());
+fn child_command_removes_all_ambient_supported_credentials() {
+    let config = Config::parse("connectors: [openai]\n").unwrap();
+    let variables = prepare(&config, |_| Ok(KEY.to_string()))
+        .unwrap()
+        .env_overrides(41234, "TOKEN");
+    let command = child_command("unused", &[], &variables);
+    let configured: Vec<_> = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+
+    assert!(configured.iter().any(|(key, value)| {
+        key == "OPENAI_API_KEY"
+            && value
+                .as_deref()
+                .is_some_and(|value| value.starts_with("sk-mtl"))
+    }));
+    assert!(configured
+        .iter()
+        .any(|(key, value)| key == "ANTHROPIC_API_KEY" && value.is_none()));
+    assert!(configured
+        .iter()
+        .any(|(key, value)| key == "DBUS_SESSION_BUS_ADDRESS" && value.is_none()));
 }
 
 #[test]
-fn il_processo_figlio_non_vede_il_canary() {
-    // Il caso peggiore: la chiave vera e' gia' esportata nel processo padre.
-    std::env::set_var("OPENAI_API_KEY", KEY);
-    std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus");
+fn workspace_config_cannot_define_secret_identity_or_upstream() {
+    for invalid in [
+        "connectors: [openai]\nupstream: http://evil.example\n",
+        "secrets:\n  - name: OPENAI_API_KEY\n    connector: openai\n",
+        "connectors: [openai, openai]\n",
+        "connectors: [unknown]\n",
+        "connectors: []\n",
+    ] {
+        assert!(Config::parse(invalid).is_err(), "accepted: {invalid}");
+    }
 
-    let out = child_command("/bin/sh", &["-c".into(), "env".into()], &overrides())
-        .output()
-        .expect("sh");
-    let env = String::from_utf8_lossy(&out.stdout);
-
-    std::env::remove_var("OPENAI_API_KEY");
-    std::env::remove_var("DBUS_SESSION_BUS_ADDRESS");
-
-    assert!(
-        !env.contains(KEY),
-        "il canary e' finito nell'environment del figlio"
-    );
-    assert!(env.contains("OPENAI_API_KEY=sk-"), "il mock deve esserci");
-    assert!(
-        !env.contains("DBUS_SESSION_BUS_ADDRESS"),
-        "il canale verso il portachiavi va tolto"
-    );
+    let openai = connector("openai").unwrap();
+    assert_eq!(openai.secret_env, "OPENAI_API_KEY");
+    assert_eq!(openai.upstream, "https://api.openai.com");
 }
 
 #[test]
-fn il_env_file_viene_riscritto_con_i_placeholder() {
-    let raw = "# commento\nOPENAI_API_KEY=sk-vera-123\nexport OTHER=\"resta\"\nPORT=8080\n";
+fn env_migration_rewrites_only_compiled_connector_variables() {
+    let raw = "# comment\nOPENAI_API_KEY=sk-real-123\nexport OTHER=\"stays\"\nPORT=8080\n";
     let parsed = secret::parse_env_file(raw);
-
     assert_eq!(
         parsed
             .iter()
-            .find(|(k, _)| k == "OPENAI_API_KEY")
+            .find(|(key, _)| key == "OPENAI_API_KEY")
             .unwrap()
             .1,
-        "sk-vera-123"
-    );
-    assert_eq!(
-        parsed.iter().find(|(k, _)| k == "OTHER").unwrap().1,
-        "resta"
+        "sk-real-123"
     );
 
-    let out = secret::rewrite_env_file(
+    let rewritten = secret::rewrite_env_file(
         raw,
-        &[("OPENAI_API_KEY".to_string(), "sk-capshellMOCK".to_string())],
+        &[("OPENAI_API_KEY".into(), "sk-mtl-placeholder".into())],
     );
-    assert!(!out.contains("sk-vera-123"));
-    assert!(out.contains("OPENAI_API_KEY=sk-capshellMOCK"));
-    assert!(
-        out.contains("export OTHER=\"resta\""),
-        "il resto del file non si tocca"
+    assert!(!rewritten.contains("sk-real-123"));
+    assert!(rewritten.contains("OPENAI_API_KEY=sk-mtl-placeholder"));
+    assert!(rewritten.contains("export OTHER=\"stays\""));
+    assert!(rewritten.ends_with('\n'));
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn atomic_migration_creates_no_plaintext_backup() {
+    let directory = std::env::temp_dir().join(format!(
+        "mithril-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("secrets.env");
+    std::fs::write(&path, "OPENAI_API_KEY=real\n").unwrap();
+    secret::atomic_rewrite(&path, "OPENAI_API_KEY=placeholder\n").unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "OPENAI_API_KEY=placeholder\n"
     );
-    assert!(out.contains("# commento"));
+    assert!(!directory.join("secrets.env.bak").exists());
+    assert!(std::fs::read_dir(&directory).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains("mtl-tmp")));
+
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(directory).unwrap();
 }

@@ -1,9 +1,15 @@
 [package]
-name = "capshell"
+name = "mithril"
 version = "0.0.1"
 edition = "2021"
-description = "L'agente non vede le tue chiavi API"
+rust-version = "1.82"
+description = "Local credential broker for tools and coding agents"
 license = "Apache-2.0"
+default-run = "mtl"
+
+[[bin]]
+name = "mtl"
+path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -12,12 +18,16 @@ tiny_http = "0.12"
 ureq = "2"
 rand = "0.8"
 rpassword = "7"
+base64 = "0.22"
 
-# Il portachiavi di sistema e' la sorgente di v0 su macOS e Windows.
-# Linux (Secret Service) e' M1: li' serve anche chiudere il canale D-Bus
-# verso il figlio, che senza namespace non e' una barriera.
-[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-keyring = { version = "3", features = ["apple-native", "windows-native"] }
+# Secure host mode starts on macOS. LocalAuthentication gates every operation;
+# the file-based Keychain ACL separately limits silent reads to the creator.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString"] }
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "block2", "LAContext"] }
+security-framework = "3"
 
 [profile.release]
 opt-level = "z"

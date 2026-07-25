@@ -2,81 +2,114 @@ pub mod config;
 pub mod proxy;
 pub mod secret;
 
-use config::{connector, Config};
+use config::{connector, Config, Connector, CONNECTORS};
 use proxy::Route;
 use std::collections::HashMap;
 use std::process::Command;
 
-/// Variabili che non passano al figlio. Su Linux `DBUS_SESSION_BUS_ADDRESS` e'
-/// la strada per il Secret Service: toglierla alza l'asticella, ma il socket
-/// resta indovinabile — la barriera vera arriva in M1 col mount namespace.
+/// Session-oracle variables are never inherited. Removing the D-Bus address is
+/// only defense in depth; secure automatic keyring mode is macOS-only in v0.
 pub const STRIP: &[&str] = &["DBUS_SESSION_BUS_ADDRESS"];
 
 pub struct Prepared {
     pub routes: HashMap<String, Route>,
-    /// (nome della variabile, valore finto) — quello che vede l'agente.
+    /// `(environment variable, fake value)` visible to the child.
     pub mocks: Vec<(String, String)>,
-    /// (nome della variabile, nome del connector) per i base URL.
-    pub base_urls: Vec<(String, String)>,
+    /// `(base URL variable, connector, client-specific suffix)`.
+    pub base_urls: Vec<(String, String, String)>,
 }
 
-/// Risolve i valori reali, genera i mock e costruisce le rotte del proxy.
-/// `source` e' l'unico punto in cui il valore vero entra nel processo.
-pub fn prepare(
+fn prepare_inner(
     cfg: &Config,
-    source: impl Fn(&str) -> Result<String, String>,
+    source: impl Fn(&Connector) -> Result<String, String>,
+    demo_upstream: Option<&str>,
 ) -> Result<Prepared, String> {
-    let mut p = Prepared {
+    let mut prepared = Prepared {
         routes: HashMap::new(),
         mocks: Vec::new(),
         base_urls: Vec::new(),
     };
-    for decl in &cfg.secrets {
-        let c = connector(&decl.connector).ok_or("connector sconosciuto")?;
-        if p.routes.contains_key(&decl.connector) {
-            return Err(format!("due segreti sul connector {}", decl.connector));
+
+    for name in &cfg.connectors {
+        let connector = connector(name).ok_or_else(|| format!("unknown connector: {name}"))?;
+        let key = source(connector)?;
+        if key.is_empty() {
+            return Err(format!("empty credential for connector {}", connector.id));
         }
-        p.routes.insert(
-            decl.connector.clone(),
+        prepared.routes.insert(
+            connector.id.to_string(),
             Route {
-                upstream: decl
-                    .upstream
-                    .clone()
-                    .unwrap_or_else(|| c.upstream.to_string()),
-                auth: c.auth,
-                key: source(&decl.name)?,
+                upstream: demo_upstream.unwrap_or(connector.upstream).to_string(),
+                auth: connector.auth,
+                key,
+                allowed: connector.allowed,
             },
         );
-        p.mocks
-            .push((decl.name.clone(), secret::mock(c.mock_prefix)));
-        for var in c.base_url_vars {
-            p.base_urls.push((var.to_string(), decl.connector.clone()));
+        prepared.mocks.push((
+            connector.secret_env.to_string(),
+            secret::mock(connector.mock_prefix),
+        ));
+        for var in connector.base_url_vars {
+            prepared.base_urls.push((
+                var.to_string(),
+                connector.id.to_string(),
+                connector.client_base_suffix.to_string(),
+            ));
         }
     }
-    Ok(p)
+    Ok(prepared)
+}
+
+/// Prepare a real session. The caller can supply a test source, but destination,
+/// authentication mode, secret identity, and route policy always come from the
+/// compiled connector table.
+pub fn prepare(
+    cfg: &Config,
+    source: impl Fn(&Connector) -> Result<String, String>,
+) -> Result<Prepared, String> {
+    prepare_inner(cfg, source, None)
+}
+
+/// Prepare a canary-only demonstration. This is the only path that can replace
+/// an upstream, and it cannot read the keyring.
+pub fn prepare_demo(cfg: &Config, upstream: &str) -> Result<Prepared, String> {
+    prepare_inner(
+        cfg,
+        |connector| Ok(secret::demo(connector.mock_prefix)),
+        Some(upstream),
+    )
 }
 
 impl Prepared {
-    pub fn env_overrides(&self, port: u16) -> Vec<(String, String)> {
+    pub fn env_overrides(&self, port: u16, token: &str) -> Vec<(String, String)> {
         let mut out = self.mocks.clone();
-        for (var, conn) in &self.base_urls {
-            out.push((var.clone(), format!("http://127.0.0.1:{port}/{conn}")));
+        for (var, connector, suffix) in &self.base_urls {
+            out.push((
+                var.clone(),
+                format!("http://127.0.0.1:{port}/{token}/{connector}{suffix}"),
+            ));
         }
         out
     }
 }
 
-/// Il figlio eredita l'environment corrente, meno le variabili di STRIP e con i
-/// mock al posto dei valori dichiarati. Tutto il resto passa invariato:
-/// Capshell tocca solo cio' che gli e' stato detto di toccare.
+/// The child inherits ordinary configuration, but never an ambient supported
+/// credential or stale provider base URL. Selected values are then replaced by
+/// the session-scoped mocks and local URLs.
 pub fn child_command(program: &str, args: &[String], overrides: &[(String, String)]) -> Command {
     let mut cmd = Command::new(program);
     cmd.args(args);
     for var in STRIP {
         cmd.env_remove(var);
     }
-    for (k, v) in overrides {
-        cmd.env(k, v);
+    for connector in CONNECTORS {
+        cmd.env_remove(connector.secret_env);
+        for var in connector.base_url_vars {
+            cmd.env_remove(var);
+        }
+    }
+    for (key, value) in overrides {
+        cmd.env(key, value);
     }
     cmd
 }

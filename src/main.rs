@@ -1,230 +1,249 @@
-use capshell::config::{connector, Config};
-use capshell::{child_command, prepare, proxy, secret};
+use mithril::config::{connector, Config};
+use mithril::{child_command, prepare, prepare_demo, proxy, secret, Prepared};
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::exit;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let r = match args.first().map(String::as_str) {
+    let result = match args.first().map(String::as_str) {
         Some("run") => run(&args[1..]),
-        Some("secret") => secret_cmd(&args[1..]),
-        Some("mock-upstream") => mock_upstream(&args[1..]),
-        _ => {
-            eprintln!(
-                "capshell run [--config capshell.yaml] [--env .env] -- <comando> [args...]\n\
-                 capshell secret set <NOME>\n\
-                 capshell secret import <file.env> [--config capshell.yaml]\n\
-                 capshell mock-upstream [--port 9000]"
-            );
-            exit(2);
+        Some("demo") => demo(&args[1..]),
+        Some("secret") => secret_command(&args[1..]).map(|_| 0),
+        Some("doctor") => {
+            doctor();
+            Ok(0)
         }
+        _ => Err(usage()),
     };
-    if let Err(e) = r {
-        eprintln!("capshell: {e}");
-        exit(1);
+
+    match result {
+        Ok(code) => exit(code),
+        Err(error) => {
+            eprintln!("mtl: {error}");
+            exit(1);
+        }
     }
 }
 
-fn opt(args: &[String], name: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1).cloned())
+fn usage() -> String {
+    "usage:\n\
+     mtl run [--config mithril.yaml] -- <command> [args...]\n\
+     mtl demo [--config mithril.yaml] -- <command> [args...]\n\
+     mtl secret set <connector>\n\
+     mtl secret import <file.env> [--config mithril.yaml]\n\
+     mtl secret delete <connector>\n\
+     mtl doctor"
+        .into()
 }
 
-fn run(args: &[String]) -> Result<(), String> {
+fn config_path(flags: &[String]) -> Result<String, String> {
+    let mut path = "mithril.yaml".to_string();
+    let mut index = 0;
+    while index < flags.len() {
+        if flags[index] != "--config" {
+            return Err(format!("unknown option: {}", flags[index]));
+        }
+        path = flags
+            .get(index + 1)
+            .cloned()
+            .ok_or("--config requires a path")?;
+        index += 2;
+    }
+    Ok(path)
+}
+
+fn invocation(args: &[String]) -> Result<(Config, &str, &[String]), String> {
     let split = args
         .iter()
-        .position(|a| a == "--")
-        .ok_or("manca `-- <comando>`")?;
-    let (flags, rest) = (&args[..split], &args[split + 1..]);
-    let program = rest.first().ok_or("manca il comando da eseguire")?;
+        .position(|arg| arg == "--")
+        .ok_or("missing `-- <command>`")?;
+    let config = Config::load(&config_path(&args[..split])?)?;
+    let command = args.get(split + 1).ok_or("missing command")?;
+    Ok((config, command, &args[split + 2..]))
+}
 
-    let cfg = Config::load(&opt(flags, "--config").unwrap_or_else(|| "capshell.yaml".into()))?;
+fn run(args: &[String]) -> Result<i32, String> {
+    let (config, command, command_args) = invocation(args)?;
+    eprintln!(
+        "mtl: requesting human authorization for: {}",
+        config.connectors.join(", ")
+    );
+    let prepared = prepare(&config, |connector| secret::get(connector.id))?;
+    run_prepared(config, prepared, command, command_args)
+}
 
-    // Sorgente dei valori: il portachiavi, o un .env come percorso di migrazione.
-    let from_file: Option<HashMap<String, String>> = match opt(flags, "--env") {
-        Some(path) => {
-            let raw = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
-            Some(secret::parse_env_file(&raw).into_iter().collect())
-        }
-        None => None,
-    };
-    let mut prepared = prepare(&cfg, |name| match &from_file {
-        Some(map) => map
-            .get(name)
-            .cloned()
-            .ok_or(format!("{name} assente dal file --env")),
-        None => secret::get(name),
-    })?;
+fn demo(args: &[String]) -> Result<i32, String> {
+    let (config, command, command_args) = invocation(args)?;
+    let upstream = spawn_demo_upstream()?;
+    let prepared = prepare_demo(&config, &upstream)?;
+    eprintln!("mtl: demo mode uses generated canaries; no keyring access");
+    run_prepared(config, prepared, command, command_args)
+}
 
-    let budget = cfg.budget.map(|b| b.max_requests);
+fn run_prepared(
+    config: Config,
+    mut prepared: Prepared,
+    command: &str,
+    command_args: &[String],
+) -> Result<i32, String> {
+    let budget = config.budget.map(|budget| budget.max_requests);
     let routes = std::mem::take(&mut prepared.routes);
-    let handle = proxy::spawn(routes, budget).map_err(|e| e.to_string())?;
-
-    // Le variabili del file non dichiarate in capshell.yaml passano invariate:
-    // il .env dell'utente contiene anche configurazione che serve all'app.
-    let declared: Vec<&str> = cfg.secrets.iter().map(|s| s.name.as_str()).collect();
-    let mut overrides: Vec<(String, String)> = from_file
-        .iter()
-        .flatten()
-        .filter(|(k, _)| !declared.contains(&k.as_str()))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    avvisa_non_dichiarate(&overrides);
-    overrides.extend(prepared.env_overrides(handle.port));
+    let handle = proxy::spawn(routes, budget).map_err(|error| error.to_string())?;
+    let overrides = prepared.env_overrides(handle.port, &handle.token);
 
     eprintln!(
-        "capshell: proxy su 127.0.0.1:{} — {} segreti mascherati{}",
+        "mtl: session proxy on 127.0.0.1:{} — {} connector(s){}",
         handle.port,
         prepared.mocks.len(),
         budget
-            .map(|b| format!(", budget {b} richieste"))
+            .map(|max| format!(", advisory budget {max} requests"))
             .unwrap_or_default()
     );
-
-    let status = child_command(program, &rest[1..], &overrides)
+    let status = child_command(command, command_args, &overrides)
         .status()
-        .map_err(|e| format!("{program}: {e}"))?;
+        .map_err(|error| format!("{command}: {error}"))?;
 
-    // Il fallimento piu' probabile al primo avvio: il client ignora il base URL,
-    // chiama il provider vero, prende 401, e l'utente da' la colpa a Capshell.
     if handle.seen.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         eprintln!(
-            "capshell: nessuna richiesta e' arrivata al proxy.\n\
-             Il client sta ignorando il base URL: verifica che rispetti una di {:?}",
+            "mtl: no authorized request reached the proxy; verify that the client honors one of {:?}",
             prepared
                 .base_urls
                 .iter()
-                .map(|(v, _)| v)
+                .map(|(variable, _, _)| variable)
                 .collect::<Vec<_>>()
         );
     }
-    exit(status.code().unwrap_or(1));
+    Ok(status.code().unwrap_or(1))
 }
 
-/// Un'euristica non decide mai cosa proteggere — quello lo dichiara l'utente.
-/// Ma segnalare cio' che *sembra* una credenziale e non e' dichiarato costa
-/// nulla e intercetta l'errore piu' probabile: aggiungere una chiave al .env e
-/// dimenticarsi di dichiararla.
-fn avvisa_non_dichiarate(passthrough: &[(String, String)]) {
-    const PREFISSI: &[&str] = &[
-        "sk-",
-        "ghp_",
-        "github_pat_",
-        "xoxb-",
-        "AKIA",
-        "AIza",
-        "gsk_",
-    ];
-    const SUFFISSI: &[&str] = &["_KEY", "_TOKEN", "_SECRET", "_PASSWORD"];
-
-    let sospette: Vec<&str> = passthrough
-        .iter()
-        .filter(|(k, v)| {
-            PREFISSI.iter().any(|p| v.starts_with(p)) || SUFFISSI.iter().any(|s| k.ends_with(s))
-        })
-        .map(|(k, _)| k.as_str())
-        .collect();
-    if !sospette.is_empty() {
-        eprintln!(
-            "capshell: sembrano credenziali ma non sono dichiarate in capshell.yaml,\n\
-             quindi il figlio le riceve in chiaro: {}",
-            sospette.join(", ")
-        );
+fn secret_command(args: &[String]) -> Result<(), String> {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("set" | "import" | "delete")
+    ) {
+        secret::preflight()?;
     }
-}
-
-fn secret_cmd(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("set") => {
-            let name = args.get(1).ok_or("manca il nome del segreto")?;
-            let value = rpassword::prompt_password(format!("{name}: "))
-                .map_err(|e| format!("lettura da tty: {e}"))?;
+            let name = args.get(1).ok_or("missing connector")?;
+            if args.len() != 2 {
+                return Err("usage: mtl secret set <connector>".into());
+            }
+            let connector = connector(name).ok_or_else(|| format!("unknown connector: {name}"))?;
+            let value = rpassword::prompt_password(format!("{}: ", connector.secret_env))
+                .map_err(|error| format!("reading from terminal: {error}"))?;
             if value.is_empty() {
-                return Err("valore vuoto".into());
+                return Err("empty credential".into());
             }
-            secret::set(name, &value)?;
-            println!("{name} nel portachiavi.");
+            secret::set(connector.id, &value)?;
+            println!("Stored {} with user-presence protection.", connector.id);
             Ok(())
         }
-        Some("import") => {
-            let path = args.get(1).ok_or("manca il file .env")?;
-            let cfg =
-                Config::load(&opt(args, "--config").unwrap_or_else(|| "capshell.yaml".into()))?;
-            let raw = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-            let found: HashMap<String, String> = secret::parse_env_file(&raw).into_iter().collect();
-
-            let mut replacements = Vec::new();
-            for decl in &cfg.secrets {
-                let Some(value) = found.get(&decl.name) else {
-                    continue;
-                };
-                let c = connector(&decl.connector).ok_or("connector sconosciuto")?;
-                secret::set(&decl.name, value)?;
-                replacements.push((decl.name.clone(), secret::mock(c.mock_prefix)));
+        Some("import") => import_secret(args),
+        Some("delete") => {
+            let name = args.get(1).ok_or("missing connector")?;
+            if args.len() != 2 {
+                return Err("usage: mtl secret delete <connector>".into());
             }
-            if replacements.is_empty() {
-                return Err(format!("nessun segreto dichiarato trovato in {path}"));
-            }
-            std::fs::write(format!("{path}.bak"), &raw).map_err(|e| e.to_string())?;
-            std::fs::write(path, secret::rewrite_env_file(&raw, &replacements))
-                .map_err(|e| e.to_string())?;
-            println!(
-                "{} segreti nel portachiavi. {path} riscritto con i placeholder, originale in {path}.bak",
-                replacements.len()
-            );
+            let connector = connector(name).ok_or_else(|| format!("unknown connector: {name}"))?;
+            secret::delete(connector.id)?;
+            println!("Deleted {} from the keyring.", connector.id);
             Ok(())
         }
-        _ => Err("uso: capshell secret set <NOME> | capshell secret import <file.env>".into()),
+        _ => {
+            Err("usage: mtl secret set <connector> | import <file.env> | delete <connector>".into())
+        }
     }
 }
 
-/// Finto provider per provare il giro completo senza una chiave vera: rimanda
-/// indietro quello che ha ricevuto, credenziale inclusa.
-fn mock_upstream(args: &[String]) -> Result<(), String> {
-    let port: u16 = opt(args, "--port")
-        .unwrap_or_else(|| "9000".into())
-        .parse()
-        .map_err(|_| "porta non valida")?;
-    let server = tiny_http::Server::http(("127.0.0.1", port)).map_err(|e| e.to_string())?;
-    eprintln!("mock-upstream su http://127.0.0.1:{port}");
-    for req in server.incoming_requests() {
-        let url = req.url().to_string();
-        let seen: Vec<String> = req
-            .headers()
-            .iter()
-            .map(|h| {
-                let name = h.field.to_string().to_ascii_lowercase();
-                let value = h.value.to_string().replace('"', "'");
-                // La credenziale arrivata non torna indietro per intero: si
-                // mostra che c'e' e come inizia, non quanto vale. Altrimenti il
-                // proxy scarta la risposta — giustamente — e non si vede nulla.
-                let shown = if name == "authorization" || name == "x-api-key" {
-                    let head: String = value.chars().take(18).collect();
-                    format!("<ricevuta, {} byte, inizia con {head}>", value.len())
-                } else {
-                    value
-                };
-                format!("\"{name}\":\"{shown}\"")
-            })
-            .collect();
-        eprintln!("  {} {}", req.method(), url);
-        let resp = if url.starts_with("/redirect") {
-            // Per verificare che il proxy non segua i 3xx e non riallegi la chiave.
-            tiny_http::Response::from_data(Vec::new())
-                .with_status_code(302)
-                .with_header(
-                    tiny_http::Header::from_bytes("location", "http://evil.example/").unwrap(),
-                )
-        } else {
-            let body = format!("{{\"path\":\"{url}\",\"headers\":{{{}}}}}", seen.join(","));
-            tiny_http::Response::from_data(body.into_bytes())
-                .with_status_code(200)
-                .with_header(
-                    tiny_http::Header::from_bytes("content-type", "application/json").unwrap(),
-                )
-        };
-        let _ = req.respond(resp);
+fn import_secret(args: &[String]) -> Result<(), String> {
+    let path = args.get(1).ok_or("missing .env path")?;
+    let config = Config::load(&config_path(&args[2..])?)?;
+    let raw = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+    let found: HashMap<String, String> = secret::parse_env_file(&raw).into_iter().collect();
+
+    let mut values = Vec::new();
+    for name in &config.connectors {
+        let connector = connector(name).ok_or_else(|| format!("unknown connector: {name}"))?;
+        let value = found
+            .get(connector.secret_env)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{} is missing from {path}", connector.secret_env))?;
+        values.push((connector, value.clone()));
     }
+
+    let mut replacements = Vec::new();
+    for (connector, value) in values {
+        secret::set(connector.id, &value)?;
+        replacements.push((
+            connector.secret_env.to_string(),
+            secret::mock(connector.mock_prefix),
+        ));
+    }
+    let rewritten = secret::rewrite_env_file(&raw, &replacements);
+    secret::atomic_rewrite(Path::new(path), &rewritten)?;
+    println!(
+        "Imported {} credential(s); {path} was atomically rewritten without a plaintext backup.",
+        replacements.len()
+    );
     Ok(())
+}
+
+fn doctor() {
+    println!("Mithril diagnostic");
+    match secret::preflight() {
+        Ok(()) => {
+            println!("  secure keyring sessions: available (native user presence + Keychain ACL)")
+        }
+        Err(error) => {
+            println!("  secure keyring sessions: unavailable ({error})");
+            println!("  safe local option:       mtl demo");
+            println!("  real credentials:        unavailable in this build");
+        }
+    }
+}
+
+fn spawn_demo_upstream() -> Result<String, String> {
+    let server = tiny_http::Server::http("127.0.0.1:0").map_err(|error| error.to_string())?;
+    let port = server
+        .server_addr()
+        .to_ip()
+        .ok_or("demo upstream did not bind an IP socket")?
+        .port();
+    std::thread::spawn(move || {
+        for request in server.incoming_requests() {
+            std::thread::spawn(move || serve_demo_upstream(request));
+        }
+    });
+    Ok(format!("http://127.0.0.1:{port}"))
+}
+
+fn serve_demo_upstream(request: tiny_http::Request) {
+    let path = request.url().replace(['"', '\\'], "'");
+    let headers: Vec<String> = request
+        .headers()
+        .iter()
+        .map(|header| {
+            let name = header.field.to_string().to_ascii_lowercase();
+            let value = header.value.to_string().replace(['"', '\\'], "'");
+            let shown = if name == "authorization" || name == "x-api-key" {
+                let prefix: String = value.chars().take(18).collect();
+                format!("<received, {} bytes, starts with {prefix}>", value.len())
+            } else {
+                value
+            };
+            format!("\"{name}\":\"{shown}\"")
+        })
+        .collect();
+    let body = format!(
+        "{{\"path\":\"{path}\",\"headers\":{{{}}}}}",
+        headers.join(",")
+    );
+    let header = tiny_http::Header::from_bytes("content-type", "application/json").unwrap();
+    let _ = request.respond(
+        tiny_http::Response::from_data(body.into_bytes())
+            .with_status_code(200)
+            .with_header(header),
+    );
 }
