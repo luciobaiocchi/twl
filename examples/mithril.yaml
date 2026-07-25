@@ -1,0 +1,7 @@
+# Workspace configuration selects a compiled connector policy. It cannot name
+# a secret, change authentication, or replace the provider destination.
+connectors:
+  - openai
+
+budget:
+  max_requests: 5
