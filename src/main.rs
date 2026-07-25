@@ -97,7 +97,7 @@ fn run_prepared(
         handle.port,
         prepared.mocks.len(),
         budget
-            .map(|max| format!(", advisory budget {max} requests"))
+            .map(|max| format!(", request budget {max}"))
             .unwrap_or_default()
     );
     let status = child_command(command, command_args, &overrides)

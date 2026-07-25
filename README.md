@@ -35,7 +35,8 @@ other ambient secrets and sockets remain the caller's responsibility. The
 response scanner blocks accidental plain/base64 credential reflection, but it
 is defense in depth—not protection from a malicious provider, which necessarily
 receives the key. Responses are buffered up to 16 MiB, so real-time streaming
-is not supported yet.
+is not supported yet. At most 16 requests are forwarded concurrently; excess
+requests fail locally with `503` instead of being queued.
 
 ## How the agent knows which endpoint to call
 

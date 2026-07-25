@@ -4,6 +4,7 @@ use common::{call, raw, upstream};
 use mithril::config::{connector, AllowedRoute, Auth};
 use mithril::proxy::{self, resolve, Route};
 use std::collections::HashMap;
+use std::io::{Read, Write};
 
 const KEY: &str = "sk-CANARY-REAL-KEY-0123456789";
 const TEST_ROUTES: &[AllowedRoute] = &[
@@ -234,5 +235,35 @@ fn invalid_requests_do_not_consume_budget() {
         call(handle.port, "GET", &format!("{prefix}/v1/b"), &[]).0,
         429
     );
+    assert_eq!(log.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn rejected_body_is_drained_before_keep_alive_reuse() {
+    let (upstream, log) = upstream();
+    let (handle, prefix) = test_proxy(&upstream, None);
+    let body = "x".repeat(2048);
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", handle.port)).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    write!(
+        stream,
+        "POST /wrong/openai/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}GET {prefix}/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        body.len(),
+        body
+    )
+    .unwrap();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let statuses: Vec<u16> = response
+        .split("HTTP/1.1 ")
+        .skip(1)
+        .filter_map(|part| part.split_whitespace().next()?.parse().ok())
+        .collect();
+
+    assert_eq!(statuses, [404, 200]);
     assert_eq!(log.lock().unwrap().len(), 1);
 }

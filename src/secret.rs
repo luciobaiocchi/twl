@@ -3,6 +3,7 @@ use rand::Rng;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
 const SERVICE: &str = "mithril";
 
 #[cfg(target_os = "macos")]
@@ -127,9 +128,16 @@ fn authorize(reason: &str) -> Result<(), String> {
             &reply,
         );
     }
-    receiver
-        .recv()
-        .map_err(|_| "local authentication ended without a result".to_string())?
+    match receiver.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            unsafe { context.invalidate() };
+            Err("local authentication timed out after 120 seconds".into())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("local authentication ended without a result".into())
+        }
+    }
 }
 
 /// A nested `mtl` can execute this code, but it cannot silently satisfy the

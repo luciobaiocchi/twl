@@ -154,7 +154,7 @@ pub fn spawn(routes: HashMap<String, Route>, max_requests: Option<u64>) -> std::
         while let Ok(request) = listener.recv() {
             if active.fetch_add(1, Ordering::SeqCst) >= MAX_IN_FLIGHT {
                 active.fetch_sub(1, Ordering::SeqCst);
-                respond_error(request, 503, "too many requests in flight");
+                respond_error(request, 503, "local proxy concurrency limit reached");
                 continue;
             }
             let guard = InFlight(active.clone());
