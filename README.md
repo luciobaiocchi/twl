@@ -117,13 +117,7 @@ budget:                      # opzionale, assente per default
   max_requests: 500
 ```
 
-**Sorgente dei valori in v0:** un `.env` non committato, indicato al lancio.
-
-```bash
-capshell run --env .env -- codex
-```
-
-Qualunque variabile presente nel `.env` e non dichiarata in `capshell.yaml`
+Qualunque variabile presente nella sorgente e non dichiarata in `capshell.yaml`
 viene passata al figlio **invariata**. Capshell non indovina: tocca solo ciò che
 gli dici di toccare.
 
@@ -140,15 +134,87 @@ passare più di N.
 
 ---
 
+## Da dove arrivano i segreti
+
+La sorgente è un backend intercambiabile, scelto in base all'ambiente. La
+garanzia non cambia: il valore entra nella memoria di Capshell e il figlio riceve
+sempre e solo il mock.
+
+| ambiente | sorgente |
+|---|---|
+| host desktop (macOS, Windows, Linux con sessione) | **OS keyring** |
+| container, headless, CI | **environment del processo Capshell**, iniettato dal runtime |
+| primo avvio / migrazione | `--env .env` non committato |
+
+I due ambienti si coprono a vicenda: il keyring è facile sull'host e impossibile
+in un container; la separazione di UID è gratis in un container e costosa
+sull'host.
+
+> Il keyring arriva in M1. La v0 usa `--env` sull'host e l'environment del
+> processo negli ambienti containerizzati.
+
+### Il `.env` non è una modalità, è un percorso di migrazione
+
+```bash
+capshell secret import .env
+```
+
+Sposta i valori nel keyring e riscrive il `.env` con i placeholder. Da quel
+momento il file non contiene più segreti e può anche finire in git senza danni.
+`--env` resta per il primo avvio e per chi un keyring non ce l'ha.
+
+### Nel container
+
+Vale un principio unico:
+
+> **Capshell e l'agente devono essere separati da qualcosa: un UID, un container
+> o una macchina.** Se condividono UID e namespace, non c'è niente da proteggere.
+
+In ordine di preferenza:
+
+1. **Due container** — Capshell in uno, l'agente nell'altro, che parla col proxy
+   sulla rete interna. Nessun privilegio, nessun namespace condiviso, dieci righe
+   di compose. È il pattern sidecar con entrambi containerizzati.
+2. **Un container, due UID** — Capshell parte come root e spawna il figlio sotto
+   un utente non privilegiato. La sequenza è `setgroups()` → `setgid()` →
+   `setuid()`, **in quest'ordine**; poi si verifica che il drop sia avvenuto e si
+   fallisce chiuso in caso contrario, si chiudono i descrittori ereditati con
+   `close_range()`, e solo allora `execve()`.
+3. **Un container, un UID** — sopravvivibile ma con una difesa sola, e non è la
+   modalità consigliata. Regge su `prctl(PR_SET_DUMPABLE, 0)`: contro un processo
+   non-dumpable il kernel richiede `CAP_SYS_PTRACE` per leggere `environ`, `mem`
+   e `maps`, anche a parità di UID. Perché funzioni servono due condizioni: il
+   segreto arriva dall'environment e **non** da un file leggibile dall'agente, e
+   Capshell è l'**entrypoint** — se lo lancia uno script di shell, quello resta
+   vivo come PID 1 con il segreto nel proprio `environ`.
+
+   Yama non basta da solo: `ptrace_scope` filtra `PTRACE_MODE_ATTACH`, mentre la
+   lettura di `/proc/<pid>/environ` passa da `PTRACE_MODE_READ`. È `dumpable=0` a
+   chiudere entrambe le vie.
+
+### Non-goal: cifratura a riposo
+
+Capshell **non persiste niente**. Legge la sorgente all'avvio, tiene il valore in
+memoria per la durata del processo, e muore con esso. Non esiste un "at rest" da
+cifrare, quindi non esiste un cifrario da scegliere, una chiave di cifratura da
+custodire, né un file di stato da proteggere.
+
+Se un giorno servisse persistere segreti su disco, la risposta giusta non è
+aggiungere un cifrario: è usare il keyring, o iniettarli a runtime.
+
+---
+
 ## Piattaforme
 
 Il nucleo — processo figlio, environment mockato, proxy locale — è **puro
 POSIX**: funziona su Linux e macOS senza namespace, container o privilegi.
 
-L'hardening del filesystem (mount namespace che nasconde al figlio il file
-sorgente dei segreti) è **opzionale e Linux-only**. Non è richiesto perché il
-nucleo funzioni, e diventa irrilevante quando i segreti arrivano dal keyring
-invece che da un file.
+Non è previsto un confinamento del filesystem costruito da Capshell. Un mount
+namespace servirebbe solo a nascondere al figlio il file da cui i segreti
+arrivano — un problema che il keyring elimina alla radice, e che nel frattempo
+`PR_SET_DUMPABLE` copre per la sorgente da environment. Chi vuole confinare
+davvero il filesystem usa Docker, che lo fa meglio e che è già nel percorso
+consigliato.
 
 ---
 
@@ -172,11 +238,10 @@ già in v0. Restano da fare i byte inviati upstream e il costo per-token
 provider-specific: il numero di chiamate è un proxy debole per la spesa, 500
 richieste con contesto pieno valgono centinaia di dollari.
 
-**M3 — copertura e hardening.** Connector protocol-aware (AWS SigV4, client
-senza override del base URL come Stripe). Scansione pre-flight dei segreti
-committati per errore nel repository — problema di igiene di git più che di
-agenti, ma facile da segnalare quando si è già lì. Mount namespace di default su
-Linux, separazione di UID.
+**M3 — copertura.** Connector protocol-aware (AWS SigV4, client senza override
+del base URL come Stripe). Scansione pre-flight dei segreti committati per errore
+nel repository — problema di igiene di git più che di agenti, ma facile da
+segnalare quando si è già lì.
 
 Ogni fase mantiene fallback espliciti e non indebolisce in silenzio le garanzie
 già dichiarate.
