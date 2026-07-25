@@ -1,0 +1,15 @@
+# Config di prova: punta al finto provider invece che a OpenAI, cosi' si vede
+# tutto il giro senza spendere e senza una chiave vera.
+#
+#   capshell mock-upstream --port 9000
+#   capshell run --config examples/capshell.yaml --env examples/dev.env -- sh
+#
+# In produzione si toglie `upstream:` e il connector usa il suo host cablato.
+
+secrets:
+  - name: OPENAI_API_KEY
+    connector: openai
+    upstream: http://127.0.0.1:9000
+
+budget:
+  max_requests: 5

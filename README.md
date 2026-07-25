@@ -11,7 +11,8 @@ processo figlio con un environment in cui le chiavi vere sono sostituite da
 token finti. Le chiavi reali restano nel processo padre, in memoria, e vengono
 attaccate alle richieste solo da un proxy locale con destinazione cablata.
 
-> **Stato: progettazione.** Nessuna riga di codice scritta.
+> **Stato: v0 in corso.** Il nucleo funziona ed è coperto da test; il portachiavi
+> è attivo su macOS e Windows, su Linux serve `--env` (vedi roadmap).
 > Non è software di sicurezza auditato: fino a revisione indipendente, usare
 > solo credenziali di test.
 
@@ -131,6 +132,52 @@ sempre, un accesso brokerato muore con la sessione — ma va detta.
 Con `max_requests`, la richiesta N+1 viene rifiutata localmente. Il contatore si
 incrementa **prima** dell'inoltro: con richieste concorrenti, contare dopo lascia
 passare più di N.
+
+---
+
+## Provarlo
+
+Serve solo `cargo`. Il giro completo si vede senza una chiave vera e senza
+spendere: `capshell mock-upstream` è un finto provider che riporta quello che ha
+ricevuto.
+
+```bash
+cargo build
+cargo test                 # 17 test: INV-SECRET, INV-DEST, budget
+
+# terminale 1 — il finto provider
+./target/debug/capshell mock-upstream --port 9000
+
+# terminale 2 — una shell sotto Capshell
+./target/debug/capshell run \
+  --config examples/capshell.yaml \
+  --env examples/dev.env \
+  -- sh
+```
+
+Dentro quella shell:
+
+```bash
+env | grep OPENAI
+# OPENAI_API_KEY=sk-capshell...        <- il mock, non la tua chiave
+# OPENAI_BASE_URL=http://127.0.0.1:PORTA/openai
+
+curl -s "$OPENAI_BASE_URL/v1/models"
+# "authorization":"<ricevuta, 55 byte, inizia con Bearer sk-CANARY-C>"
+#  ^ la chiave vera e' arrivata all'upstream, senza mai passare da qui
+
+curl -s -H "Host: evil.example" "$OPENAI_BASE_URL/v1/models"
+# stessa risposta: l'header Host non sposta la destinazione (INV-DEST)
+
+grep -r "CANARY" /proc/self/environ
+# nessun risultato (INV-SECRET)
+```
+
+`examples/dev.env` dichiara `OPENAI_API_KEY` ma **non** `ANTHROPIC_API_KEY`, di
+proposito: all'avvio Capshell avvisa che quest'ultima passa in chiaro perché non
+è dichiarata. È l'errore più probabile — aggiungere una chiave al `.env` e
+dimenticarsi di dichiararla — e l'avviso è l'unico punto in cui il progetto usa
+un'euristica: per segnalare, mai per decidere cosa proteggere.
 
 ---
 

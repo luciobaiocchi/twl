@@ -1,0 +1,26 @@
+[package]
+name = "capshell"
+version = "0.0.1"
+edition = "2021"
+description = "L'agente non vede le tue chiavi API"
+license = "Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tiny_http = "0.12"
+ureq = "2"
+rand = "0.8"
+rpassword = "7"
+
+# Il portachiavi di sistema e' la sorgente di v0 su macOS e Windows.
+# Linux (Secret Service) e' M1: li' serve anche chiudere il canale D-Bus
+# verso il figlio, che senza namespace non e' una barriera.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
