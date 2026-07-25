@@ -1,5 +1,5 @@
 use capshell::config::{connector, Config};
-use capshell::{child_command, prepare, proxy, secret};
+use capshell::{child_command_isolato, prepare, proxy, sandbox, secret, Chiusura};
 use std::collections::HashMap;
 use std::process::exit;
 
@@ -82,9 +82,23 @@ fn run(args: &[String]) -> Result<(), String> {
             .unwrap_or_default()
     );
 
-    let status = child_command(program, &rest[1..], &overrides)
-        .status()
-        .map_err(|e| format!("{program}: {e}"))?;
+    let (mut cmd, chiusura) = child_command_isolato(program, &rest[1..], &overrides);
+    match chiusura {
+        Chiusura::Chiusi(cosa) => eprintln!("capshell: canali chiusi al figlio — {cosa}"),
+        Chiusura::NonNecessaria => {}
+        Chiusura::Fallita(motivo) => eprintln!(
+            "capshell: il portachiavi resta raggiungibile dal processo figlio ({motivo}).\n\
+             Su Linux serve bubblewrap per chiudere il canale D-Bus."
+        ),
+    }
+    if sandbox::dall_ambiente().bus_astratto {
+        eprintln!(
+            "capshell: il bus D-Bus usa un socket astratto, che vive nel network\n\
+             namespace e non nel filesystem: il mount namespace non lo chiude."
+        );
+    }
+
+    let status = cmd.status().map_err(|e| format!("{program}: {e}"))?;
 
     // Il fallimento piu' probabile al primo avvio: il client ignora il base URL,
     // chiama il provider vero, prende 401, e l'utente da' la colpa a Capshell.

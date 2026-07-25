@@ -13,11 +13,19 @@ ureq = "2"
 rand = "0.8"
 rpassword = "7"
 
-# Il portachiavi di sistema e' la sorgente di v0 su macOS e Windows.
-# Linux (Secret Service) e' M1: li' serve anche chiudere il canale D-Bus
-# verso il figlio, che senza namespace non e' una barriera.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
+
+# Su Linux il Secret Service autorizza per utente, non per applicazione: il
+# portachiavi da solo non e' una barriera verso il figlio. La barriera la
+# costruisce src/sandbox.rs togliendogli il socket del bus.
+#
+# `async-secret-service` invece di `sync-`: quest'ultima passa da libdbus-sys,
+# che pretende libdbus-1-dev installato su ogni macchina che compila. La
+# variante async parla il protocollo D-Bus in Rust puro — piu' crate, ma
+# nessun pacchetto di sistema da procurarsi.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"] }
 
 [profile.release]
 opt-level = "z"

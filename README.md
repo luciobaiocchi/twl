@@ -11,8 +11,9 @@ processo figlio con un environment in cui le chiavi vere sono sostituite da
 token finti. Le chiavi reali restano nel processo padre, in memoria, e vengono
 attaccate alle richieste solo da un proxy locale con destinazione cablata.
 
-> **Stato: v0 in corso.** Il nucleo funziona ed è coperto da test; il portachiavi
-> è attivo su macOS e Windows, su Linux serve `--env` (vedi roadmap).
+> **Stato: v0 in corso.** Il nucleo funziona ed è coperto da test. Portachiavi
+> attivo su macOS, Windows e Linux; su Linux il canale D-Bus verso il figlio
+> viene chiuso con bubblewrap, quando c'è.
 > Non è software di sicurezza auditato: fino a revisione indipendente, usare
 > solo credenziali di test.
 
@@ -64,7 +65,7 @@ funzionano meglio.
 | L'agente ti distrugge la codebase? | **Usa git.** Non è un problema di Capshell. |
 | Vuoi isolamento vero di processi e filesystem? | **Usa Docker.** Capshell ci gira dentro senza modifiche. |
 | Vuoi impedire l'esfiltrazione del codice sorgente? | **Non è possibile** con un endpoint LLM raggiungibile. Non lo promettiamo. |
-| L'agente consuma troppi token? | Fuori scope v0. Vedi roadmap. |
+| L'agente consuma troppi token? | `budget: max_requests`, opzionale. Il costo per-token è in roadmap. |
 
 ---
 
@@ -143,7 +144,7 @@ ricevuto.
 
 ```bash
 cargo build
-cargo test                 # 17 test: INV-SECRET, INV-DEST, budget
+cargo test                 # 24 test: INV-SECRET, INV-DEST, budget, canali
 
 # terminale 1 — il finto provider
 ./target/debug/capshell mock-upstream --port 9000
@@ -171,6 +172,10 @@ curl -s -H "Host: evil.example" "$OPENAI_BASE_URL/v1/models"
 
 grep -r "CANARY" /proc/self/environ
 # nessun risultato (INV-SECRET)
+
+cat "$XDG_RUNTIME_DIR/bus"
+# No such file or directory: su Linux con bubblewrap il socket del
+# portachiavi non esiste nel mount namespace del figlio
 ```
 
 `examples/dev.env` dichiara `OPENAI_API_KEY` ma **non** `ANTHROPIC_API_KEY`, di
@@ -216,22 +221,33 @@ aggiornamento, il prompt ritorna, e l'utente impara a cliccare "consenti sempre"
 a occhi chiusi), e gli item vanno creati con ACL ristretta alla sola app
 creatrice — il default di `SecItemAdd`.
 
-**Su Linux la barriera va costruita.** Il Secret Service si raggiunge attraverso
-un socket Unix su un path (`/run/user/<uid>/bus`): basta che quel path **non
-esista nel mount namespace del figlio** e la `connect()` fallisce, senza che
-nessuna variabile d'ambiente possa recuperarlo. Serve `unshare(CLONE_NEWNS |
-CLONE_NEWUSER)`, un tmpfs sopra la directory, e `execve()` — nessun privilegio,
-nessun sandbox generico: non stiamo confinando il filesystem, stiamo togliendo un
-socket.
+**Su Linux la barriera va costruita**, ed è quello che fa `src/sandbox.rs`. Il
+Secret Service si raggiunge attraverso un socket Unix su un path
+(`/run/user/<uid>/bus`): basta che quel path **non esista nel mount namespace del
+figlio** e la `connect()` fallisce, senza che nessuna variabile d'ambiente possa
+recuperarlo. Il comando viene avvolto in bubblewrap con un tmpfs sopra quella
+directory.
 
-Già che il namespace c'è, vanno mascherati anche gli altri oracoli di credenziali
-della sessione, alla stessa riga di codice: `/run/user/<uid>/keyring/` (socket di
-controllo di gnome-keyring), `$SSH_AUTH_SOCK`, `/var/run/docker.sock` (che è
-root-equivalente), il socket di gpg-agent.
+Non è un sandbox: `--dev-bind / /` lascia il filesystem esattamente com'è. Non
+stiamo confinando niente, stiamo togliendo dei socket. E **non** si passa
+`--unshare-net`, che taglierebbe anche il loopback e impedirebbe al figlio di
+raggiungere il proxy.
 
-Non è un requisito: se gli unprivileged user namespace sono disabilitati,
-**Capshell parte lo stesso e lo dice** — *"il portachiavi resta raggiungibile dal
-processo figlio"*. Degradare con un avviso, non rifiutarsi di funzionare.
+Già che il namespace c'è, vengono chiusi anche gli altri oracoli di credenziali
+della sessione: `/run/user/<uid>/keyring/` (socket di controllo di
+gnome-keyring), `$SSH_AUTH_SOCK`, il socket di gpg-agent, `/var/run/docker.sock`
+(che è root-equivalente).
+
+Non è un requisito. Se bubblewrap manca o gli unprivileged user namespace sono
+disabilitati, **Capshell parte lo stesso e lo dice** — *"il portachiavi resta
+raggiungibile dal processo figlio"*. Degradare con un avviso, non rifiutarsi di
+funzionare. L'utilizzabilità di bwrap viene verificata **prima** di lanciarci il
+comando vero: un fallimento a metà strada sarebbe indistinguibile da un errore
+del comando dell'utente.
+
+Un caso resta scoperto e viene segnalato: se il bus è su un **socket astratto**
+(`unix:abstract=`), quello vive nel network namespace e non nel filesystem, e un
+mount namespace non lo tocca.
 
 **Su Windows** non esiste un equivalente semplice, quindi la garanzia si ferma
 alla protezione dall'esposizione.
@@ -293,10 +309,10 @@ Il nucleo — processo figlio, environment mockato, proxy locale — è
 **cross-platform**: funziona su macOS, Windows e Linux senza namespace,
 container o privilegi.
 
-L'unico uso di namespace previsto è quello descritto sopra: rimuovere il socket
-del portachiavi dalla vista del figlio, su Linux, come hardening opzionale con
-fallback. È chirurgico e non richiede una dipendenza esterna — `unshare` più un
-`mount`, non un lanciatore di sandbox.
+L'unico uso di namespace è quello descritto sopra: rimuovere dalla vista del
+figlio i socket delle credenziali, su Linux, come hardening opzionale con
+fallback. Richiede `bubblewrap` (`apt install bubblewrap`), che è opzionale:
+senza, Capshell funziona e lo segnala.
 
 **Non è previsto un confinamento del filesystem costruito da Capshell.** Chi
 vuole confinare davvero il filesystem usa Docker, che lo fa meglio ed è già nel
@@ -319,20 +335,19 @@ ACL per firma del binario dà da subito la garanzia più forte del progetto.
 > disco serve mascherarlo, e quel mascheramento è codice. Il keyring **toglie**
 > codice al progetto invece di aggiungerne. Per questo sta in v0 e non dopo.
 
-**M1 — Linux.** Secret Service come sorgente, più la chiusura del canale: mount
-namespace che rimuove dalla vista del figlio il socket del bus e gli altri
-oracoli di credenziali della sessione. Con fallback e avviso dove gli
-unprivileged user namespace non sono disponibili.
+Linux è coperto allo stesso modo: Secret Service come sorgente, e la chiusura
+del canale D-Bus verso il figlio via bubblewrap, con fallback dove non è
+disponibile.
 
-**M2 — container.** Iniezione dei segreti a runtime, drop verso un UID non
+**M1 — container.** Iniezione dei segreti a runtime, drop verso un UID non
 privilegiato per il processo figlio, Capshell come entrypoint.
 
-**M3 — controllo del consumo, oltre il contatore.** Il cap sulle richieste c'è
+**M2 — controllo del consumo, oltre il contatore.** Il cap sulle richieste c'è
 già in v0. Restano i byte inviati upstream e il costo per-token
 provider-specific: il numero di chiamate è un proxy debole per la spesa, 500
 richieste con contesto pieno valgono centinaia di dollari.
 
-**M4 — copertura.** Connector protocol-aware (AWS SigV4, client senza override
+**M3 — copertura.** Connector protocol-aware (AWS SigV4, client senza override
 del base URL come Stripe). Scansione pre-flight dei segreti committati per errore
 nel repository — problema di igiene di git più che di agenti, ma facile da
 segnalare quando si è già lì.
@@ -350,9 +365,10 @@ già dichiarate.
 - **Modificare o distruggere** i file su cui lavora. Usa git.
 - **Leggere altre credenziali** presenti sulla macchina, se non lo isoli.
   Usa Docker.
-- **Chiedere al portachiavi i tuoi item su Linux e Windows**, dove
-  l'autorizzazione è per utente e non per applicazione. Su macOS no: lì la ACL
-  è per firma del binario. Su Linux si chiude con M1.
+- **Chiedere al portachiavi i tuoi item su Windows**, dove l'autorizzazione è
+  per utente e non per applicazione. Su macOS no: lì la ACL è per firma del
+  binario. Su Linux no, se bubblewrap è disponibile: il socket del bus non
+  esiste nel suo mount namespace.
 - Sfruttare un bug in Capshell, nel kernel, o nel provider upstream.
 
 Quello che **non** può fare è ottenere il valore di una chiave gestita **dal

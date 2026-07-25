@@ -1,5 +1,6 @@
 pub mod config;
 pub mod proxy;
+pub mod sandbox;
 pub mod secret;
 
 use config::{connector, Config};
@@ -8,8 +9,10 @@ use std::collections::HashMap;
 use std::process::Command;
 
 /// Variabili che non passano al figlio. Su Linux `DBUS_SESSION_BUS_ADDRESS` e'
-/// la strada per il Secret Service: toglierla alza l'asticella, ma il socket
-/// resta indovinabile — la barriera vera arriva in M1 col mount namespace.
+/// la strada per il Secret Service: toglierla da sola alzerebbe solo l'asticella,
+/// perche' il socket resta indovinabile su `/run/user/<uid>/bus`. La barriera la
+/// mette `sandbox`, togliendo il path dal mount namespace; questa e' la prima
+/// riga di difesa, e l'unica quando bwrap non c'e'.
 pub const STRIP: &[&str] = &["DBUS_SESSION_BUS_ADDRESS"];
 
 pub struct Prepared {
@@ -79,4 +82,55 @@ pub fn child_command(program: &str, args: &[String], overrides: &[(String, Strin
         cmd.env(k, v);
     }
     cmd
+}
+
+/// Esito del tentativo di chiudere i canali di credenziali della sessione.
+pub enum Chiusura {
+    /// I socket elencati non esistono nel mount namespace del figlio.
+    Chiusi(String),
+    /// Non c'era niente da chiudere, o la piattaforma non ne ha bisogno.
+    NonNecessaria,
+    /// Il comando parte comunque: degradare con un avviso, non rifiutarsi
+    /// di funzionare.
+    Fallita(String),
+}
+
+/// Su Linux avvolge il comando in bwrap per togliere al figlio i socket del
+/// portachiavi e degli agent. Su macOS non serve: il Keychain autorizza per
+/// firma del binario, quindi la barriera c'e' gia' ed e' piu' precisa.
+pub fn child_command_isolato(
+    program: &str,
+    args: &[String],
+    overrides: &[(String, String)],
+) -> (Command, Chiusura) {
+    if !cfg!(target_os = "linux") {
+        return (
+            child_command(program, args, overrides),
+            Chiusura::NonNecessaria,
+        );
+    }
+    let canali = sandbox::dall_ambiente();
+    if canali.nulla_da_chiudere() {
+        return (
+            child_command(program, args, overrides),
+            Chiusura::NonNecessaria,
+        );
+    }
+    let bwrap_args = canali.bwrap_args();
+    match sandbox::bwrap_utilizzabile(&bwrap_args) {
+        Err(motivo) => (
+            child_command(program, args, overrides),
+            Chiusura::Fallita(motivo),
+        ),
+        Ok(()) => {
+            let mut tutti = bwrap_args;
+            tutti.push("--".into());
+            tutti.push(program.to_string());
+            tutti.extend(args.iter().cloned());
+            (
+                child_command("bwrap", &tutti, overrides),
+                Chiusura::Chiusi(canali.descrizione()),
+            )
+        }
+    }
 }
