@@ -150,8 +150,44 @@ I due ambienti si coprono a vicenda: il keyring è facile sull'host e impossibil
 in un container; la separazione di UID è gratis in un container e costosa
 sull'host.
 
-> Il keyring arriva in M1. La v0 usa `--env` sull'host e l'environment del
-> processo negli ambienti containerizzati.
+### Il keyring non protegge allo stesso modo su tutte le piattaforme
+
+Mettere il segreto nel portachiavi lo toglie dal filesystem — niente `cat .env`,
+niente `grep -r`, niente commit per errore. Ma **impedire a un altro processo del
+tuo utente di chiederlo** è una proprietà diversa, e solo una piattaforma ce
+l'ha nativamente.
+
+| | come autorizza | l'agente può chiederlo? |
+|---|---|---|
+| **macOS** — Keychain | ACL per **item** e per **firma del binario** | **no**: binario diverso, prompt o rifiuto |
+| **Windows** — Credential Manager | DPAPI **per utente** | sì, qualunque processo della sessione |
+| **Linux** — Secret Service | **per utente**, via D-Bus di sessione | sì, qualunque processo che raggiunge il bus |
+
+**Su macOS la barriera è già lì**, e va solo non buttata via: il binario dev'essere
+**firmato** (con un binario instabile la ACL non combacia più a ogni
+aggiornamento, il prompt ritorna, e l'utente impara a cliccare "consenti sempre"
+a occhi chiusi), e gli item vanno creati con ACL ristretta alla sola app
+creatrice — il default di `SecItemAdd`.
+
+**Su Linux la barriera va costruita.** Il Secret Service si raggiunge attraverso
+un socket Unix su un path (`/run/user/<uid>/bus`): basta che quel path **non
+esista nel mount namespace del figlio** e la `connect()` fallisce, senza che
+nessuna variabile d'ambiente possa recuperarlo. Serve `unshare(CLONE_NEWNS |
+CLONE_NEWUSER)`, un tmpfs sopra la directory, e `execve()` — nessun privilegio,
+nessun sandbox generico: non stiamo confinando il filesystem, stiamo togliendo un
+socket.
+
+Già che il namespace c'è, vanno mascherati anche gli altri oracoli di credenziali
+della sessione, alla stessa riga di codice: `/run/user/<uid>/keyring/` (socket di
+controllo di gnome-keyring), `$SSH_AUTH_SOCK`, `/var/run/docker.sock` (che è
+root-equivalente), il socket di gpg-agent.
+
+Non è un requisito: se gli unprivileged user namespace sono disabilitati,
+**Capshell parte lo stesso e lo dice** — *"il portachiavi resta raggiungibile dal
+processo figlio"*. Degradare con un avviso, non rifiutarsi di funzionare.
+
+**Su Windows** non esiste un equivalente semplice, quindi la garanzia si ferma
+alla protezione dall'esposizione.
 
 ### Il `.env` non è una modalità, è un percorso di migrazione
 
@@ -206,39 +242,50 @@ aggiungere un cifrario: è usare il keyring, o iniettarli a runtime.
 
 ## Piattaforme
 
-Il nucleo — processo figlio, environment mockato, proxy locale — è **puro
-POSIX**: funziona su Linux e macOS senza namespace, container o privilegi.
+Il nucleo — processo figlio, environment mockato, proxy locale — è
+**cross-platform**: funziona su macOS, Windows e Linux senza namespace,
+container o privilegi.
 
-Non è previsto un confinamento del filesystem costruito da Capshell. Un mount
-namespace servirebbe solo a nascondere al figlio il file da cui i segreti
-arrivano — un problema che il keyring elimina alla radice, e che nel frattempo
-`PR_SET_DUMPABLE` copre per la sorgente da environment. Chi vuole confinare
-davvero il filesystem usa Docker, che lo fa meglio e che è già nel percorso
-consigliato.
+L'unico uso di namespace previsto è quello descritto sopra: rimuovere il socket
+del portachiavi dalla vista del figlio, su Linux, come hardening opzionale con
+fallback. È chirurgico e non richiede una dipendenza esterna — `unshare` più un
+`mount`, non un lanciatore di sandbox.
+
+**Non è previsto un confinamento del filesystem costruito da Capshell.** Chi
+vuole confinare davvero il filesystem usa Docker, che lo fa meglio ed è già nel
+percorso consigliato.
 
 ---
 
 ## Roadmap
 
-**v0 — questo documento.** Un comando, un file di config, connector per provider
-LLM bearer-token (OpenAI, Anthropic, OpenAI-compatible), le due proprietà con la
-loro suite di test. Sorgente segreti: `.env` non committato.
+**v0 — nucleo e keyring desktop.** Un comando, un file di config, connector per
+provider LLM bearer-token (OpenAI, Anthropic, OpenAI-compatible), le due
+proprietà con la loro suite di test, `budget` opzionale.
 
-**M1 — keyring.** Integrazione con il portachiavi di sistema (Secret Service su
-Linux, Keychain su macOS), con i segreti associati a un progetto e caricati
-automaticamente quando lo avvii. Accessibili solo all'utente umano.
+Sorgente dei segreti: **OS keyring su macOS e Windows**, con `capshell secret
+import` come percorso di migrazione dal `.env`. Si parte da qui perché è il caso
+in cui il portachiavi funziona senza costruirci niente attorno — e su macOS la
+ACL per firma del binario dà da subito la garanzia più forte del progetto.
 
-> Questa è la milestone che conta davvero. Finché la sorgente è un file su
-> disco, l'agente non isolato può leggerlo e serve mascherarlo. Con il keyring
-> il segreto non è in nessun file e il mascheramento diventa inutile: il keyring
-> **toglie** codice al progetto invece di aggiungerne.
+> Il keyring non è un dettaglio rimandabile: finché la sorgente è un file su
+> disco serve mascherarlo, e quel mascheramento è codice. Il keyring **toglie**
+> codice al progetto invece di aggiungerne. Per questo sta in v0 e non dopo.
 
-**M2 — controllo del consumo, oltre il contatore.** Il cap sulle richieste c'è
-già in v0. Restano da fare i byte inviati upstream e il costo per-token
+**M1 — Linux.** Secret Service come sorgente, più la chiusura del canale: mount
+namespace che rimuove dalla vista del figlio il socket del bus e gli altri
+oracoli di credenziali della sessione. Con fallback e avviso dove gli
+unprivileged user namespace non sono disponibili.
+
+**M2 — container.** Iniezione dei segreti a runtime, drop verso un UID non
+privilegiato per il processo figlio, Capshell come entrypoint.
+
+**M3 — controllo del consumo, oltre il contatore.** Il cap sulle richieste c'è
+già in v0. Restano i byte inviati upstream e il costo per-token
 provider-specific: il numero di chiamate è un proxy debole per la spesa, 500
 richieste con contesto pieno valgono centinaia di dollari.
 
-**M3 — copertura.** Connector protocol-aware (AWS SigV4, client senza override
+**M4 — copertura.** Connector protocol-aware (AWS SigV4, client senza override
 del base URL come Stripe). Scansione pre-flight dei segreti committati per errore
 nel repository — problema di igiene di git più che di agenti, ma facile da
 segnalare quando si è già lì.
@@ -255,11 +302,14 @@ già dichiarate.
 - **Esfiltrare** codice e dati codificandoli in un prompt. Non arginabile.
 - **Modificare o distruggere** i file su cui lavora. Usa git.
 - **Leggere altre credenziali** presenti sulla macchina, se non lo isoli.
-  Usa Docker, o M1.
+  Usa Docker.
+- **Chiedere al portachiavi i tuoi item su Linux e Windows**, dove
+  l'autorizzazione è per utente e non per applicazione. Su macOS no: lì la ACL
+  è per firma del binario. Su Linux si chiude con M1.
 - Sfruttare un bug in Capshell, nel kernel, o nel provider upstream.
 
-Quello che **non** può fare è ottenere il valore di una chiave gestita, o usarla
-verso una destinazione che non hai dichiarato.
+Quello che **non** può fare è ottenere il valore di una chiave gestita **dal
+processo di Capshell**, o usarla verso una destinazione che non hai dichiarato.
 
 ---
 
