@@ -1,4 +1,6 @@
 use crate::config::Auth;
+use rand::distributions::Alphanumeric;
+use rand::Rng;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,17 +26,48 @@ pub struct Route {
     pub key: String,
 }
 
+/// Finche' esiste, il proxy ascolta. Quando cade, il thread che accetta esce:
+/// senza questo resterebbe bloccato in `recv()` per sempre, e con piu' sessioni
+/// nello stesso processo i thread si accumulerebbero fino a inchiodarlo.
 pub struct Handle {
     pub port: u16,
+    /// Segreto di sessione, primo segmento di ogni URL. Il proxy ascolta su
+    /// loopback, che e' raggiungibile da *qualunque* processo della macchina:
+    /// senza questo, un altro utente locale potrebbe scoprire la porta e
+    /// spendere la tua chiave. Il figlio ce l'ha nell'environment, nessun altro.
+    pub token: String,
     pub seen: Arc<AtomicU64>,
+    server: Arc<tiny_http::Server>,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.server.unblock();
+    }
 }
 
 type Denied = (u16, &'static str);
+
+fn token_casuale() -> String {
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
+}
+
+/// Confronto senza uscita anticipata: il tempo di risposta non deve dire
+/// quanti caratteri del token erano giusti.
+fn uguali(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
 
 /// INV-DEST: l'host di destinazione viene dal connector, mai dalla richiesta.
 /// L'unica cosa che l'agente sceglie e' il path dopo il nome del connector.
 pub fn resolve<'a>(
     url: &str,
+    token: &str,
     routes: &'a HashMap<String, Route>,
 ) -> Result<(&'a Route, String), Denied> {
     if !url.starts_with('/') {
@@ -45,7 +78,13 @@ pub fn resolve<'a>(
         None => (url, None),
     };
     let mut segs = path.split('/').filter(|s| !s.is_empty());
-    let name = segs.next().ok_or((404, "connector non specificato"))?;
+
+    // Un token sbagliato risponde come un path sconosciuto: chi sonda la porta
+    // non deve nemmeno capire che c'e' un proxy.
+    if !segs.next().is_some_and(|t| uguali(t, token)) {
+        return Err((404, "non trovato"));
+    }
+    let name = segs.next().ok_or((404, "non trovato"))?;
     let rest: Vec<&str> = segs.collect();
     if rest
         .iter()
@@ -67,26 +106,50 @@ pub fn resolve<'a>(
 }
 
 pub fn spawn(routes: HashMap<String, Route>, max_requests: Option<u64>) -> std::io::Result<Handle> {
-    let server =
-        tiny_http::Server::http("127.0.0.1:0").map_err(|e| std::io::Error::other(e.to_string()))?;
+    let server = Arc::new(
+        tiny_http::Server::http("127.0.0.1:0").map_err(|e| std::io::Error::other(e.to_string()))?,
+    );
     let port = server.server_addr().to_ip().expect("socket ip").port();
+    let token = Arc::new(token_casuale());
+    let routes = Arc::new(routes);
     let seen = Arc::new(AtomicU64::new(0));
-    let counter = seen.clone();
 
+    // Ogni richiesta va servita subito, in un thread suo. Metterle in coda per
+    // un pool di worker sembra piu' ordinato ma si inceppa: finche' tratteniamo
+    // un `Request` senza rispondere, tiny_http non legge la richiesta successiva
+    // da quella connessione, e sotto carico concorrente smette di consegnarne.
+    // Misurato: con un pool il proxy ne riceveva 111 su 120, e i client rimasti
+    // senza risposta aspettavano per sempre.
+    let agent = Arc::new(
+        ureq::AgentBuilder::new()
+            .redirects(0)
+            // Un upstream che non risponde mai non deve tenere appeso il figlio.
+            .timeout(std::time::Duration::from_secs(120))
+            .build(),
+    );
+    let token_pubblico = token.to_string();
+    let accettatore = server.clone();
+    let contatore = seen.clone();
     std::thread::spawn(move || {
-        let agent = ureq::AgentBuilder::new().redirects(0).build();
-        for req in server.incoming_requests() {
+        while let Ok(req) = accettatore.recv() {
             // Il contatore si incrementa PRIMA di inoltrare: contare a valle
             // lascerebbe passare piu' di N con richieste concorrenti.
-            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-            serve(req, &routes, &agent, max_requests, n);
+            let n = contatore.fetch_add(1, Ordering::SeqCst) + 1;
+            let (routes, token, agent) = (routes.clone(), token.clone(), agent.clone());
+            std::thread::spawn(move || serve(req, &token, &routes, &agent, max_requests, n));
         }
     });
-    Ok(Handle { port, seen })
+    Ok(Handle {
+        port,
+        token: token_pubblico,
+        seen,
+        server,
+    })
 }
 
 fn serve(
     mut req: tiny_http::Request,
+    token: &str,
     routes: &HashMap<String, Route>,
     agent: &ureq::Agent,
     max: Option<u64>,
@@ -107,7 +170,8 @@ fn serve(
     let mut body = Vec::new();
     let _ = req.as_reader().take(MAX_BODY).read_to_end(&mut body);
 
-    let (code, ctype, data) = match forward(&url, &method, &headers, body, routes, agent, max, n) {
+    let esito = forward(&url, token, &method, &headers, body, routes, agent, max, n);
+    let (code, ctype, data) = match esito {
         Ok(v) => v,
         Err((code, msg)) => (
             code,
@@ -127,6 +191,7 @@ fn serve(
 #[allow(clippy::too_many_arguments)]
 fn forward(
     url: &str,
+    token: &str,
     method: &str,
     headers: &[(String, String)],
     body: Vec<u8>,
@@ -141,13 +206,20 @@ fn forward(
     if !matches!(method, "GET" | "POST") {
         return Err((405, "metodo non consentito"));
     }
-    let (route, target) = resolve(url, routes)?;
+    let (route, target) = resolve(url, token, routes)?;
 
     let mut r = agent.request(method, &target);
     for (k, v) in headers {
-        if FORWARD.contains(&k.as_str()) {
-            r = r.set(k, v);
+        if !FORWARD.contains(&k.as_str()) {
+            continue;
         }
+        // Un valore con caratteri di controllo puo' spezzare la richiesta e
+        // iniettare header nostri. Non deleghiamo il controllo al client HTTP:
+        // se e' malformato la richiesta muore qui.
+        if v.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err((400, "header con caratteri di controllo"));
+        }
+        r = r.set(k, v);
     }
     r = match route.auth {
         Auth::Bearer => r.set("authorization", &format!("Bearer {}", route.key)),

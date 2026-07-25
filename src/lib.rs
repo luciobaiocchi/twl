@@ -60,10 +60,17 @@ pub fn prepare(
 }
 
 impl Prepared {
-    pub fn env_overrides(&self, port: u16) -> Vec<(String, String)> {
+    /// Il token di sessione e' il primo segmento del path. Il proxy ascolta su
+    /// loopback, raggiungibile da qualunque processo della macchina: senza
+    /// token, un altro utente locale potrebbe scoprire la porta e spendere la
+    /// tua chiave. Il figlio lo riceve qui dentro, nessun altro lo conosce.
+    pub fn env_overrides(&self, port: u16, token: &str) -> Vec<(String, String)> {
         let mut out = self.mocks.clone();
         for (var, conn) in &self.base_urls {
-            out.push((var.clone(), format!("http://127.0.0.1:{port}/{conn}")));
+            out.push((
+                var.clone(),
+                format!("http://127.0.0.1:{port}/{token}/{conn}"),
+            ));
         }
         out
     }

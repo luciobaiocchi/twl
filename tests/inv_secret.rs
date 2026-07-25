@@ -15,7 +15,7 @@ fn overrides() -> Vec<(String, String)> {
     let cfg = Config::parse(YAML).unwrap();
     prepare(&cfg, |_| Ok(KEY.to_string()))
         .unwrap()
-        .env_overrides(41234)
+        .env_overrides(41234, "TOKENDITEST")
 }
 
 fn value(vars: &[(String, String)], name: &str) -> String {
@@ -44,12 +44,16 @@ fn i_base_url_puntano_al_proxy_con_tutti_gli_alias() {
     let vars = overrides();
 
     for var in ["OPENAI_BASE_URL", "OPENAI_API_BASE"] {
-        assert_eq!(value(&vars, var), "http://127.0.0.1:41234/openai", "{var}");
+        assert_eq!(
+            value(&vars, var),
+            "http://127.0.0.1:41234/TOKENDITEST/openai",
+            "{var}"
+        );
     }
     for var in ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL"] {
         assert_eq!(
             value(&vars, var),
-            "http://127.0.0.1:41234/anthropic",
+            "http://127.0.0.1:41234/TOKENDITEST/anthropic",
             "{var}"
         );
     }

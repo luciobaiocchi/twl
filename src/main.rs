@@ -71,7 +71,7 @@ fn run(args: &[String]) -> Result<(), String> {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     avvisa_non_dichiarate(&overrides);
-    overrides.extend(prepared.env_overrides(handle.port));
+    overrides.extend(prepared.env_overrides(handle.port, &handle.token));
 
     eprintln!(
         "capshell: proxy su 127.0.0.1:{} — {} segreti mascherati{}",
@@ -212,7 +212,18 @@ fn mock_upstream(args: &[String]) -> Result<(), String> {
         .map_err(|_| "porta non valida")?;
     let server = tiny_http::Server::http(("127.0.0.1", port)).map_err(|e| e.to_string())?;
     eprintln!("mock-upstream su http://127.0.0.1:{port}");
-    for req in server.incoming_requests() {
+    // Una richiesta alla volta strozzerebbe il proxy, che ne manda diverse in
+    // parallelo su connessioni keep-alive.
+    std::thread::scope(|s| {
+        for req in server.incoming_requests() {
+            s.spawn(|| servi_finta(req));
+        }
+    });
+    Ok(())
+}
+
+fn servi_finta(req: tiny_http::Request) {
+    {
         let url = req.url().to_string();
         let seen: Vec<String> = req
             .headers()
@@ -250,5 +261,4 @@ fn mock_upstream(args: &[String]) -> Result<(), String> {
         };
         let _ = req.respond(resp);
     }
-    Ok(())
 }

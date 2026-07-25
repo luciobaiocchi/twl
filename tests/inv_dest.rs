@@ -18,16 +18,19 @@ fn routes(up: &str) -> HashMap<String, Route> {
     )])
 }
 
-fn proxy_su(up: &str, budget: Option<u64>) -> u16 {
-    proxy::spawn(routes(up), budget).unwrap().port
+/// L'Handle va tenuto vivo: quando cade, il proxy si spegne.
+fn proxy_su(up: &str, budget: Option<u64>) -> (proxy::Handle, String) {
+    let h = proxy::spawn(routes(up), budget).unwrap();
+    let prefisso = format!("/{}", h.token);
+    (h, prefisso)
 }
 
 #[test]
 fn la_chiave_vera_arriva_all_upstream_cablato() {
     let (up, log) = upstream();
-    let port = proxy_su(&up, None);
+    let (h, t) = proxy_su(&up, None);
 
-    let (code, _) = call(port, "GET", "/openai/v1/models", &[]);
+    let (code, _) = call(h.port, "GET", &format!("{t}/openai/v1/models"), &[]);
     assert_eq!(code, 200);
 
     let seen = log.lock().unwrap();
@@ -42,12 +45,12 @@ fn la_chiave_vera_arriva_all_upstream_cablato() {
 #[test]
 fn host_ostile_non_cambia_la_destinazione() {
     let (up, log) = upstream();
-    let port = proxy_su(&up, None);
+    let (h, t) = proxy_su(&up, None);
 
     let (code, _) = call(
-        port,
+        h.port,
         "GET",
-        "/openai/v1/models",
+        &format!("{t}/openai/v1/models"),
         &[("Host", "evil.example")],
     );
 
@@ -64,12 +67,12 @@ fn host_ostile_non_cambia_la_destinazione() {
 #[test]
 fn gli_header_di_forwarding_non_passano() {
     let (up, log) = upstream();
-    let port = proxy_su(&up, None);
+    let (h, t) = proxy_su(&up, None);
 
     call(
-        port,
+        h.port,
         "GET",
-        "/openai/v1/models",
+        &format!("{t}/openai/v1/models"),
         &[
             ("X-Forwarded-Host", "evil.example"),
             ("X-Original-URL", "http://evil.example"),
@@ -84,12 +87,12 @@ fn gli_header_di_forwarding_non_passano() {
 #[test]
 fn il_client_non_puo_sovrascrivere_authorization() {
     let (up, log) = upstream();
-    let port = proxy_su(&up, None);
+    let (h, t) = proxy_su(&up, None);
 
     call(
-        port,
+        h.port,
         "GET",
-        "/openai/v1/models",
+        &format!("{t}/openai/v1/models"),
         &[("Authorization", "Bearer sk-scelta-dall-agente")],
     );
 
@@ -103,9 +106,9 @@ fn il_client_non_puo_sovrascrivere_authorization() {
 #[test]
 fn i_redirect_non_vengono_seguiti() {
     let (up, log) = upstream();
-    let port = proxy_su(&up, None);
+    let (h, t) = proxy_su(&up, None);
 
-    let (code, _) = call(port, "GET", "/openai/redirect", &[]);
+    let (code, _) = call(h.port, "GET", &format!("{t}/openai/redirect"), &[]);
 
     assert_eq!(code, 302, "il 3xx torna al client cosi' com'e'");
     assert_eq!(
@@ -118,9 +121,9 @@ fn i_redirect_non_vengono_seguiti() {
 #[test]
 fn connector_sconosciuto_rifiutato() {
     let (up, log) = upstream();
-    let port = proxy_su(&up, None);
+    let (h, t) = proxy_su(&up, None);
 
-    let (code, _) = call(port, "GET", "/altro/v1/models", &[]);
+    let (code, _) = call(h.port, "GET", &format!("{t}/altro/v1/models"), &[]);
 
     assert_eq!(code, 404);
     assert!(log.lock().unwrap().is_empty());
@@ -129,9 +132,9 @@ fn connector_sconosciuto_rifiutato() {
 #[test]
 fn metodo_non_consentito_rifiutato() {
     let (up, log) = upstream();
-    let port = proxy_su(&up, None);
+    let (h, t) = proxy_su(&up, None);
 
-    let (code, _) = call(port, "DELETE", "/openai/v1/models", &[]);
+    let (code, _) = call(h.port, "DELETE", &format!("{t}/openai/v1/models"), &[]);
 
     assert_eq!(code, 405);
     assert!(log.lock().unwrap().is_empty());
@@ -140,18 +143,21 @@ fn metodo_non_consentito_rifiutato() {
 #[test]
 fn traversal_rifiutato() {
     let (up, log) = upstream();
-    let port = proxy_su(&up, None);
+    let (h, t) = proxy_su(&up, None);
 
-    assert_eq!(raw(port, "GET /openai/../../etc/passwd HTTP/1.1"), 400);
+    assert_eq!(
+        raw(h.port, &format!("GET {t}/openai/../../etc/passwd HTTP/1.1")),
+        400
+    );
     assert!(log.lock().unwrap().is_empty());
 }
 
 #[test]
 fn uri_assoluto_rifiutato() {
     let (up, log) = upstream();
-    let port = proxy_su(&up, None);
+    let (h, _t) = proxy_su(&up, None);
 
-    let code = raw(port, "GET http://evil.example/v1/models HTTP/1.1");
+    let code = raw(h.port, "GET http://evil.example/v1/models HTTP/1.1");
 
     assert!(
         code == 400 || code == 0,
@@ -163,14 +169,15 @@ fn uri_assoluto_rifiutato() {
 #[test]
 fn nessun_path_puo_cambiare_l_host_di_destinazione() {
     let r = routes("https://api.openai.com");
+    const T: &str = "tokenditest";
     for ostile in [
         "http://evil.example/v1",
         "//evil.example/v1",
-        "/openai/../../../evil.example",
-        "/openai/@evil.example/v1",
-        "/openai/v1#@evil.example",
+        &format!("/{T}/openai/../../../evil.example"),
+        &format!("/{T}/openai/@evil.example/v1"),
+        &format!("/{T}/openai/v1#@evil.example"),
     ] {
-        match resolve(ostile, &r) {
+        match resolve(ostile, T, &r) {
             Err(_) => {}
             Ok((_, target)) => assert!(
                 target.starts_with("https://api.openai.com/"),
@@ -183,9 +190,9 @@ fn nessun_path_puo_cambiare_l_host_di_destinazione() {
 #[test]
 fn la_chiave_non_torna_indietro_nella_risposta() {
     let (up, _log) = upstream();
-    let port = proxy_su(&up, None);
+    let (h, t) = proxy_su(&up, None);
 
-    let (code, body) = call(port, "GET", "/openai/echo-key", &[]);
+    let (code, body) = call(h.port, "GET", &format!("{t}/openai/echo-key"), &[]);
 
     assert_eq!(
         code, 502,
@@ -197,11 +204,11 @@ fn la_chiave_non_torna_indietro_nella_risposta() {
 #[test]
 fn il_budget_fallisce_chiuso() {
     let (up, log) = upstream();
-    let port = proxy_su(&up, Some(2));
+    let (h, t) = proxy_su(&up, Some(2));
 
-    assert_eq!(call(port, "GET", "/openai/a", &[]).0, 200);
-    assert_eq!(call(port, "GET", "/openai/b", &[]).0, 200);
-    let (code, body) = call(port, "GET", "/openai/c", &[]);
+    assert_eq!(call(h.port, "GET", &format!("{t}/openai/a"), &[]).0, 200);
+    assert_eq!(call(h.port, "GET", &format!("{t}/openai/b"), &[]).0, 200);
+    let (code, body) = call(h.port, "GET", &format!("{t}/openai/c"), &[]);
 
     assert_eq!(code, 429);
     assert!(body.contains("budget"));

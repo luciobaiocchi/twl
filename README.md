@@ -95,6 +95,12 @@ chiaro e in base64.
 `/openai` parla con `api.openai.com` e con nient'altro. Non esiste un proxy
 generico.
 
+Ogni URL comincia con un **token di sessione** casuale, che il figlio riceve nel
+suo environment. Il proxy ascolta su loopback, raggiungibile da qualunque
+processo della macchina: senza token un altro utente locale potrebbe scoprire la
+porta e spendere la tua chiave. Un token sbagliato risponde `404` esattamente
+come un path inesistente, e il confronto e' a tempo costante.
+
 **Test — tutti respinti o forzati sull'host fisso:** header `Host` ostile;
 request line con URI assoluto; `CONNECT`; `X-Forwarded-Host`, `X-Original-URL`;
 path traversal; **e i redirect `3xx` dall'upstream, che il proxy non segue mai e
@@ -145,7 +151,7 @@ ricevuto.
 
 ```bash
 cargo build
-cargo test                 # 24 test: INV-SECRET, INV-DEST, budget, canali
+cargo test                 # 30 test: INV-SECRET, INV-DEST, budget, canali, attacchi
 
 # terminale 1 — il finto provider
 ./target/debug/capshell mock-upstream --port 9000
@@ -167,6 +173,10 @@ env | grep OPENAI
 curl -s "$OPENAI_BASE_URL/v1/models"
 # "authorization":"<ricevuta, 55 byte, inizia con Bearer sk-CANARY-C>"
 #  ^ la chiave vera e' arrivata all'upstream, senza mai passare da qui
+
+curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:PORTA/openai/v1/models"
+# 404: senza il token di sessione il proxy non serve nessuno, nemmeno
+# un altro processo dello stesso utente che ha trovato la porta
 
 curl -s -H "Host: evil.example" "$OPENAI_BASE_URL/v1/models"
 # stessa risposta: l'header Host non sposta la destinazione (INV-DEST)
