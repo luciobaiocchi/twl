@@ -13,7 +13,8 @@ attaccate alle richieste solo da un proxy locale con destinazione cablata.
 
 > **Stato: v0 in corso.** Il nucleo funziona ed è coperto da test. Portachiavi
 > attivo su macOS, Windows e Linux; su Linux il canale D-Bus verso il figlio
-> viene chiuso con bubblewrap, quando c'è.
+> viene chiuso con bubblewrap, quando c'è. 76 dipendenze, di cui 53 sono lo
+> stack TLS.
 > Non è software di sicurezza auditato: fino a revisione indipendente, usare
 > solo credenziali di test.
 
@@ -249,6 +250,40 @@ Un caso resta scoperto e viene segnalato: se il bus è su un **socket astratto**
 (`unix:abstract=`), quello vive nel network namespace e non nel filesystem, e un
 mount namespace non lo tocca.
 
+Puoi verificare tutto questo da solo — è la proprietà su cui poggia il supporto
+Linux, quindi non fidarti sulla parola:
+
+```bash
+./scripts/verifica-portachiavi-linux.sh
+```
+
+```
+--- fuori da capshell ---
+sk-CANARY-NON-DEVE-USCIRE
+--- dentro capshell, stesso comando ---
+secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY
+```
+
+Stesso comando, stesso utente, stesso portachiavi.
+
+### Perché su Linux si chiama `secret-tool` e su macOS no
+
+Su Linux il portachiavi si raggiunge con **`secret-tool`** (pacchetto
+`libsecret-tools`), il client a riga di comando di libsecret. La libreria Rust
+equivalente costa **79 crate** per implementare D-Bus, e non comprerebbe nessuna
+garanzia in più: come dice la tabella qui sopra, il Secret Service autorizza per
+utente, quindi la barriera verso l'agente la mette comunque il mount namespace.
+Al portachiavi resta un solo mestiere — non lasciare il valore in chiaro su disco
+— e per quello la CLI basta.
+
+Su macOS **no, e non è una scelta di gusto**: la ACL del Keychain è legata alla
+firma del binario che chiede. Invocando `/usr/bin/security` da riga di comando la
+garanzia si attaccherebbe a *quello*, e qualunque processo potrebbe ottenerla.
+Lì la libreria è obbligatoria.
+
+Da cui la regola: **libreria dove l'identità del chiamante conta, sottoprocesso
+dove non conta.**
+
 **Su Windows** non esiste un equivalente semplice, quindi la garanzia si ferma
 alla protezione dall'esposizione.
 
@@ -311,8 +346,17 @@ container o privilegi.
 
 L'unico uso di namespace è quello descritto sopra: rimuovere dalla vista del
 figlio i socket delle credenziali, su Linux, come hardening opzionale con
-fallback. Richiede `bubblewrap` (`apt install bubblewrap`), che è opzionale:
-senza, Capshell funziona e lo segnala.
+fallback.
+
+Su Linux due pacchetti opzionali, sulla stessa riga di `apt`:
+
+```bash
+apt install bubblewrap libsecret-tools
+```
+
+`bubblewrap` chiude i canali, `libsecret-tools` dà accesso al portachiavi. Senza
+il primo Capshell funziona e avvisa; senza il secondo si usa `--env`. Nessuno
+dei due è un requisito di compilazione.
 
 **Non è previsto un confinamento del filesystem costruito da Capshell.** Chi
 vuole confinare davvero il filesystem usa Docker, che lo fa meglio ed è già nel

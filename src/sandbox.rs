@@ -47,27 +47,21 @@ pub fn canali(var: impl Fn(&str) -> Option<String>, esiste: impl Fn(&Path) -> bo
         }
     }
 
-    for chiave in ["SSH_AUTH_SOCK", "GPG_AGENT_INFO"] {
-        if let Some(path) = var(chiave).map(PathBuf::from).filter(|p| esiste(p)) {
-            let dentro_xdg = c.xdg_runtime.as_ref().is_some_and(|d| path.starts_with(d));
-            if !dentro_xdg {
-                c.socket.push(path);
-            }
-        }
-    }
-
-    if let Some(home) = var("HOME") {
-        let gpg = PathBuf::from(home).join(".gnupg/S.gpg-agent");
-        if esiste(&gpg) {
-            c.socket.push(gpg);
-        }
-    }
-
-    for noto in SOCKET_NOTI {
-        let path = PathBuf::from(noto);
-        if esiste(&path) {
+    let mut aggiungi = |path: PathBuf| {
+        let dentro_xdg = c.xdg_runtime.as_ref().is_some_and(|d| path.starts_with(d));
+        if !dentro_xdg && esiste(&path) {
             c.socket.push(path);
         }
+    };
+
+    if let Some(path) = var("SSH_AUTH_SOCK") {
+        aggiungi(PathBuf::from(path));
+    }
+    if let Some(home) = var("HOME") {
+        aggiungi(PathBuf::from(home).join(".gnupg/S.gpg-agent"));
+    }
+    for noto in SOCKET_NOTI {
+        aggiungi(PathBuf::from(noto));
     }
 
     c

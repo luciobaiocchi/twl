@@ -13,19 +13,12 @@ ureq = "2"
 rand = "0.8"
 rpassword = "7"
 
+# Solo macOS e Windows: li' il portachiavi si raggiunge dalla libreria, e su
+# macOS e' obbligatorio perche' la ACL del Keychain e' legata alla firma del
+# binario che chiede. Su Linux si chiama `secret-tool` (vedi src/secret.rs):
+# stesso portachiavi, 79 crate in meno, e nessuna garanzia persa.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
-
-# Su Linux il Secret Service autorizza per utente, non per applicazione: il
-# portachiavi da solo non e' una barriera verso il figlio. La barriera la
-# costruisce src/sandbox.rs togliendogli il socket del bus.
-#
-# `async-secret-service` invece di `sync-`: quest'ultima passa da libdbus-sys,
-# che pretende libdbus-1-dev installato su ogni macchina che compila. La
-# variante async parla il protocollo D-Bus in Rust puro — piu' crate, ma
-# nessun pacchetto di sistema da procurarsi.
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"] }
 
 [profile.release]
 opt-level = "z"

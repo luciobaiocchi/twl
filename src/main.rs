@@ -152,8 +152,18 @@ fn secret_cmd(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("set") => {
             let name = args.get(1).ok_or("manca il nome del segreto")?;
-            let value = rpassword::prompt_password(format!("{name}: "))
-                .map_err(|e| format!("lettura da tty: {e}"))?;
+            // Da terminale si legge con l'eco disabilitato; da pipe si legge una
+            // riga, cosi' `echo … | capshell secret set NOME` funziona.
+            let value = match rpassword::prompt_password(format!("{name}: ")) {
+                Ok(v) => v,
+                Err(_) => {
+                    let mut riga = String::new();
+                    std::io::stdin()
+                        .read_line(&mut riga)
+                        .map_err(|e| format!("lettura del valore: {e}"))?;
+                    riga.trim_end_matches('\n').to_string()
+                }
+            };
             if value.is_empty() {
                 return Err("valore vuoto".into());
             }
