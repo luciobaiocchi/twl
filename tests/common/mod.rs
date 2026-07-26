@@ -49,7 +49,7 @@ fn serve_upstream(request: tiny_http::Request, sink: &Log) {
         .collect();
     let authentication = headers
         .iter()
-        .find(|(name, _)| name == "authorization" || name == "x-api-key")
+        .find(|(name, _)| name == "authorization")
         .map(|(_, value)| value.clone())
         .unwrap_or_default();
     sink.lock().unwrap().push(Seen {
@@ -90,7 +90,7 @@ fn serve_upstream(request: tiny_http::Request, sink: &Log) {
     } else if url.starts_with("/v1/echo-key") {
         tiny_http::Response::from_data(authentication.into_bytes()).with_status_code(200)
     } else {
-        tiny_http::Response::from_data(b"ok".to_vec())
+        tiny_http::Response::from_data(br#"{"authenticated":true}"#.to_vec())
             .with_status_code(200)
             .with_header(tiny_http::Header::from_bytes("content-type", "application/json").unwrap())
     };

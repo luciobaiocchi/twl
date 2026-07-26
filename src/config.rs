@@ -1,9 +1,14 @@
 use serde::Deserialize;
 
-#[derive(Deserialize, Debug)]
+pub const CHILD_SECRET_ENV: &str = "APP_API_KEY";
+pub const CHILD_BASE_URL_ENV: &str = "APP_BASE_URL";
+pub const PARENT_SECRET_ENV: &str = "MTL_APPLICATION_API_KEY";
+pub const PARENT_UPSTREAM_ENV: &str = "MTL_APPLICATION_UPSTREAM";
+pub const ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
+
+#[derive(Default, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub connectors: Vec<String>,
     #[serde(default)]
     pub budget: Option<Budget>,
 }
@@ -14,108 +19,39 @@ pub struct Budget {
     pub max_requests: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Auth {
-    Bearer,
-    XApiKey,
-}
+pub fn validate_upstream(value: &str) -> Result<String, String> {
+    let parsed =
+        url::Url::parse(value).map_err(|_| "upstream must be an absolute URL".to_string())?;
+    if parsed.cannot_be_a_base() || parsed.host().is_none() {
+        return Err("upstream must include a host".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("upstream must not contain user information".into());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("upstream must not contain a query or fragment".into());
+    }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct AllowedRoute {
-    pub method: &'static str,
-    pub path: &'static str,
-}
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+        return Err("upstream must use HTTPS (HTTP is allowed only on loopback)".into());
+    }
 
-pub struct Connector {
-    pub id: &'static str,
-    pub secret_env: &'static str,
-    pub upstream: &'static str,
-    pub auth: Auth,
-    pub mock_prefix: &'static str,
-    pub base_url_vars: &'static [&'static str],
-    /// OpenAI clients append `responses` to a base URL that already ends in
-    /// `/v1`; other clients have different conventions.
-    pub client_base_suffix: &'static str,
-    pub allowed: &'static [AllowedRoute],
-}
-
-const OPENAI_ROUTES: &[AllowedRoute] = &[
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/models",
-    },
-    AllowedRoute {
-        method: "POST",
-        path: "/v1/responses",
-    },
-    AllowedRoute {
-        method: "POST",
-        path: "/v1/chat/completions",
-    },
-    AllowedRoute {
-        method: "POST",
-        path: "/v1/embeddings",
-    },
-];
-
-const ANTHROPIC_ROUTES: &[AllowedRoute] = &[
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/models",
-    },
-    AllowedRoute {
-        method: "POST",
-        path: "/v1/messages",
-    },
-];
-
-pub static CONNECTORS: &[Connector] = &[
-    Connector {
-        id: "openai",
-        secret_env: "OPENAI_API_KEY",
-        upstream: "https://api.openai.com",
-        auth: Auth::Bearer,
-        mock_prefix: "sk-",
-        base_url_vars: &["OPENAI_BASE_URL", "OPENAI_API_BASE"],
-        client_base_suffix: "/v1",
-        allowed: OPENAI_ROUTES,
-    },
-    Connector {
-        id: "anthropic",
-        secret_env: "ANTHROPIC_API_KEY",
-        upstream: "https://api.anthropic.com",
-        auth: Auth::XApiKey,
-        mock_prefix: "sk-ant-",
-        base_url_vars: &["ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL"],
-        client_base_suffix: "",
-        allowed: ANTHROPIC_ROUTES,
-    },
-];
-
-pub fn connector(name: &str) -> Option<&'static Connector> {
-    CONNECTORS.iter().find(|connector| connector.id == name)
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
 impl Config {
-    pub fn parse(raw: &str) -> Result<Config, String> {
-        let cfg: Config = serde_yaml::from_str(raw).map_err(|e| e.to_string())?;
-        if cfg.connectors.is_empty() {
-            return Err("at least one connector is required".into());
-        }
-        let mut seen = std::collections::HashSet::new();
-        for name in &cfg.connectors {
-            if connector(name).is_none() {
-                return Err(format!("unknown connector: {name}"));
-            }
-            if !seen.insert(name) {
-                return Err(format!("duplicate connector: {name}"));
-            }
-        }
-        Ok(cfg)
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        serde_yaml::from_str(raw).map_err(|error| error.to_string())
     }
 
-    pub fn load(path: &str) -> Result<Config, String> {
-        let raw = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-        Config::parse(&raw).map_err(|e| format!("{path}: {e}"))
+    pub fn load(path: &str) -> Result<Self, String> {
+        let raw = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+        Self::parse(&raw).map_err(|error| format!("{path}: {error}"))
     }
 }

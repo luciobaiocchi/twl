@@ -1,115 +1,101 @@
 pub mod config;
 pub mod proxy;
+pub mod runtime;
 pub mod secret;
 
-use config::{connector, Config, Connector, CONNECTORS};
-use proxy::Route;
-use std::collections::HashMap;
+use config::{
+    validate_upstream, CHILD_BASE_URL_ENV, CHILD_SECRET_ENV, PARENT_SECRET_ENV, PARENT_UPSTREAM_ENV,
+};
 use std::process::Command;
 
-/// Session-oracle variables are never inherited. Removing the D-Bus address is
-/// only defense in depth; secure automatic keyring mode is macOS-only in v0.
+/// Session-oracle variables are never inherited by the agent process.
 pub const STRIP: &[&str] = &["DBUS_SESSION_BUS_ADDRESS"];
 
 pub struct Prepared {
-    pub routes: HashMap<String, Route>,
-    /// `(environment variable, fake value)` visible to the child.
-    pub mocks: Vec<(String, String)>,
-    /// `(base URL variable, connector, client-specific suffix)`.
-    pub base_urls: Vec<(String, String, String)>,
+    route: proxy::Route,
+    mock: String,
 }
 
-fn prepare_inner(
-    cfg: &Config,
-    source: impl Fn(&Connector) -> Result<String, String>,
-    demo_upstream: Option<&str>,
-) -> Result<Prepared, String> {
-    let mut prepared = Prepared {
-        routes: HashMap::new(),
-        mocks: Vec::new(),
-        base_urls: Vec::new(),
-    };
+/// A real credential paired with the only upstream allowed to receive it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionMaterial {
+    pub key: String,
+    pub upstream: String,
+}
 
-    for name in &cfg.connectors {
-        let connector = connector(name).ok_or_else(|| format!("unknown connector: {name}"))?;
-        let key = source(connector)?;
-        if key.is_empty() {
-            return Err(format!("empty credential for connector {}", connector.id));
-        }
-        prepared.routes.insert(
-            connector.id.to_string(),
-            Route {
-                upstream: demo_upstream.unwrap_or(connector.upstream).to_string(),
-                auth: connector.auth,
-                key,
-                allowed: connector.allowed,
-            },
-        );
-        prepared.mocks.push((
-            connector.secret_env.to_string(),
-            secret::mock(connector.mock_prefix),
-        ));
-        for var in connector.base_url_vars {
-            prepared.base_urls.push((
-                var.to_string(),
-                connector.id.to_string(),
-                connector.client_base_suffix.to_string(),
-            ));
-        }
+fn prepare(material: SessionMaterial, mock: String) -> Result<Prepared, String> {
+    if material.key.is_empty() {
+        return Err("empty application credential".into());
     }
-    Ok(prepared)
+    if material.key.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        return Err("application credential contains control characters".into());
+    }
+
+    let upstream = validate_upstream(&material.upstream)?;
+    Ok(Prepared {
+        route: proxy::Route {
+            upstream,
+            key: material.key,
+        },
+        mock,
+    })
 }
 
-/// Prepare a real session. The caller can supply a test source, but destination,
-/// authentication mode, secret identity, and route policy always come from the
-/// compiled connector table.
-pub fn prepare(
-    cfg: &Config,
-    source: impl Fn(&Connector) -> Result<String, String>,
-) -> Result<Prepared, String> {
-    prepare_inner(cfg, source, None)
+pub fn prepare_session(material: SessionMaterial) -> Result<Prepared, String> {
+    prepare(material, secret::mock())
 }
 
-/// Prepare a canary-only demonstration. This is the only path that can replace
-/// an upstream, and it cannot read the keyring.
-pub fn prepare_demo(cfg: &Config, upstream: &str) -> Result<Prepared, String> {
-    prepare_inner(
-        cfg,
-        |connector| Ok(secret::demo(connector.mock_prefix)),
-        Some(upstream),
+/// Prepare a canary-only demonstration against a local generated upstream.
+pub fn prepare_demo(upstream: &str) -> Result<Prepared, String> {
+    prepare(
+        SessionMaterial {
+            key: secret::demo(),
+            upstream: upstream.to_string(),
+        },
+        secret::mock(),
     )
 }
 
 impl Prepared {
+    pub fn start(
+        self,
+        max_requests: Option<u64>,
+    ) -> std::io::Result<(proxy::Handle, Vec<(String, String)>)> {
+        let handle = proxy::spawn(self.route, max_requests)?;
+        let overrides = vec![
+            (CHILD_SECRET_ENV.into(), self.mock),
+            (
+                CHILD_BASE_URL_ENV.into(),
+                format!("http://127.0.0.1:{}/{}", handle.port, handle.token),
+            ),
+        ];
+        Ok((handle, overrides))
+    }
+
     pub fn env_overrides(&self, port: u16, token: &str) -> Vec<(String, String)> {
-        let mut out = self.mocks.clone();
-        for (var, connector, suffix) in &self.base_urls {
-            out.push((
-                var.clone(),
-                format!("http://127.0.0.1:{port}/{token}/{connector}{suffix}"),
-            ));
-        }
-        out
+        vec![
+            (CHILD_SECRET_ENV.into(), self.mock.clone()),
+            (
+                CHILD_BASE_URL_ENV.into(),
+                format!("http://127.0.0.1:{port}/{token}"),
+            ),
+        ]
     }
 }
 
-/// The child inherits ordinary configuration, but never an ambient supported
-/// credential or stale provider base URL. Selected values are then replaced by
-/// the session-scoped mocks and local URLs.
+/// Replace the application credential with a fake value and remove every
+/// parent-only input before launching the agent.
 pub fn child_command(program: &str, args: &[String], overrides: &[(String, String)]) -> Command {
-    let mut cmd = Command::new(program);
-    cmd.args(args);
-    for var in STRIP {
-        cmd.env_remove(var);
+    let mut command = Command::new(program);
+    command.args(args);
+    for variable in STRIP {
+        command.env_remove(variable);
     }
-    for connector in CONNECTORS {
-        cmd.env_remove(connector.secret_env);
-        for var in connector.base_url_vars {
-            cmd.env_remove(var);
-        }
+    for variable in [PARENT_SECRET_ENV, PARENT_UPSTREAM_ENV] {
+        command.env_remove(variable);
     }
     for (key, value) in overrides {
-        cmd.env(key, value);
+        command.env(key, value);
     }
-    cmd
+    command
 }

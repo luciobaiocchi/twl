@@ -3,7 +3,7 @@ name = "mithril"
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.82"
-description = "Local credential broker for tools and coding agents"
+description = "Local project-credential broker for coding agents"
 license = "Apache-2.0"
 default-run = "mtl"
 
@@ -19,15 +19,10 @@ ureq = "2"
 rand = "0.8"
 rpassword = "7"
 base64 = "0.22"
+url = "2"
 
-# Secure host mode starts on macOS. LocalAuthentication gates every operation;
-# the file-based Keychain ACL separately limits silent reads to the creator.
-[target.'cfg(target_os = "macos")'.dependencies]
-block2 = "0.6"
-objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString"] }
-objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "block2", "LAContext"] }
-security-framework = "3"
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 opt-level = "z"

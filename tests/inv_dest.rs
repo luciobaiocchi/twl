@@ -1,62 +1,21 @@
 mod common;
 
 use common::{call, raw, upstream};
-use mithril::config::{connector, AllowedRoute, Auth};
 use mithril::proxy::{self, resolve, Route};
-use std::collections::HashMap;
 use std::io::{Read, Write};
 
-const KEY: &str = "sk-CANARY-REAL-KEY-0123456789";
-const TEST_ROUTES: &[AllowedRoute] = &[
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/models",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/redirect",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/echo-key",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/echo-key-base64",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/echo-key-base64-no-pad",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/echo-key-header",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/a",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/b",
-    },
-];
+const KEY: &str = "project-canary-real-key-0123456789";
 
-fn routes(upstream: &str, allowed: &'static [AllowedRoute]) -> HashMap<String, Route> {
-    HashMap::from([(
-        "openai".to_string(),
-        Route {
-            upstream: upstream.to_string(),
-            auth: Auth::Bearer,
-            key: KEY.to_string(),
-            allowed,
-        },
-    )])
+fn route(upstream: &str) -> Route {
+    Route {
+        upstream: upstream.to_string(),
+        key: KEY.to_string(),
+    }
 }
 
 fn test_proxy(upstream: &str, budget: Option<u64>) -> (proxy::Handle, String) {
-    let handle = proxy::spawn(routes(upstream, TEST_ROUTES), budget).unwrap();
-    let prefix = format!("/{}/openai", handle.token);
+    let handle = proxy::spawn(route(upstream), budget).unwrap();
+    let prefix = format!("/{}", handle.token);
     (handle, prefix)
 }
 
@@ -79,7 +38,29 @@ fn real_key_reaches_only_the_fixed_upstream() {
 }
 
 #[test]
-fn hostile_host_and_forwarding_headers_are_ignored() {
+fn ordinary_application_paths_and_methods_are_forwarded() {
+    let (upstream, log) = upstream();
+    let (handle, prefix) = test_proxy(&upstream, None);
+
+    assert_eq!(
+        call(
+            handle.port,
+            "POST",
+            &format!("{prefix}/projects/42/tasks?dry_run=true"),
+            &[],
+        )
+        .0,
+        200
+    );
+    assert_eq!(call(handle.port, "GET", &format!("{prefix}/"), &[]).0, 200);
+
+    let seen = log.lock().unwrap();
+    assert_eq!(seen[0].url, "/projects/42/tasks?dry_run=true");
+    assert_eq!(seen[1].url, "/");
+}
+
+#[test]
+fn hostile_host_and_auth_headers_are_ignored() {
     let (upstream, log) = upstream();
     let (handle, prefix) = test_proxy(&upstream, None);
     let headers = [
@@ -87,6 +68,7 @@ fn hostile_host_and_forwarding_headers_are_ignored() {
         ("X-Forwarded-Host", "evil.example"),
         ("X-Original-URL", "http://evil.example"),
         ("Authorization", "Bearer attacker-choice"),
+        ("X-Api-Key", "attacker-choice"),
     ];
     assert_eq!(
         call(handle.port, "GET", &format!("{prefix}/v1/models"), &headers).0,
@@ -97,6 +79,7 @@ fn hostile_host_and_forwarding_headers_are_ignored() {
     assert_ne!(seen[0].header("host"), Some("evil.example"));
     assert_eq!(seen[0].header("x-forwarded-host"), None);
     assert_eq!(seen[0].header("x-original-url"), None);
+    assert_eq!(seen[0].header("x-api-key"), None);
     assert_eq!(
         seen[0].header("authorization"),
         Some(&*format!("Bearer {KEY}"))
@@ -107,7 +90,7 @@ fn hostile_host_and_forwarding_headers_are_ignored() {
 fn missing_or_wrong_session_token_reaches_nothing() {
     let (upstream, log) = upstream();
     let (handle, _prefix) = test_proxy(&upstream, None);
-    for path in ["/openai/v1/models", "/wrong/openai/v1/models", "/openai"] {
+    for path in ["/v1/models", "/wrong/v1/models", "/wrong"] {
         assert_eq!(call(handle.port, "GET", path, &[]).0, 404, "{path}");
     }
     assert!(log.lock().unwrap().is_empty());
@@ -123,35 +106,13 @@ fn redirects_are_returned_but_never_followed() {
 }
 
 #[test]
-fn unknown_connector_method_and_provider_path_are_rejected() {
+fn unsupported_methods_are_rejected() {
     let (upstream, log) = upstream();
-    let production = connector("openai").unwrap();
-    let handle = proxy::spawn(routes(&upstream, production.allowed), None).unwrap();
-    let prefix = format!("/{}/openai", handle.token);
+    let (handle, prefix) = test_proxy(&upstream, None);
 
     assert_eq!(
-        call(
-            handle.port,
-            "GET",
-            &format!("/{}/unknown/v1/models", handle.token),
-            &[]
-        )
-        .0,
-        404
-    );
-    assert_eq!(
-        call(handle.port, "DELETE", &format!("{prefix}/v1/models"), &[]).0,
+        call(handle.port, "OPTIONS", &format!("{prefix}/v1/models"), &[]).0,
         405
-    );
-    assert_eq!(
-        call(
-            handle.port,
-            "POST",
-            &format!("{prefix}/v1/organization/api_keys"),
-            &[]
-        )
-        .0,
-        403
     );
     assert!(log.lock().unwrap().is_empty());
 }
@@ -182,17 +143,18 @@ fn malformed_targets_never_reach_upstream() {
 
 #[test]
 fn no_path_can_change_the_destination_host() {
-    let routes = routes("https://api.openai.com", TEST_ROUTES);
+    let route = route("https://service.example/api");
     let token = "TESTTOKEN";
     for hostile in [
         "http://evil.example/v1",
         "//evil.example/v1",
-        "/TESTTOKEN/openai/v1/@evil.example",
-        "/TESTTOKEN/openai/v1/models#@evil.example",
+        "/TESTTOKEN//evil.example/v1",
+        "/TESTTOKEN/v1/@evil.example",
+        "/TESTTOKEN/v1/models#@evil.example",
     ] {
-        match resolve(hostile, token, "GET", &routes) {
+        match resolve(hostile, token, "GET", &route) {
             Err(_) => {}
-            Ok((_, target)) => assert!(target.starts_with("https://api.openai.com/")),
+            Ok(target) => assert!(target.starts_with("https://service.example/api/")),
         }
     }
 }
@@ -223,10 +185,7 @@ fn invalid_requests_do_not_consume_budget() {
     let (upstream, log) = upstream();
     let (handle, prefix) = test_proxy(&upstream, Some(1));
 
-    assert_eq!(
-        call(handle.port, "GET", "/wrong/openai/v1/models", &[]).0,
-        404
-    );
+    assert_eq!(call(handle.port, "GET", "/wrong/v1/models", &[]).0, 404);
     assert_eq!(
         call(handle.port, "GET", &format!("{prefix}/v1/a"), &[]).0,
         200
@@ -250,7 +209,7 @@ fn rejected_body_is_drained_before_keep_alive_reuse() {
 
     write!(
         stream,
-        "POST /wrong/openai/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}GET {prefix}/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        "POST /wrong/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}GET {prefix}/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
         body.len(),
         body
     )

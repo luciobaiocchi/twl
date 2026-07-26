@@ -1,7 +1,5 @@
-use mithril::config::{connector, Config};
-use mithril::{child_command, prepare, prepare_demo, proxy, secret, Prepared};
-use std::collections::HashMap;
-use std::path::Path;
+use mithril::config::{Config, CHILD_BASE_URL_ENV, CHILD_SECRET_ENV, PARENT_SECRET_ENV};
+use mithril::{child_command, prepare_demo, prepare_session, runtime, secret, Prepared};
 use std::process::exit;
 
 fn main() {
@@ -9,8 +7,7 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("run") => run(&args[1..]),
         Some("demo") => demo(&args[1..]),
-        Some("secret") => secret_command(&args[1..]).map(|_| 0),
-        Some("doctor") => {
+        Some("doctor") if args.len() == 1 => {
             doctor();
             Ok(0)
         }
@@ -28,74 +25,123 @@ fn main() {
 
 fn usage() -> String {
     "usage:\n\
-     mtl run [--config mithril.yaml] -- <command> [args...]\n\
+     mtl run [--config mithril.yaml] --upstream URL [--secret-fd FD] -- <command> [args...]\n\
      mtl demo [--config mithril.yaml] -- <command> [args...]\n\
-     mtl secret set <connector>\n\
-     mtl secret import <file.env> [--config mithril.yaml]\n\
-     mtl secret delete <connector>\n\
      mtl doctor"
         .into()
 }
 
-fn config_path(flags: &[String]) -> Result<String, String> {
-    let mut path = "mithril.yaml".to_string();
-    let mut index = 0;
-    while index < flags.len() {
-        if flags[index] != "--config" {
-            return Err(format!("unknown option: {}", flags[index]));
-        }
-        path = flags
-            .get(index + 1)
-            .cloned()
-            .ok_or("--config requires a path")?;
-        index += 2;
-    }
-    Ok(path)
+#[derive(Default)]
+struct RunFlags {
+    config: Option<String>,
+    runtime: runtime::Inputs,
 }
 
-fn invocation(args: &[String]) -> Result<(Config, &str, &[String]), String> {
+fn run_flags(flags: &[String]) -> Result<RunFlags, String> {
+    let mut parsed = RunFlags::default();
+    let mut index = 0;
+    while index < flags.len() {
+        let option = flags[index].as_str();
+        let value = flags
+            .get(index + 1)
+            .ok_or_else(|| format!("{option} requires a value"))?;
+        match option {
+            "--config" => {
+                if parsed.config.replace(value.clone()).is_some() {
+                    return Err("--config was specified more than once".into());
+                }
+            }
+            "--upstream" => parsed.runtime.set_upstream(value.clone())?,
+            "--secret-fd" => {
+                let fd = value
+                    .parse()
+                    .map_err(|_| "--secret-fd requires a numeric descriptor".to_string())?;
+                parsed.runtime.set_secret_fd(fd)?;
+            }
+            _ => return Err(format!("unknown option: {option}")),
+        }
+        index += 2;
+    }
+    Ok(parsed)
+}
+
+fn config_flags(flags: &[String]) -> Result<Option<String>, String> {
+    match flags {
+        [] => Ok(None),
+        [option, path] if option == "--config" => Ok(Some(path.clone())),
+        [option, ..] if option != "--config" => Err(format!("unknown option: {option}")),
+        _ => Err("usage: --config mithril.yaml".into()),
+    }
+}
+
+fn load_config(path: Option<&str>) -> Result<Config, String> {
+    path.map(Config::load)
+        .transpose()
+        .map(|config| config.unwrap_or_default())
+}
+
+fn run_invocation(args: &[String]) -> Result<(Config, RunFlags, &str, &[String]), String> {
     let split = args
         .iter()
         .position(|arg| arg == "--")
         .ok_or("missing `-- <command>`")?;
-    let config = Config::load(&config_path(&args[..split])?)?;
+    let flags = run_flags(&args[..split])?;
+    let config = load_config(flags.config.as_deref())?;
+    let command = args.get(split + 1).ok_or("missing command")?;
+    Ok((config, flags, command, &args[split + 2..]))
+}
+
+fn demo_invocation(args: &[String]) -> Result<(Config, &str, &[String]), String> {
+    let split = args
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or("missing `-- <command>`")?;
+    let config_path = config_flags(&args[..split])?;
+    let config = load_config(config_path.as_deref())?;
     let command = args.get(split + 1).ok_or("missing command")?;
     Ok((config, command, &args[split + 2..]))
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
-    let (config, command, command_args) = invocation(args)?;
-    eprintln!(
-        "mtl: requesting human authorization for: {}",
-        config.connectors.join(", ")
-    );
-    let prepared = prepare(&config, |connector| secret::get(connector.id))?;
-    run_prepared(config, prepared, command, command_args)
+    let (config, flags, command, command_args) = run_invocation(args)?;
+    eprintln!("mtl: requesting the project application credential");
+    let resolved = flags.runtime.resolve(|| {
+        rpassword::prompt_password(format!("{CHILD_SECRET_ENV}: "))
+            .map_err(|error| format!("reading from terminal: {error}"))
+    })?;
+    if resolved.used_environment_secret {
+        eprintln!(
+            "mtl: warning: {PARENT_SECRET_ENV} is a weaker input because parent environments can leak through shell history, logs, or process metadata; prefer --secret-fd FD"
+        );
+    }
+    run_prepared(
+        config,
+        prepare_session(resolved.material)?,
+        command,
+        command_args,
+    )
 }
 
 fn demo(args: &[String]) -> Result<i32, String> {
-    let (config, command, command_args) = invocation(args)?;
+    let (config, command, command_args) = demo_invocation(args)?;
     let upstream = spawn_demo_upstream()?;
-    let prepared = prepare_demo(&config, &upstream)?;
-    eprintln!("mtl: demo mode uses generated canaries; no keyring access");
+    let prepared = prepare_demo(&upstream)?;
+    eprintln!("mtl: demo mode uses a generated canary; no real credential is read");
     run_prepared(config, prepared, command, command_args)
 }
 
 fn run_prepared(
     config: Config,
-    mut prepared: Prepared,
+    prepared: Prepared,
     command: &str,
     command_args: &[String],
 ) -> Result<i32, String> {
     let budget = config.budget.map(|budget| budget.max_requests);
-    let routes = std::mem::take(&mut prepared.routes);
-    let handle = proxy::spawn(routes, budget).map_err(|error| error.to_string())?;
-    let overrides = prepared.env_overrides(handle.port, &handle.token);
+    let (handle, overrides) = prepared.start(budget).map_err(|error| error.to_string())?;
 
     eprintln!(
-        "mtl: session proxy on 127.0.0.1:{} — {} connector(s){}",
+        "mtl: application proxy on 127.0.0.1:{}{}",
         handle.port,
-        prepared.mocks.len(),
         budget
             .map(|max| format!(", request budget {max}"))
             .unwrap_or_default()
@@ -106,102 +152,19 @@ fn run_prepared(
 
     if handle.seen.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         eprintln!(
-            "mtl: no authorized request reached the proxy; verify that the client honors one of {:?}",
-            prepared
-                .base_urls
-                .iter()
-                .map(|(variable, _, _)| variable)
-                .collect::<Vec<_>>()
+            "mtl: no authorized request reached the proxy; verify that the application uses {CHILD_BASE_URL_ENV}"
         );
     }
     Ok(status.code().unwrap_or(1))
 }
 
-fn secret_command(args: &[String]) -> Result<(), String> {
-    if matches!(
-        args.first().map(String::as_str),
-        Some("set" | "import" | "delete")
-    ) {
-        secret::preflight()?;
-    }
-    match args.first().map(String::as_str) {
-        Some("set") => {
-            let name = args.get(1).ok_or("missing connector")?;
-            if args.len() != 2 {
-                return Err("usage: mtl secret set <connector>".into());
-            }
-            let connector = connector(name).ok_or_else(|| format!("unknown connector: {name}"))?;
-            let value = rpassword::prompt_password(format!("{}: ", connector.secret_env))
-                .map_err(|error| format!("reading from terminal: {error}"))?;
-            if value.is_empty() {
-                return Err("empty credential".into());
-            }
-            secret::set(connector.id, &value)?;
-            println!("Stored {} with user-presence protection.", connector.id);
-            Ok(())
-        }
-        Some("import") => import_secret(args),
-        Some("delete") => {
-            let name = args.get(1).ok_or("missing connector")?;
-            if args.len() != 2 {
-                return Err("usage: mtl secret delete <connector>".into());
-            }
-            let connector = connector(name).ok_or_else(|| format!("unknown connector: {name}"))?;
-            secret::delete(connector.id)?;
-            println!("Deleted {} from the keyring.", connector.id);
-            Ok(())
-        }
-        _ => {
-            Err("usage: mtl secret set <connector> | import <file.env> | delete <connector>".into())
-        }
-    }
-}
-
-fn import_secret(args: &[String]) -> Result<(), String> {
-    let path = args.get(1).ok_or("missing .env path")?;
-    let config = Config::load(&config_path(&args[2..])?)?;
-    let raw = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
-    let found: HashMap<String, String> = secret::parse_env_file(&raw).into_iter().collect();
-
-    let mut values = Vec::new();
-    for name in &config.connectors {
-        let connector = connector(name).ok_or_else(|| format!("unknown connector: {name}"))?;
-        let value = found
-            .get(connector.secret_env)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("{} is missing from {path}", connector.secret_env))?;
-        values.push((connector, value.clone()));
-    }
-
-    let mut replacements = Vec::new();
-    for (connector, value) in values {
-        secret::set(connector.id, &value)?;
-        replacements.push((
-            connector.secret_env.to_string(),
-            secret::mock(connector.mock_prefix),
-        ));
-    }
-    let rewritten = secret::rewrite_env_file(&raw, &replacements);
-    secret::atomic_rewrite(Path::new(path), &rewritten)?;
-    println!(
-        "Imported {} credential(s); {path} was atomically rewritten without a plaintext backup.",
-        replacements.len()
-    );
-    Ok(())
-}
-
 fn doctor() {
     println!("Mithril diagnostic");
-    match secret::preflight() {
-        Ok(()) => {
-            println!("  secure keyring sessions: available (native user presence + Keychain ACL)")
-        }
-        Err(error) => {
-            println!("  secure keyring sessions: unavailable ({error})");
-            println!("  safe local option:       mtl demo");
-            println!("  real credentials:        unavailable in this build");
-        }
+    match secret::process_preflight() {
+        Ok(()) => println!("  protected project sessions: available"),
+        Err(error) => println!("  protected project sessions: unavailable ({error})"),
     }
+    println!("  canary-only demo:           available");
 }
 
 fn spawn_demo_upstream() -> Result<String, String> {
@@ -227,9 +190,8 @@ fn serve_demo_upstream(request: tiny_http::Request) {
         .map(|header| {
             let name = header.field.to_string().to_ascii_lowercase();
             let value = header.value.to_string().replace(['"', '\\'], "'");
-            let shown = if name == "authorization" || name == "x-api-key" {
-                let prefix: String = value.chars().take(18).collect();
-                format!("<received, {} bytes, starts with {prefix}>", value.len())
+            let shown = if name == "authorization" {
+                format!("<received, {} bytes>", value.len())
             } else {
                 value
             };

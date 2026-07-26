@@ -1,14 +1,17 @@
-use mithril::config::{connector, Config};
-use mithril::{child_command, prepare, secret};
+use mithril::config::{
+    validate_upstream, Config, CHILD_BASE_URL_ENV, CHILD_SECRET_ENV, PARENT_SECRET_ENV,
+    PARENT_UPSTREAM_ENV,
+};
+use mithril::{child_command, prepare_session, SessionMaterial};
 
-const KEY: &str = "sk-CANARY-REAL-KEY-0123456789";
-const YAML: &str = "connectors:\n  - openai\n  - anthropic\n";
+const KEY: &str = "project-canary-real-key-0123456789";
 
-fn overrides() -> Vec<(String, String)> {
-    let config = Config::parse(YAML).unwrap();
-    prepare(&config, |_| Ok(KEY.to_string()))
-        .unwrap()
-        .env_overrides(41234, "SESSIONTOKEN")
+fn prepared() -> mithril::Prepared {
+    prepare_session(SessionMaterial {
+        key: KEY.to_string(),
+        upstream: "https://service.example/api".into(),
+    })
+    .unwrap()
 }
 
 fn value<'a>(variables: &'a [(String, String)], name: &str) -> &'a str {
@@ -20,36 +23,21 @@ fn value<'a>(variables: &'a [(String, String)], name: &str) -> &'a str {
 }
 
 #[test]
-fn child_receives_provider_shaped_mocks_not_real_values() {
-    let variables = overrides();
-    assert!(value(&variables, "OPENAI_API_KEY").starts_with("sk-mtl"));
-    assert!(value(&variables, "ANTHROPIC_API_KEY").starts_with("sk-ant-mtl"));
+fn child_receives_one_fake_project_key_and_local_url() {
+    let variables = prepared().env_overrides(41234, "SESSIONTOKEN");
+
+    assert!(value(&variables, CHILD_SECRET_ENV).starts_with("mtl-app-"));
+    assert_ne!(value(&variables, CHILD_SECRET_ENV), KEY);
+    assert_eq!(
+        value(&variables, CHILD_BASE_URL_ENV),
+        "http://127.0.0.1:41234/SESSIONTOKEN"
+    );
     assert!(variables.iter().all(|(_, value)| value != KEY));
 }
 
 #[test]
-fn base_urls_include_session_token_and_sdk_specific_prefix() {
-    let variables = overrides();
-    for name in ["OPENAI_BASE_URL", "OPENAI_API_BASE"] {
-        assert_eq!(
-            value(&variables, name),
-            "http://127.0.0.1:41234/SESSIONTOKEN/openai/v1"
-        );
-    }
-    for name in ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL"] {
-        assert_eq!(
-            value(&variables, name),
-            "http://127.0.0.1:41234/SESSIONTOKEN/anthropic"
-        );
-    }
-}
-
-#[test]
-fn child_command_removes_all_ambient_supported_credentials() {
-    let config = Config::parse("connectors: [openai]\n").unwrap();
-    let variables = prepare(&config, |_| Ok(KEY.to_string()))
-        .unwrap()
-        .env_overrides(41234, "TOKEN");
+fn child_command_removes_parent_inputs_but_leaves_agent_credentials_alone() {
+    let variables = prepared().env_overrides(41234, "TOKEN");
     let command = child_command("unused", &[], &variables);
     let configured: Vec<_> = command
         .get_envs()
@@ -62,86 +50,82 @@ fn child_command_removes_all_ambient_supported_credentials() {
         .collect();
 
     assert!(configured.iter().any(|(key, value)| {
-        key == "OPENAI_API_KEY"
+        key == CHILD_SECRET_ENV
             && value
                 .as_deref()
-                .is_some_and(|value| value.starts_with("sk-mtl"))
+                .is_some_and(|value| value.starts_with("mtl-app-"))
     }));
-    assert!(configured
-        .iter()
-        .any(|(key, value)| key == "ANTHROPIC_API_KEY" && value.is_none()));
+    for name in [PARENT_SECRET_ENV, PARENT_UPSTREAM_ENV] {
+        assert!(configured
+            .iter()
+            .any(|(key, value)| key == name && value.is_none()));
+    }
     assert!(configured
         .iter()
         .any(|(key, value)| key == "DBUS_SESSION_BUS_ADDRESS" && value.is_none()));
+    assert!(configured.iter().all(|(key, _)| key != "AGENT_LOGIN_TOKEN"));
 }
 
 #[test]
-fn workspace_config_cannot_define_secret_identity_or_upstream() {
+fn credentials_with_header_control_characters_are_rejected() {
+    let error = prepare_session(SessionMaterial {
+        key: "secret\nsecond-header".into(),
+        upstream: "https://service.example".into(),
+    })
+    .err()
+    .unwrap();
+
+    assert!(error.contains("control characters"));
+    assert!(!error.contains("second-header"));
+}
+
+#[test]
+fn prepared_sessions_revalidate_the_trusted_destination() {
+    let error = prepare_session(SessionMaterial {
+        key: KEY.into(),
+        upstream: "http://service.example".into(),
+    })
+    .err()
+    .unwrap();
+
+    assert!(error.contains("HTTPS"));
+}
+
+#[test]
+fn project_config_contains_only_an_optional_request_budget() {
+    let config = Config::parse("budget:\n  max_requests: 5\n").unwrap();
+    assert_eq!(config.budget.unwrap().max_requests, 5);
+    assert!(Config::parse("{}\n").unwrap().budget.is_none());
+
     for invalid in [
-        "connectors: [openai]\nupstream: http://evil.example\n",
-        "secrets:\n  - name: OPENAI_API_KEY\n    connector: openai\n",
-        "connectors: [openai, openai]\n",
-        "connectors: [unknown]\n",
-        "connectors: []\n",
+        "upstream: https://evil.example\n",
+        "secrets:\n  - APP_API_KEY\n",
+        "connectors: [legacy-provider]\n",
+        "budget:\n  max_requests: 5\n  extra: true\n",
     ] {
         assert!(Config::parse(invalid).is_err(), "accepted: {invalid}");
     }
-
-    let openai = connector("openai").unwrap();
-    assert_eq!(openai.secret_env, "OPENAI_API_KEY");
-    assert_eq!(openai.upstream, "https://api.openai.com");
 }
 
 #[test]
-fn env_migration_rewrites_only_compiled_connector_variables() {
-    let raw = "# comment\nOPENAI_API_KEY=sk-real-123\nexport OTHER=\"stays\"\nPORT=8080\n";
-    let parsed = secret::parse_env_file(raw);
-    assert_eq!(
-        parsed
-            .iter()
-            .find(|(key, _)| key == "OPENAI_API_KEY")
-            .unwrap()
-            .1,
-        "sk-real-123"
-    );
-
-    let rewritten = secret::rewrite_env_file(
-        raw,
-        &[("OPENAI_API_KEY".into(), "sk-mtl-placeholder".into())],
-    );
-    assert!(!rewritten.contains("sk-real-123"));
-    assert!(rewritten.contains("OPENAI_API_KEY=sk-mtl-placeholder"));
-    assert!(rewritten.contains("export OTHER=\"stays\""));
-    assert!(rewritten.ends_with('\n'));
-}
-
-#[cfg(not(target_os = "windows"))]
-#[test]
-fn atomic_migration_creates_no_plaintext_backup() {
-    let directory = std::env::temp_dir().join(format!(
-        "mithril-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&directory).unwrap();
-    let path = directory.join("secrets.env");
-    std::fs::write(&path, "OPENAI_API_KEY=real\n").unwrap();
-    secret::atomic_rewrite(&path, "OPENAI_API_KEY=placeholder\n").unwrap();
-
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        "OPENAI_API_KEY=placeholder\n"
-    );
-    assert!(!directory.join("secrets.env.bak").exists());
-    assert!(std::fs::read_dir(&directory).unwrap().all(|entry| !entry
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .contains("mtl-tmp")));
-
-    std::fs::remove_file(path).unwrap();
-    std::fs::remove_dir(directory).unwrap();
+fn upstreams_require_https_except_for_loopback_tests() {
+    for valid in [
+        "https://service.example",
+        "https://service.example/prefix/",
+        "http://127.0.0.1:8080",
+        "http://[::1]:8080",
+        "http://localhost:8080",
+    ] {
+        assert!(validate_upstream(valid).is_ok(), "rejected: {valid}");
+    }
+    for invalid in [
+        "http://service.example",
+        "file:///tmp/socket",
+        "https://user:pass@service.example",
+        "https://service.example/path?redirect=evil",
+        "https://service.example/path#fragment",
+        "not-a-url",
+    ] {
+        assert!(validate_upstream(invalid).is_err(), "accepted: {invalid}");
+    }
 }
