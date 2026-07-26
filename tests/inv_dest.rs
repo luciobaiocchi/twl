@@ -1,8 +1,8 @@
 mod common;
 
 use common::{call, raw, upstream};
-use mithril::proxy::{self, resolve, Route};
 use std::io::{Read, Write};
+use twl::proxy::{self, resolve, Route};
 
 const KEY: &str = "project-canary-real-key-0123456789";
 

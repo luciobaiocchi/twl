@@ -6,7 +6,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-EXPECTED_KEY = os.environ.get("MTL_TEST_APPLICATION_KEY", "third-party-test-key")
+EXPECTED_KEY = os.environ.get("TWL_TEST_APPLICATION_KEY", "third-party-test-key")
 
 
 class Handler(BaseHTTPRequestHandler):

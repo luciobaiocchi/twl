@@ -11,12 +11,12 @@ fn random_tail(length: usize) -> String {
 
 /// Placeholder visible to the agent and its child processes.
 pub fn mock() -> String {
-    format!("mtl-app-{}", random_tail(40))
+    format!("twl-app-{}", random_tail(40))
 }
 
-/// A recognizable fake credential used only by `mtl demo`.
+/// A recognizable fake credential used only by `twl demo`.
 pub fn demo() -> String {
-    format!("mtl-demo-canary-{}", random_tail(24))
+    format!("twl-demo-canary-{}", random_tail(24))
 }
 
 #[cfg(target_os = "macos")]

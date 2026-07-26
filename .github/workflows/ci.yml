@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.82.0 --profile minimal
+
+      - name: Run tests
+        run: cargo +1.82.0 test --all-targets --locked
+
+      - name: Build release binary
+        run: cargo +1.82.0 build --release --locked
+
+  quality:
+    name: Formatting and Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.82.0 --profile minimal --component rustfmt,clippy
+
+      - name: Check formatting
+        run: cargo +1.82.0 fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo +1.82.0 clippy --all-targets --all-features --locked -- -D warnings

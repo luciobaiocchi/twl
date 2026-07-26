@@ -1,7 +1,7 @@
 mod common;
 
 use common::{call_with, client, upstream};
-use mithril::proxy::{self, Route};
+use twl::proxy::{self, Route};
 
 #[test]
 fn concurrent_budget_is_reserved_before_forwarding() {

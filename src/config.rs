@@ -2,8 +2,8 @@ use serde::Deserialize;
 
 pub const CHILD_SECRET_ENV: &str = "APP_API_KEY";
 pub const CHILD_BASE_URL_ENV: &str = "APP_BASE_URL";
-pub const PARENT_SECRET_ENV: &str = "MTL_APPLICATION_API_KEY";
-pub const PARENT_UPSTREAM_ENV: &str = "MTL_APPLICATION_UPSTREAM";
+pub const PARENT_SECRET_ENV: &str = "TWL_APPLICATION_API_KEY";
+pub const PARENT_UPSTREAM_ENV: &str = "TWL_APPLICATION_UPSTREAM";
 pub const ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
 
 #[derive(Default, Deserialize, Debug)]
@@ -47,7 +47,7 @@ pub fn validate_upstream(value: &str) -> Result<String, String> {
 
 impl Config {
     pub fn parse(raw: &str) -> Result<Self, String> {
-        serde_yaml::from_str(raw).map_err(|error| error.to_string())
+        serde_yaml_ng::from_str(raw).map_err(|error| error.to_string())
     }
 
     pub fn load(path: &str) -> Result<Self, String> {

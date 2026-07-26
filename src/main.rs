@@ -1,6 +1,6 @@
-use mithril::config::{Config, CHILD_BASE_URL_ENV, CHILD_SECRET_ENV, PARENT_SECRET_ENV};
-use mithril::{child_command, prepare_demo, prepare_session, runtime, secret, Prepared};
 use std::process::exit;
+use twl::config::{Config, CHILD_BASE_URL_ENV, CHILD_SECRET_ENV, PARENT_SECRET_ENV};
+use twl::{child_command, prepare_demo, prepare_session, runtime, secret, Prepared};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -17,7 +17,7 @@ fn main() {
     match result {
         Ok(code) => exit(code),
         Err(error) => {
-            eprintln!("mtl: {error}");
+            eprintln!("twl: {error}");
             exit(1);
         }
     }
@@ -25,9 +25,9 @@ fn main() {
 
 fn usage() -> String {
     "usage:\n\
-     mtl run [--config mithril.yaml] --upstream URL [--secret-fd FD] -- <command> [args...]\n\
-     mtl demo [--config mithril.yaml] -- <command> [args...]\n\
-     mtl doctor"
+     twl run [--config towel.yaml] --upstream URL [--secret-fd FD] -- <command> [args...]\n\
+     twl demo [--config towel.yaml] -- <command> [args...]\n\
+     twl doctor"
         .into()
 }
 
@@ -70,7 +70,7 @@ fn config_flags(flags: &[String]) -> Result<Option<String>, String> {
         [] => Ok(None),
         [option, path] if option == "--config" => Ok(Some(path.clone())),
         [option, ..] if option != "--config" => Err(format!("unknown option: {option}")),
-        _ => Err("usage: --config mithril.yaml".into()),
+        _ => Err("usage: --config towel.yaml".into()),
     }
 }
 
@@ -104,14 +104,14 @@ fn demo_invocation(args: &[String]) -> Result<(Config, &str, &[String]), String>
 
 fn run(args: &[String]) -> Result<i32, String> {
     let (config, flags, command, command_args) = run_invocation(args)?;
-    eprintln!("mtl: requesting the project application credential");
+    eprintln!("twl: requesting the project application credential");
     let resolved = flags.runtime.resolve(|| {
         rpassword::prompt_password(format!("{CHILD_SECRET_ENV}: "))
             .map_err(|error| format!("reading from terminal: {error}"))
     })?;
     if resolved.used_environment_secret {
         eprintln!(
-            "mtl: warning: {PARENT_SECRET_ENV} is a weaker input because parent environments can leak through shell history, logs, or process metadata; prefer --secret-fd FD"
+            "twl: warning: {PARENT_SECRET_ENV} is a weaker input because parent environments can leak through shell history, logs, or process metadata; prefer --secret-fd FD"
         );
     }
     run_prepared(
@@ -126,7 +126,7 @@ fn demo(args: &[String]) -> Result<i32, String> {
     let (config, command, command_args) = demo_invocation(args)?;
     let upstream = spawn_demo_upstream()?;
     let prepared = prepare_demo(&upstream)?;
-    eprintln!("mtl: demo mode uses a generated canary; no real credential is read");
+    eprintln!("twl: demo mode uses a generated canary; no real credential is read");
     run_prepared(config, prepared, command, command_args)
 }
 
@@ -140,7 +140,7 @@ fn run_prepared(
     let (handle, overrides) = prepared.start(budget).map_err(|error| error.to_string())?;
 
     eprintln!(
-        "mtl: application proxy on 127.0.0.1:{}{}",
+        "twl: application proxy on 127.0.0.1:{}{}",
         handle.port,
         budget
             .map(|max| format!(", request budget {max}"))
@@ -152,14 +152,14 @@ fn run_prepared(
 
     if handle.seen.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         eprintln!(
-            "mtl: no authorized request reached the proxy; verify that the application uses {CHILD_BASE_URL_ENV}"
+            "twl: no authorized request reached the proxy; verify that the application uses {CHILD_BASE_URL_ENV}"
         );
     }
     Ok(status.code().unwrap_or(1))
 }
 
 fn doctor() {
-    println!("Mithril diagnostic");
+    println!("Towel diagnostic");
     match secret::process_preflight() {
         Ok(()) => println!("  protected project sessions: available"),
         Err(error) => println!("  protected project sessions: unavailable ({error})"),
