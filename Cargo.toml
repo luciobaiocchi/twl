@@ -19,6 +19,10 @@ ureq = "2"
 rand = "0.8"
 rpassword = "7"
 base64 = "0.22"
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Secure host mode starts on macOS. LocalAuthentication gates every operation;
 # the file-based Keychain ACL separately limits silent reads to the creator.

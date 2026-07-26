@@ -28,7 +28,7 @@ pub fn demo(prefix: &str) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn hardened_runtime() -> Result<(), String> {
+pub fn process_preflight() -> Result<(), String> {
     use std::ffi::c_void;
 
     const CS_OPS_STATUS: u32 = 0;
@@ -79,12 +79,30 @@ fn hardened_runtime() -> Result<(), String> {
 fn authentication_context() -> Result<AuthenticationContext, String> {
     use objc2_local_authentication::{LAContext, LAPolicy};
 
-    hardened_runtime()?;
+    process_preflight()?;
     let context = unsafe { LAContext::new() };
     unsafe { context.setTouchIDAuthenticationAllowableReuseDuration(0.0) };
     unsafe { context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }
         .map_err(|error| format!("local authentication is unavailable: {error}"))?;
     Ok(context)
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_preflight() -> Result<(), String> {
+    let result = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "disabling same-user process inspection: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn process_preflight() -> Result<(), String> {
+    Err("runtime credentials currently require macOS or Linux process hardening".into())
 }
 
 #[cfg(target_os = "macos")]

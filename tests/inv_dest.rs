@@ -8,38 +8,14 @@ use std::io::{Read, Write};
 
 const KEY: &str = "sk-CANARY-REAL-KEY-0123456789";
 const TEST_ROUTES: &[AllowedRoute] = &[
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/models",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/redirect",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/echo-key",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/echo-key-base64",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/echo-key-base64-no-pad",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/echo-key-header",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/a",
-    },
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/b",
-    },
+    AllowedRoute::exact("GET", "/v1/models"),
+    AllowedRoute::exact("GET", "/v1/redirect"),
+    AllowedRoute::exact("GET", "/v1/echo-key"),
+    AllowedRoute::exact("GET", "/v1/echo-key-base64"),
+    AllowedRoute::exact("GET", "/v1/echo-key-base64-no-pad"),
+    AllowedRoute::exact("GET", "/v1/echo-key-header"),
+    AllowedRoute::exact("GET", "/v1/a"),
+    AllowedRoute::exact("GET", "/v1/b"),
 ];
 
 fn routes(upstream: &str, allowed: &'static [AllowedRoute]) -> HashMap<String, Route> {
@@ -72,6 +48,31 @@ fn real_key_reaches_only_the_fixed_upstream() {
     let seen = log.lock().unwrap();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].url, "/v1/models");
+    assert_eq!(
+        seen[0].header("authorization"),
+        Some(&*format!("Bearer {KEY}"))
+    );
+}
+
+#[test]
+fn runtime_application_accepts_general_paths_but_keeps_one_destination() {
+    let (upstream, log) = upstream();
+    let application = connector("application").unwrap();
+    let routes = HashMap::from([(
+        "application".to_string(),
+        Route {
+            upstream,
+            auth: application.auth,
+            key: KEY.to_string(),
+            allowed: application.allowed,
+        },
+    )]);
+    let handle = proxy::spawn(routes, None).unwrap();
+    let path = format!("/{}/application/projects/42/tasks", handle.token);
+
+    assert_eq!(call(handle.port, "POST", &path, &[]).0, 200);
+    let seen = log.lock().unwrap();
+    assert_eq!(seen[0].url, "/projects/42/tasks");
     assert_eq!(
         seen[0].header("authorization"),
         Some(&*format!("Bearer {KEY}"))

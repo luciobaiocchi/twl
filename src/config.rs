@@ -23,13 +23,59 @@ pub enum Auth {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct AllowedRoute {
     pub method: &'static str,
-    pub path: &'static str,
+    path: AllowedPath,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AllowedPath {
+    Exact(&'static str),
+    Any,
+}
+
+impl AllowedRoute {
+    pub const fn exact(method: &'static str, path: &'static str) -> Self {
+        Self {
+            method,
+            path: AllowedPath::Exact(path),
+        }
+    }
+
+    pub const fn any(method: &'static str) -> Self {
+        Self {
+            method,
+            path: AllowedPath::Any,
+        }
+    }
+
+    pub fn matches_path(self, path: &str) -> bool {
+        match self.path {
+            AllowedPath::Exact(allowed) => allowed == path,
+            AllowedPath::Any => true,
+        }
+    }
+
+    pub fn allows(self, method: &str, path: &str) -> bool {
+        self.method == method && self.matches_path(path)
+    }
+}
+
+/// Defines where the trusted parent obtains a connector credential and fixes
+/// whether its destination is built in or supplied for one session.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CredentialSource {
+    Keychain {
+        upstream: &'static str,
+    },
+    Runtime {
+        parent_secret_env: &'static str,
+        parent_upstream_env: &'static str,
+    },
 }
 
 pub struct Connector {
     pub id: &'static str,
     pub secret_env: &'static str,
-    pub upstream: &'static str,
+    pub credential_source: CredentialSource,
     pub auth: Auth,
     pub mock_prefix: &'static str,
     pub base_url_vars: &'static [&'static str],
@@ -40,40 +86,32 @@ pub struct Connector {
 }
 
 const OPENAI_ROUTES: &[AllowedRoute] = &[
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/models",
-    },
-    AllowedRoute {
-        method: "POST",
-        path: "/v1/responses",
-    },
-    AllowedRoute {
-        method: "POST",
-        path: "/v1/chat/completions",
-    },
-    AllowedRoute {
-        method: "POST",
-        path: "/v1/embeddings",
-    },
+    AllowedRoute::exact("GET", "/v1/models"),
+    AllowedRoute::exact("POST", "/v1/responses"),
+    AllowedRoute::exact("POST", "/v1/chat/completions"),
+    AllowedRoute::exact("POST", "/v1/embeddings"),
 ];
 
 const ANTHROPIC_ROUTES: &[AllowedRoute] = &[
-    AllowedRoute {
-        method: "GET",
-        path: "/v1/models",
-    },
-    AllowedRoute {
-        method: "POST",
-        path: "/v1/messages",
-    },
+    AllowedRoute::exact("GET", "/v1/models"),
+    AllowedRoute::exact("POST", "/v1/messages"),
+];
+
+const APPLICATION_ROUTES: &[AllowedRoute] = &[
+    AllowedRoute::any("GET"),
+    AllowedRoute::any("POST"),
+    AllowedRoute::any("PUT"),
+    AllowedRoute::any("PATCH"),
+    AllowedRoute::any("DELETE"),
 ];
 
 pub static CONNECTORS: &[Connector] = &[
     Connector {
         id: "openai",
         secret_env: "OPENAI_API_KEY",
-        upstream: "https://api.openai.com",
+        credential_source: CredentialSource::Keychain {
+            upstream: "https://api.openai.com",
+        },
         auth: Auth::Bearer,
         mock_prefix: "sk-",
         base_url_vars: &["OPENAI_BASE_URL", "OPENAI_API_BASE"],
@@ -83,17 +121,58 @@ pub static CONNECTORS: &[Connector] = &[
     Connector {
         id: "anthropic",
         secret_env: "ANTHROPIC_API_KEY",
-        upstream: "https://api.anthropic.com",
+        credential_source: CredentialSource::Keychain {
+            upstream: "https://api.anthropic.com",
+        },
         auth: Auth::XApiKey,
         mock_prefix: "sk-ant-",
         base_url_vars: &["ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL"],
         client_base_suffix: "",
         allowed: ANTHROPIC_ROUTES,
     },
+    Connector {
+        id: "application",
+        secret_env: "APP_API_KEY",
+        credential_source: CredentialSource::Runtime {
+            parent_secret_env: "MTL_APPLICATION_API_KEY",
+            parent_upstream_env: "MTL_APPLICATION_UPSTREAM",
+        },
+        auth: Auth::Bearer,
+        mock_prefix: "mtl-app-",
+        base_url_vars: &["APP_BASE_URL"],
+        client_base_suffix: "",
+        allowed: APPLICATION_ROUTES,
+    },
 ];
 
 pub fn connector(name: &str) -> Option<&'static Connector> {
     CONNECTORS.iter().find(|connector| connector.id == name)
+}
+
+pub fn validate_runtime_upstream(value: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(value)
+        .map_err(|_| "runtime upstream must be an absolute URL".to_string())?;
+    if parsed.cannot_be_a_base() || parsed.host().is_none() {
+        return Err("runtime upstream must include a host".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("runtime upstream must not contain user information".into());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("runtime upstream must not contain a query or fragment".into());
+    }
+
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+        return Err("runtime upstream must use HTTPS (HTTP is allowed only on loopback)".into());
+    }
+
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
 impl Config {

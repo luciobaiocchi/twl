@@ -1,5 +1,5 @@
-use mithril::config::{connector, Config};
-use mithril::{child_command, prepare, secret};
+use mithril::config::{connector, validate_runtime_upstream, Config, CredentialSource};
+use mithril::{child_command, prepare, prepare_session, secret, SessionMaterial};
 
 const KEY: &str = "sk-CANARY-REAL-KEY-0123456789";
 const YAML: &str = "connectors:\n  - openai\n  - anthropic\n";
@@ -45,7 +45,7 @@ fn base_urls_include_session_token_and_sdk_specific_prefix() {
 }
 
 #[test]
-fn child_command_removes_all_ambient_supported_credentials() {
+fn child_command_replaces_selected_values_and_preserves_unrelated_ones() {
     let config = Config::parse("connectors: [openai]\n").unwrap();
     let variables = prepare(&config, |_| Ok(KEY.to_string()))
         .unwrap()
@@ -67,12 +67,79 @@ fn child_command_removes_all_ambient_supported_credentials() {
                 .as_deref()
                 .is_some_and(|value| value.starts_with("sk-mtl"))
     }));
-    assert!(configured
-        .iter()
-        .any(|(key, value)| key == "ANTHROPIC_API_KEY" && value.is_none()));
+    assert!(configured.iter().all(|(key, _)| key != "ANTHROPIC_API_KEY"));
     assert!(configured
         .iter()
         .any(|(key, value)| key == "DBUS_SESSION_BUS_ADDRESS" && value.is_none()));
+    for name in ["MTL_APPLICATION_API_KEY", "MTL_APPLICATION_UPSTREAM"] {
+        assert!(configured
+            .iter()
+            .any(|(key, value)| key == name && value.is_none()));
+    }
+}
+
+#[test]
+fn application_connector_does_not_replace_agent_provider_credentials() {
+    let config = Config::parse("connectors: [application]\n").unwrap();
+    let variables = prepare_session(&config, |_| {
+        Ok(SessionMaterial {
+            key: KEY.into(),
+            upstream: "https://service.example".into(),
+        })
+    })
+    .unwrap()
+    .env_overrides(41234, "TOKEN");
+    let command = child_command("unused", &[], &variables);
+    let configured: Vec<_> = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+
+    assert!(configured.iter().any(|(key, value)| {
+        key == "APP_API_KEY"
+            && value
+                .as_deref()
+                .is_some_and(|value| value.starts_with("mtl-app-mtl"))
+    }));
+    assert!(configured.iter().all(|(key, _)| key != "OPENAI_API_KEY"));
+    assert!(configured.iter().all(|(key, _)| key != "OPENAI_BASE_URL"));
+}
+
+#[test]
+fn runtime_application_exposes_only_a_fake_key_and_local_url() {
+    let config = Config::parse("connectors: [application]\n").unwrap();
+    let prepared = prepare_session(&config, |connector| {
+        assert_eq!(connector.id, "application");
+        Ok(SessionMaterial {
+            key: KEY.to_string(),
+            upstream: "https://service.example/api".into(),
+        })
+    })
+    .unwrap();
+    let variables = prepared.env_overrides(41234, "TOKEN");
+
+    assert!(value(&variables, "APP_API_KEY").starts_with("mtl-app-mtl"));
+    assert_ne!(value(&variables, "APP_API_KEY"), KEY);
+    assert_eq!(
+        value(&variables, "APP_BASE_URL"),
+        "http://127.0.0.1:41234/TOKEN/application"
+    );
+}
+
+#[test]
+fn credentials_with_header_control_characters_are_rejected() {
+    let config = Config::parse("connectors: [openai]\n").unwrap();
+    let error = prepare(&config, |_| Ok("secret\nsecond-header".into()))
+        .err()
+        .unwrap();
+
+    assert!(error.contains("control characters"));
+    assert!(!error.contains("second-header"));
 }
 
 #[test]
@@ -89,7 +156,41 @@ fn workspace_config_cannot_define_secret_identity_or_upstream() {
 
     let openai = connector("openai").unwrap();
     assert_eq!(openai.secret_env, "OPENAI_API_KEY");
-    assert_eq!(openai.upstream, "https://api.openai.com");
+    assert_eq!(
+        openai.credential_source,
+        CredentialSource::Keychain {
+            upstream: "https://api.openai.com"
+        }
+    );
+}
+
+#[test]
+fn runtime_upstreams_require_https_except_for_loopback_tests() {
+    for valid in [
+        "https://service.example",
+        "https://service.example/prefix/",
+        "http://127.0.0.1:8080",
+        "http://[::1]:8080",
+        "http://localhost:8080",
+    ] {
+        assert!(
+            validate_runtime_upstream(valid).is_ok(),
+            "rejected: {valid}"
+        );
+    }
+    for invalid in [
+        "http://service.example",
+        "file:///tmp/socket",
+        "https://user:pass@service.example",
+        "https://service.example/path?redirect=evil",
+        "https://service.example/path#fragment",
+        "not-a-url",
+    ] {
+        assert!(
+            validate_runtime_upstream(invalid).is_err(),
+            "accepted: {invalid}"
+        );
+    }
 }
 
 #[test]

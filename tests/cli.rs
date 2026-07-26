@@ -18,6 +18,18 @@ fn doctor_reports_the_platform_security_mode() {
         .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("secure keyring sessions"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ephemeral runtime secrets"));
+}
+
+#[test]
+fn runtime_connector_has_no_persistent_secret_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mtl"))
+        .args(["secret", "set", "application"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ephemeral runtime credentials"));
 }
 
 #[cfg(target_os = "macos")]

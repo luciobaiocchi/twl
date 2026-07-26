@@ -5,10 +5,7 @@ use mithril::config::{AllowedRoute, Auth};
 use mithril::proxy::{self, Route};
 use std::collections::HashMap;
 
-const RULES: &[AllowedRoute] = &[AllowedRoute {
-    method: "GET",
-    path: "/v1/models",
-}];
+const RULES: &[AllowedRoute] = &[AllowedRoute::exact("GET", "/v1/models")];
 
 #[test]
 fn concurrent_budget_is_reserved_before_forwarding() {

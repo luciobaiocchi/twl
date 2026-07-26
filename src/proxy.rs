@@ -101,14 +101,17 @@ pub fn resolve<'a>(
 
     let route = routes.get(segments[2]).ok_or((404, "not found"))?;
     let provider_path = format!("/{}", segments[3..].join("/"));
-    let path_allowed = route.allowed.iter().any(|rule| rule.path == provider_path);
+    let path_allowed = route
+        .allowed
+        .iter()
+        .any(|rule| rule.matches_path(&provider_path));
     if !path_allowed {
         return Err((403, "provider path is not allowed"));
     }
     if !route
         .allowed
         .iter()
-        .any(|rule| rule.method == method && rule.path == provider_path)
+        .any(|rule| rule.allows(method, &provider_path))
     {
         return Err((405, "method is not allowed"));
     }

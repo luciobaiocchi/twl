@@ -300,6 +300,7 @@ version = "0.0.1"
 dependencies = [
  "base64",
  "block2",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-local-authentication",
@@ -310,6 +311,7 @@ dependencies = [
  "serde_yaml",
  "tiny_http",
  "ureq",
+ "url",
 ]
 
 [[package]]

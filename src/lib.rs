@@ -1,8 +1,9 @@
 pub mod config;
 pub mod proxy;
+pub mod runtime;
 pub mod secret;
 
-use config::{connector, Config, Connector, CONNECTORS};
+use config::{connector, Config, Connector, CredentialSource, CONNECTORS};
 use proxy::Route;
 use std::collections::HashMap;
 use std::process::Command;
@@ -19,10 +20,16 @@ pub struct Prepared {
     pub base_urls: Vec<(String, String, String)>,
 }
 
+/// A real credential paired with the only upstream allowed to receive it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionMaterial {
+    pub key: String,
+    pub upstream: String,
+}
+
 fn prepare_inner(
     cfg: &Config,
-    source: impl Fn(&Connector) -> Result<String, String>,
-    demo_upstream: Option<&str>,
+    mut source: impl FnMut(&Connector) -> Result<SessionMaterial, String>,
 ) -> Result<Prepared, String> {
     let mut prepared = Prepared {
         routes: HashMap::new(),
@@ -32,14 +39,21 @@ fn prepare_inner(
 
     for name in &cfg.connectors {
         let connector = connector(name).ok_or_else(|| format!("unknown connector: {name}"))?;
-        let key = source(connector)?;
+        let material = source(connector)?;
+        let key = material.key;
         if key.is_empty() {
             return Err(format!("empty credential for connector {}", connector.id));
+        }
+        if key.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+            return Err(format!(
+                "credential for connector {} contains control characters",
+                connector.id
+            ));
         }
         prepared.routes.insert(
             connector.id.to_string(),
             Route {
-                upstream: demo_upstream.unwrap_or(connector.upstream).to_string(),
+                upstream: material.upstream,
                 auth: connector.auth,
                 key,
                 allowed: connector.allowed,
@@ -60,24 +74,42 @@ fn prepare_inner(
     Ok(prepared)
 }
 
-/// Prepare a real session. The caller can supply a test source, but destination,
-/// authentication mode, secret identity, and route policy always come from the
-/// compiled connector table.
+/// Prepare a session containing only stored connectors. The caller can replace
+/// the credential reader for tests; all other policy stays compiled in.
 pub fn prepare(
     cfg: &Config,
-    source: impl Fn(&Connector) -> Result<String, String>,
+    mut source: impl FnMut(&Connector) -> Result<String, String>,
 ) -> Result<Prepared, String> {
-    prepare_inner(cfg, source, None)
+    prepare_inner(cfg, |connector| match connector.credential_source {
+        CredentialSource::Keychain { upstream } => Ok(SessionMaterial {
+            key: source(connector)?,
+            upstream: upstream.to_string(),
+        }),
+        CredentialSource::Runtime { .. } => Err(format!(
+            "connector {} requires a runtime credential and upstream",
+            connector.id
+        )),
+    })
 }
 
-/// Prepare a canary-only demonstration. This is the only path that can replace
-/// an upstream, and it cannot read the keyring.
+/// Prepare a session after every connector has been resolved by the trusted
+/// parent. Workspace configuration still cannot provide either value.
+pub fn prepare_session(
+    cfg: &Config,
+    source: impl FnMut(&Connector) -> Result<SessionMaterial, String>,
+) -> Result<Prepared, String> {
+    prepare_inner(cfg, source)
+}
+
+/// Prepare a canary-only demonstration against a local generated upstream. It
+/// cannot read the keyring or any runtime credential source.
 pub fn prepare_demo(cfg: &Config, upstream: &str) -> Result<Prepared, String> {
-    prepare_inner(
-        cfg,
-        |connector| Ok(secret::demo(connector.mock_prefix)),
-        Some(upstream),
-    )
+    prepare_inner(cfg, |connector| {
+        Ok(SessionMaterial {
+            key: secret::demo(connector.mock_prefix),
+            upstream: upstream.to_string(),
+        })
+    })
 }
 
 impl Prepared {
@@ -93,9 +125,9 @@ impl Prepared {
     }
 }
 
-/// The child inherits ordinary configuration, but never an ambient supported
-/// credential or stale provider base URL. Selected values are then replaced by
-/// the session-scoped mocks and local URLs.
+/// Selected connector variables are replaced by session-local values. Unrelated
+/// variables remain available to the child, while parent-only Mithril inputs
+/// and session-oracle variables are always removed.
 pub fn child_command(program: &str, args: &[String], overrides: &[(String, String)]) -> Command {
     let mut cmd = Command::new(program);
     cmd.args(args);
@@ -103,9 +135,13 @@ pub fn child_command(program: &str, args: &[String], overrides: &[(String, Strin
         cmd.env_remove(var);
     }
     for connector in CONNECTORS {
-        cmd.env_remove(connector.secret_env);
-        for var in connector.base_url_vars {
-            cmd.env_remove(var);
+        if let CredentialSource::Runtime {
+            parent_secret_env,
+            parent_upstream_env,
+        } = connector.credential_source
+        {
+            cmd.env_remove(parent_secret_env);
+            cmd.env_remove(parent_upstream_env);
         }
     }
     for (key, value) in overrides {
