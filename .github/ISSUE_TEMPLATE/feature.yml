@@ -1,0 +1,43 @@
+name: Feature proposal
+description: Propose a focused extension to Towel's project-credential boundary.
+title: "feature: "
+labels: [enhancement, feature]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What real project workflow is currently unsupported?
+    validations:
+      required: true
+
+  - type: textarea
+    id: flow
+    attributes:
+      label: Intended flow
+      description: Describe the parent, agent, application, secret source, and destination.
+    validations:
+      required: true
+
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Security-boundary impact
+      description: Which process sees the real value, and what new authority is introduced?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternative
+    attributes:
+      label: Smaller alternatives considered
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: This concerns a project credential, not the agent's own model login.
+          required: true
+        - label: I am not requesting that Towel become a general secret store or sandbox.
+          required: true

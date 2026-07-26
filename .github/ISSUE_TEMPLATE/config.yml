@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/luciobaiocchi/twl/security/advisories/new
+    about: Report vulnerabilities privately; never include real credentials.
+  - name: Product discussion
+    url: https://github.com/luciobaiocchi/twl/discussions
+    about: Discuss integrations, scope, and early design ideas.

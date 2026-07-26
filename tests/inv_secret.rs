@@ -1,12 +1,12 @@
-use mithril::config::{
+use twl::config::{
     validate_upstream, Config, CHILD_BASE_URL_ENV, CHILD_SECRET_ENV, PARENT_SECRET_ENV,
     PARENT_UPSTREAM_ENV,
 };
-use mithril::{child_command, prepare_session, SessionMaterial};
+use twl::{child_command, prepare_session, SessionMaterial};
 
 const KEY: &str = "project-canary-real-key-0123456789";
 
-fn prepared() -> mithril::Prepared {
+fn prepared() -> twl::Prepared {
     prepare_session(SessionMaterial {
         key: KEY.to_string(),
         upstream: "https://service.example/api".into(),
@@ -26,7 +26,7 @@ fn value<'a>(variables: &'a [(String, String)], name: &str) -> &'a str {
 fn child_receives_one_fake_project_key_and_local_url() {
     let variables = prepared().env_overrides(41234, "SESSIONTOKEN");
 
-    assert!(value(&variables, CHILD_SECRET_ENV).starts_with("mtl-app-"));
+    assert!(value(&variables, CHILD_SECRET_ENV).starts_with("twl-app-"));
     assert_ne!(value(&variables, CHILD_SECRET_ENV), KEY);
     assert_eq!(
         value(&variables, CHILD_BASE_URL_ENV),
@@ -53,7 +53,7 @@ fn child_command_removes_parent_inputs_but_leaves_agent_credentials_alone() {
         key == CHILD_SECRET_ENV
             && value
                 .as_deref()
-                .is_some_and(|value| value.starts_with("mtl-app-"))
+                .is_some_and(|value| value.starts_with("twl-app-"))
     }));
     for name in [PARENT_SECRET_ENV, PARENT_UPSTREAM_ENV] {
         assert!(configured

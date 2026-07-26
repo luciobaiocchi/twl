@@ -1,0 +1,29 @@
+name: Dependency audit
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml, Cargo.lock]
+  pull_request:
+    paths: [Cargo.toml, Cargo.lock]
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  issues: write
+
+jobs:
+  audit:
+    name: RustSec
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Audit locked dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

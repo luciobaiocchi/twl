@@ -1,0 +1,205 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-version:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.82.0 --profile minimal --component rustfmt,clippy
+
+      - name: Match tag to Cargo version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          test "v${version}" = "$GITHUB_REF_NAME"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tagged source
+        run: |
+          cargo +1.82.0 fmt --all -- --check
+          cargo +1.82.0 test --all-targets --locked
+          cargo +1.82.0 clippy --all-targets --all-features --locked -- -D warnings
+          cargo +1.82.0 package --locked
+
+  linux:
+    name: Linux (${{ matrix.target }})
+    needs: verify-version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install build target
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="twl-${{ needs.verify-version.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/twl" README.md LICENSE NOTICE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: twl-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    name: macOS (${{ matrix.target }})
+    needs: verify-version
+    runs-on: ${{ matrix.runner }}
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install build target
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Import Developer ID certificate
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, os, pathlib
+          pathlib.Path(os.environ["RUNNER_TEMP"], "developer-id.p12").write_bytes(
+              base64.b64decode(os.environ["CERTIFICATE_P12_BASE64"])
+          )
+          PY
+          keychain="$RUNNER_TEMP/twl-signing.keychain-db"
+          keychain_password=$(uuidgen)
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/developer-id.p12" \
+            -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+
+      - name: Sign, notarize, and package
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="twl-${{ needs.verify-version.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/twl" README.md LICENSE NOTICE "dist/$name/"
+          codesign --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "dist/$name/twl"
+          codesign --verify --strict --verbose=2 "dist/$name/twl"
+          "dist/$name/twl" doctor
+          ditto -c -k --keepParent "dist/$name" "dist/$name.zip"
+          python3 - <<'PY'
+          import base64, os, pathlib
+          key_id = os.environ["APPLE_API_KEY_ID"]
+          pathlib.Path(os.environ["RUNNER_TEMP"], f"AuthKey_{key_id}.p8").write_bytes(
+              base64.b64decode(os.environ["APPLE_API_KEY_P8_BASE64"])
+          )
+          PY
+          xcrun notarytool submit "dist/$name.zip" \
+            --key "$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait
+
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/twl-signing.keychain-db" || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: twl-${{ matrix.target }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub prerelease
+    needs: [verify-version, linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+
+      - name: Attest build artifacts
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*
+
+      - name: Create prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Towel $GITHUB_REF_NAME" \
+            --generate-notes \
+            --prerelease \
+            --verify-tag

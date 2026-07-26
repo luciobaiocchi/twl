@@ -1,19 +1,24 @@
 [package]
-name = "mithril"
+name = "twl"
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.82"
-description = "Local project-credential broker for coding agents"
+description = "Keep project credentials out of coding-agent processes"
 license = "Apache-2.0"
-default-run = "mtl"
+repository = "https://github.com/luciobaiocchi/twl"
+homepage = "https://luciobaiocchi.github.io/twl/"
+readme = "README.md"
+keywords = ["security", "secrets", "ai-agents", "proxy", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+default-run = "twl"
 
 [[bin]]
-name = "mtl"
+name = "twl"
 path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml_ng = "0.10"
 tiny_http = "0.12"
 ureq = "2"
 rand = "0.8"

@@ -3,18 +3,18 @@
 mod common;
 
 use common::upstream;
-use mithril::{child_command, prepare_session, SessionMaterial};
 use std::process::Command;
+use twl::{child_command, prepare_session, SessionMaterial};
 
 const REAL_KEY: &str = "third-party-real-test-key";
 
 #[test]
 fn python_app_uses_the_service_without_receiving_the_real_key() {
-    if std::env::var_os("MTL_TEST_APPLICATION_PARENT").is_none() {
+    if std::env::var_os("TWL_TEST_APPLICATION_PARENT").is_none() {
         let output = Command::new(std::env::current_exe().unwrap())
-            .env("MTL_TEST_APPLICATION_PARENT", "1")
-            .env("MTL_APPLICATION_API_KEY", REAL_KEY)
-            .env("MTL_APPLICATION_UPSTREAM", "http://attacker.invalid")
+            .env("TWL_TEST_APPLICATION_PARENT", "1")
+            .env("TWL_APPLICATION_API_KEY", REAL_KEY)
+            .env("TWL_APPLICATION_UPSTREAM", "http://attacker.invalid")
             .args([
                 "--exact",
                 "python_app_uses_the_service_without_receiving_the_real_key",

@@ -2,7 +2,7 @@ use std::process::Command;
 
 #[test]
 fn run_rejects_env_files() {
-    let output = Command::new(env!("CARGO_BIN_EXE_mtl"))
+    let output = Command::new(env!("CARGO_BIN_EXE_twl"))
         .args(["run", "--env", "secrets.env", "--", "unused"])
         .output()
         .unwrap();
@@ -12,7 +12,7 @@ fn run_rejects_env_files() {
 
 #[test]
 fn doctor_reports_the_platform_security_mode() {
-    let output = Command::new(env!("CARGO_BIN_EXE_mtl"))
+    let output = Command::new(env!("CARGO_BIN_EXE_twl"))
         .arg("doctor")
         .output()
         .unwrap();
@@ -24,7 +24,7 @@ fn doctor_reports_the_platform_security_mode() {
 
 #[test]
 fn persistent_secret_commands_are_not_part_of_the_cli() {
-    let output = Command::new(env!("CARGO_BIN_EXE_mtl"))
+    let output = Command::new(env!("CARGO_BIN_EXE_twl"))
         .args(["secret", "set", "application"])
         .output()
         .unwrap();
@@ -36,8 +36,8 @@ fn persistent_secret_commands_are_not_part_of_the_cli() {
 #[cfg(target_os = "linux")]
 #[test]
 fn environment_secret_prints_the_weaker_input_warning() {
-    let output = Command::new(env!("CARGO_BIN_EXE_mtl"))
-        .env("MTL_APPLICATION_API_KEY", "disposable-test-key")
+    let output = Command::new(env!("CARGO_BIN_EXE_twl"))
+        .env("TWL_APPLICATION_API_KEY", "disposable-test-key")
         .args([
             "run",
             "--upstream",
@@ -57,9 +57,9 @@ fn environment_secret_prints_the_weaker_input_warning() {
 #[cfg(target_os = "macos")]
 #[test]
 fn ordinary_cargo_binary_fails_closed_for_real_credentials() {
-    let output = Command::new(env!("CARGO_BIN_EXE_mtl"))
+    let output = Command::new(env!("CARGO_BIN_EXE_twl"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .env("MTL_APPLICATION_API_KEY", "disposable-test-key")
+        .env("TWL_APPLICATION_API_KEY", "disposable-test-key")
         .args([
             "run",
             "--upstream",
@@ -75,14 +75,14 @@ fn ordinary_cargo_binary_fails_closed_for_real_credentials() {
 
 #[test]
 fn demo_uses_the_generic_application_contract() {
-    if std::env::var_os("MTL_TEST_DEMO_CHILD").is_some() {
+    if std::env::var_os("TWL_TEST_DEMO_CHILD").is_some() {
         return;
     }
     let current_test = std::env::current_exe().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_mtl"))
+    let output = Command::new(env!("CARGO_BIN_EXE_twl"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .env("MTL_TEST_DEMO_CHILD", "1")
-        .args(["demo", "--config", "examples/mithril.yaml", "--"])
+        .env("TWL_TEST_DEMO_CHILD", "1")
+        .args(["demo", "--config", "examples/towel.yaml", "--"])
         .arg(current_test)
         .args(["--exact", "demo_child_request", "--nocapture"])
         .output()
@@ -97,12 +97,12 @@ fn demo_uses_the_generic_application_contract() {
 
 #[test]
 fn demo_child_request() {
-    if std::env::var_os("MTL_TEST_DEMO_CHILD").is_none() {
+    if std::env::var_os("TWL_TEST_DEMO_CHILD").is_none() {
         return;
     }
     let key = std::env::var("APP_API_KEY").unwrap();
     let base = std::env::var("APP_BASE_URL").unwrap();
-    assert!(key.starts_with("mtl-app-"));
+    assert!(key.starts_with("twl-app-"));
     assert!(base.starts_with("http://127.0.0.1:"));
     let response = ureq::get(&format!("{base}/v1/models"))
         .call()

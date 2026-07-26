@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-identity=${MTL_CODESIGN_IDENTITY:--}
+identity=${TWL_CODESIGN_IDENTITY:--}
 if command -v cargo >/dev/null 2>&1; then
     cargo_path=$(command -v cargo)
 elif [ -x "$HOME/.cargo/bin/cargo" ]; then
@@ -12,6 +12,6 @@ else
 fi
 
 "$cargo_path" build --release --locked
-codesign --force --sign "$identity" --options runtime target/release/mtl
-codesign --verify --strict target/release/mtl
-target/release/mtl doctor
+codesign --force --sign "$identity" --options runtime target/release/twl
+codesign --verify --strict target/release/twl
+target/release/twl doctor

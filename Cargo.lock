@@ -264,21 +264,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mithril"
-version = "0.0.1"
-dependencies = [
- "base64",
- "libc",
- "rand",
- "rpassword",
- "serde",
- "serde_yaml",
- "tiny_http",
- "ureq",
- "url",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -463,10 +448,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
+name = "serde_yaml_ng"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
 dependencies = [
  "indexmap",
  "itoa",
@@ -558,6 +543,21 @@ checksum = "c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d"
 dependencies = [
  "displaydoc",
  "zerovec",
+]
+
+[[package]]
+name = "twl"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "libc",
+ "rand",
+ "rpassword",
+ "serde",
+ "serde_yaml_ng",
+ "tiny_http",
+ "ureq",
+ "url",
 ]
 
 [[package]]
