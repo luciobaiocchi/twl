@@ -3,9 +3,9 @@ use rand::Rng;
 
 const SERVICE: &str = "capshell";
 
-/// Il mock deve avere il formato del provider: diversi SDK validano prefisso e
-/// lunghezza prima di chiamare, e un placeholder generico produce errori
-/// incomprensibili invece di una richiesta che arriva al proxy.
+/// The mock has to match the provider's shape: several SDKs validate prefix
+/// and length before calling, and a generic placeholder produces confusing
+/// errors instead of a request that reaches the proxy.
 pub fn mock(prefix: &str) -> String {
     let tail: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -15,84 +15,84 @@ pub fn mock(prefix: &str) -> String {
     format!("{prefix}capshell{tail}")
 }
 
-// macOS e Windows: si passa dalla libreria, non dalla riga di comando. Su macOS
-// e' obbligatorio, perche' la ACL del Keychain e' legata alla firma del binario
-// che chiede: invocando `/usr/bin/security` la garanzia si attaccherebbe a
-// quello, e qualunque processo potrebbe ottenerla.
+// macOS and Windows: go through the library, not the command line. On macOS
+// this is mandatory, because the Keychain ACL is tied to the signature of the
+// binary asking: invoking `/usr/bin/security` would attach the guarantee to
+// that binary instead, and any process could get it.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn get(name: &str) -> Result<String, String> {
     keyring::Entry::new(SERVICE, name)
         .and_then(|e| e.get_password())
-        .map_err(|e| format!("portachiavi, {name}: {e}"))
+        .map_err(|e| format!("keyring, {name}: {e}"))
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn set(name: &str, value: &str) -> Result<(), String> {
     keyring::Entry::new(SERVICE, name)
         .and_then(|e| e.set_password(value))
-        .map_err(|e| format!("portachiavi, {name}: {e}"))
+        .map_err(|e| format!("keyring, {name}: {e}"))
 }
 
-// Linux: si chiama `secret-tool`, lo stesso portachiavi visto da riga di
-// comando. La libreria Rust equivalente costa 79 crate per parlare D-Bus e non
-// comprerebbe nessuna garanzia in piu': il Secret Service autorizza per utente,
-// non per applicazione, quindi la barriera verso l'agente la mette comunque il
-// mount namespace di `sandbox`. Qui al portachiavi resta un solo mestiere,
-// tenere il valore cifrato a riposo, e per quello la CLI basta.
+// Linux: shell out to `secret-tool`, the same keyring seen from the command
+// line. The equivalent Rust library costs 79 crates to speak D-Bus and would
+// not buy any extra guarantee: the Secret Service authorizes per user, not
+// per application, so the barrier against the agent is set by `sandbox`'s
+// mount namespace regardless. The keyring is left with a single job here —
+// keeping the value encrypted at rest — and the CLI is enough for that.
 #[cfg(target_os = "linux")]
 pub fn get(name: &str) -> Result<String, String> {
     let out = std::process::Command::new("secret-tool")
         .args(["lookup", "service", SERVICE, "account", name])
         .output()
-        .map_err(|_| manca_secret_tool())?;
+        .map_err(|_| secret_tool_missing())?;
     if !out.status.success() || out.stdout.is_empty() {
-        return Err(format!("{name} non e' nel portachiavi{}", senza_sessione()));
+        return Err(format!("{name} is not in the keyring{}", no_session()));
     }
-    let mut valore =
-        String::from_utf8(out.stdout).map_err(|_| "valore non testuale".to_string())?;
-    if valore.ends_with('\n') {
-        valore.pop();
+    let mut value =
+        String::from_utf8(out.stdout).map_err(|_| "value is not valid text".to_string())?;
+    if value.ends_with('\n') {
+        value.pop();
     }
-    Ok(valore)
+    Ok(value)
 }
 
 #[cfg(target_os = "linux")]
 pub fn set(name: &str, value: &str) -> Result<(), String> {
     use std::io::Write;
 
-    let mut figlio = std::process::Command::new("secret-tool")
+    let mut child = std::process::Command::new("secret-tool")
         .args(["store", "--label", &format!("capshell: {name}")])
         .args(["service", SERVICE, "account", name])
         .stdin(std::process::Stdio::piped())
         .spawn()
-        .map_err(|_| manca_secret_tool())?;
+        .map_err(|_| secret_tool_missing())?;
 
-    // Il valore passa da una pipe, mai da argv: `ps` non deve poterlo vedere.
-    figlio
+    // The value goes through a pipe, never argv: `ps` must not be able to see it.
+    child
         .stdin
         .take()
-        .expect("stdin richiesta")
+        .expect("stdin requested")
         .write_all(value.as_bytes())
         .map_err(|e| e.to_string())?;
 
-    match figlio.wait().map_err(|e| e.to_string())? {
+    match child.wait().map_err(|e| e.to_string())? {
         s if s.success() => Ok(()),
-        s => Err(format!("secret-tool store: {s}{}", senza_sessione())),
+        s => Err(format!("secret-tool store: {s}{}", no_session())),
     }
 }
 
 #[cfg(target_os = "linux")]
-fn manca_secret_tool() -> String {
-    "secret-tool non trovato: `apt install libsecret-tools`, oppure usa --env".into()
+fn secret_tool_missing() -> String {
+    "secret-tool not found: `apt install libsecret-tools`, or use --env".into()
 }
 
-/// Il portachiavi vive sul bus D-Bus di sessione, che esiste solo con una
-/// sessione desktop aperta. Via SSH, in container o in CI non c'e', e l'errore
-/// della CLI da solo non dice all'utente cosa fare.
+/// The keyring lives on the D-Bus session bus, which only exists with an open
+/// desktop session. Over SSH, in a container, or in CI there isn't one, and
+/// the CLI's own error doesn't tell the user what to do about it.
 #[cfg(target_os = "linux")]
-fn senza_sessione() -> &'static str {
+fn no_session() -> &'static str {
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
-        "\n  (nessuna sessione D-Bus: via SSH, in container o in CI usa --env)"
+        "\n  (no D-Bus session: over SSH, in a container, or in CI use --env)"
     } else {
         ""
     }
@@ -101,15 +101,15 @@ fn senza_sessione() -> &'static str {
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub fn get(_name: &str) -> Result<String, String> {
     let _ = SERVICE;
-    Err("nessun portachiavi su questa piattaforma: usa --env".into())
+    Err("no keyring on this platform: use --env".into())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub fn set(_name: &str, _value: &str) -> Result<(), String> {
-    Err("nessun portachiavi su questa piattaforma".into())
+    Err("no keyring on this platform".into())
 }
 
-/// Parser minimo di un file .env: `KEY=value`, commenti con `#`, apici opzionali.
+/// Minimal .env file parser: `KEY=value`, `#` comments, optional quotes.
 pub fn parse_env_file(raw: &str) -> Vec<(String, String)> {
     raw.lines()
         .map(str::trim)
@@ -127,8 +127,8 @@ pub fn parse_env_file(raw: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Sostituisce nel testo del .env i valori dichiarati con i loro placeholder.
-/// Il file smette di contenere segreti e puo' anche finire in git.
+/// Replaces the declared values in the .env text with their placeholders.
+/// The file stops holding secrets and can even go into git.
 pub fn rewrite_env_file(raw: &str, replacements: &[(String, String)]) -> String {
     raw.lines()
         .map(|line| {

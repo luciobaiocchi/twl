@@ -1,451 +1,463 @@
 # Capshell
 
-**L'agente non vede le tue chiavi API. Un comando.**
+**The agent never sees your API keys. One command.**
 
 ```bash
 capshell run --env .env -- codex
 ```
 
-Capshell avvia il tuo agente (Codex, Claude Code, OpenHands, uno script) come
-processo figlio con un environment in cui le chiavi vere sono sostituite da
-token finti. Le chiavi reali restano nel processo padre, in memoria, e vengono
-attaccate alle richieste solo da un proxy locale con destinazione cablata.
+Capshell starts your agent (Codex, Claude Code, OpenHands, a script) as a
+child process with an environment where real keys are replaced by fake
+tokens. The real keys stay in the parent process, in memory, and only get
+attached to requests by a local proxy with a hardwired destination.
 
-> **Stato: v0 in corso.** Il nucleo funziona ed è coperto da test. Portachiavi
-> attivo su macOS, Windows e Linux; su Linux il canale D-Bus verso il figlio
-> viene chiuso con bubblewrap, quando c'è. 76 dipendenze, di cui 53 sono lo
-> stack TLS.
-> Non è software di sicurezza auditato: fino a revisione indipendente, usare
-> solo credenziali di test.
-
----
-
-## Il problema
-
-Dare a un agente autonomo una chiave API significa metterla in una variabile
-d'ambiente, e a quel punto qualunque processo in quell'ambiente può leggerla e
-spedirla altrove. Non è un bug: è Unix che funziona correttamente.
-
-Il masking non risolve — sostituisce stringhe letterali note, e viene aggirato
-da encoding, frammentazione, file e rete. Il primitivo stesso, *"il segreto è
-una stringa disponibile al processo"*, è incompatibile con il proteggere il
-segreto **dal** processo.
+> **Status: v0 in progress.** The core works and is covered by tests.
+> Keyring active on macOS, Windows, and Linux; on Linux, the D-Bus channel to
+> the child is closed with bubblewrap, when available. 76 dependencies, 53 of
+> which are the TLS stack.
+> This is not audited security software: until an independent review, use
+> test credentials only.
 
 ---
 
-## Come funziona
+## The problem
 
-Tre passi, nessuna configurazione oltre a un file.
+Giving an autonomous agent an API key means putting it in an environment
+variable, and at that point any process in that environment can read it and
+send it elsewhere. That's not a bug: it's Unix working correctly.
 
-1. **Capshell legge i segreti veri** da una sorgente che l'agente non vede.
-2. **Genera un environment mockato** e ci lancia dentro il processo figlio:
-   `OPENAI_API_KEY=cs-mock-…`, `OPENAI_BASE_URL=http://127.0.0.1:PORT/openai`.
-3. **Espone un proxy locale a rotte statiche.** Alla richiesta dell'agente
-   sostituisce il mock con la chiave vera e inoltra a un upstream cablato.
-
-### Perché l'agente non può semplicemente chiamare OpenAI
-
-Perché non ha niente da usare. Il token che possiede è finto: una chiamata
-diretta ad `api.openai.com` risponde `401`. L'unico percorso che funziona passa
-dal proxy, dove la chiave viene attaccata da Capshell e la destinazione è decisa
-da Capshell.
-
-Non stai vietando all'agente di uscire. Stai facendo in modo che uscire da solo
-non gli serva a niente.
+Masking doesn't solve it — it replaces known literal strings, and gets
+sidestepped by encoding, fragmentation, files, and the network. The
+primitive itself, *"the secret is a string available to the process,"* is
+incompatible with protecting the secret **from** the process.
 
 ---
 
-## Cosa è, e cosa non è
+## How it works
 
-Capshell fa **una cosa**: impedisce che il valore di una chiave API entri nel
-processo dell'agente. Tutto il resto è delegato a strumenti che esistono già e
-funzionano meglio.
+Three steps, no configuration beyond a file.
+
+1. **Capshell reads the real secrets** from a source the agent never sees.
+2. **Generates a mocked environment** and launches the child process inside
+   it: `OPENAI_API_KEY=cs-mock-…`, `OPENAI_BASE_URL=http://127.0.0.1:PORT/openai`.
+3. **Exposes a local proxy with static routes.** On the agent's request, it
+   swaps the mock for the real key and forwards to a hardwired upstream.
+
+### Why the agent can't just call OpenAI directly
+
+Because it has nothing to use. The token it holds is fake: a direct call to
+`api.openai.com` gets a `401`. The only path that works goes through the
+proxy, where the key is attached by Capshell and the destination is decided
+by Capshell.
+
+You're not forbidding the agent from leaving. You're making it so that
+leaving on its own gets it nowhere.
+
+---
+
+## What it is, and what it isn't
+
+Capshell does **one thing**: it stops the value of an API key from entering
+the agent's process. Everything else is delegated to tools that already
+exist and do it better.
 
 | | |
 |---|---|
-| L'agente ti distrugge la codebase? | **Usa git.** Non è un problema di Capshell. |
-| Vuoi isolamento vero di processi e filesystem? | **Usa Docker.** Capshell ci gira dentro senza modifiche. |
-| Vuoi impedire l'esfiltrazione del codice sorgente? | **Non è possibile** con un endpoint LLM raggiungibile. Non lo promettiamo. |
-| L'agente consuma troppi token? | `budget: max_requests`, opzionale. Il costo per-token è in roadmap. |
+| The agent is trashing your codebase? | **Use git.** Not Capshell's problem. |
+| Want real process and filesystem isolation? | **Use Docker.** Capshell runs inside it unmodified. |
+| Want to prevent source code exfiltration? | **Not possible** with a reachable LLM endpoint. We don't claim it. |
+| The agent is burning through tokens? | `budget: max_requests`, optional. Per-token cost is on the roadmap. |
 
 ---
 
-## Le due proprietà
+## The two properties
 
-Condizioni testabili, non teoremi. Una suite di test le rende verdi o rosse.
+Testable conditions, not theorems. A test suite makes them pass or fail.
 
-### INV-SECRET — il valore non entra nel processo agente
+### INV-SECRET — the value never enters the agent's process
 
-> Per nessun segreto gestito il valore reale compare nell'environment del
-> processo figlio, dei suoi discendenti, nel suo stdout/stderr, o nei log.
+> For no managed secret does the real value show up in the child process's
+> environment, its descendants, its stdout/stderr, or the logs.
 
-Include una regola sul proxy: **non riflette mai la richiesta upstream verso il
-client**, in nessun path di errore. I body di errore upstream vengono troncati e
-filtrati, altrimenti l'header iniettato può tornare indietro all'agente.
+This includes a rule on the proxy: **it never reflects the upstream request
+back to the client**, on any error path. Upstream error bodies are
+truncated and filtered — otherwise an injected header could find its way
+back to the agent.
 
-**Test:** canary al posto della chiave vera, scansione di environment
-(`/proc/<pid>/environ` di ogni discendente), output e log. Zero occorrenze, in
-chiaro e in base64.
+**Test:** a canary in place of the real key, a scan of the environment
+(`/proc/<pid>/environ` for every descendant), output, and logs. Zero
+occurrences, in plaintext and in base64.
 
-### INV-DEST — la destinazione è cablata
+### INV-DEST — the destination is hardwired
 
-> Nessun input dell'agente può far arrivare una richiesta autenticata a un host
-> diverso da quello del connector.
+> No input from the agent can make an authenticated request land on a host
+> other than the connector's.
 
-`/openai` parla con `api.openai.com` e con nient'altro. Non esiste un proxy
-generico.
+`/openai` talks to `api.openai.com` and nothing else. There is no generic
+proxy.
 
-Ogni URL comincia con un **token di sessione** casuale, che il figlio riceve nel
-suo environment. Il proxy ascolta su loopback, raggiungibile da qualunque
-processo della macchina: senza token un altro utente locale potrebbe scoprire la
-porta e spendere la tua chiave. Un token sbagliato risponde `404` esattamente
-come un path inesistente, e il confronto e' a tempo costante.
+Every URL starts with a random **session token**, which the child receives
+in its environment. The proxy listens on loopback, reachable by any process
+on the machine: without a token, another local user could discover the port
+and spend your key. A wrong token gets a `404`, exactly like a missing path,
+and the comparison runs in constant time.
 
-**Test — tutti respinti o forzati sull'host fisso:** header `Host` ostile;
-request line con URI assoluto; `CONNECT`; `X-Forwarded-Host`, `X-Original-URL`;
-path traversal; **e i redirect `3xx` dall'upstream, che il proxy non segue mai e
-a cui non riallega mai la chiave.**
+**Test — all rejected or forced onto the fixed host:** hostile `Host`
+header; request line with an absolute URI; `CONNECT`; `X-Forwarded-Host`,
+`X-Original-URL`; path traversal; **and `3xx` redirects from the upstream,
+which the proxy never follows and never reattaches the key to.**
 
-Senza INV-DEST il proxy non è un muro: è un tunnel di esfiltrazione autenticato.
+Without INV-DEST the proxy isn't a wall: it's an authenticated
+exfiltration tunnel.
 
 ---
 
-## Configurazione
+## Configuration
 
-Un file, che dichiara **nomi, tipi e connector**. I valori non stanno qui.
+A single file, declaring **names, types, and connectors**. Values don't
+live here.
 
 ```yaml
 # capshell.yaml
 secrets:
   - name: OPENAI_API_KEY
-    connector: openai        # upstream cablato: api.openai.com
+    connector: openai        # hardwired upstream: api.openai.com
   - name: ANTHROPIC_API_KEY
     connector: anthropic
 
-budget:                      # opzionale, assente per default
+budget:                      # optional, absent by default
   max_requests: 500
 ```
 
-Qualunque variabile presente nella sorgente e non dichiarata in `capshell.yaml`
-viene passata al figlio **invariata**. Capshell non indovina: tocca solo ciò che
-gli dici di toccare.
+Any variable present in the source and not declared in `capshell.yaml`
+passes through to the child **unchanged**. Capshell doesn't guess: it only
+touches what you tell it to.
 
-### Il limite di consumo è opzionale
+### The usage limit is optional
 
-Senza il blocco `budget`, Capshell impedisce che la chiave venga **rubata**, non
-che venga **usata**: l'agente può chiamare l'endpoint dichiarato finché la
-sessione vive. È comunque una differenza reale — una chiave esfiltrata è per
-sempre, un accesso brokerato muore con la sessione — ma va detta.
+Without a `budget` block, Capshell prevents the key from being **stolen**,
+not from being **used**: the agent can call the declared endpoint for as
+long as the session lasts. That's still a real difference — an exfiltrated
+key lasts forever, a brokered access dies with the session — but it needs
+to be said plainly.
 
-Con `max_requests`, la richiesta N+1 viene rifiutata localmente. Il contatore si
-incrementa **prima** dell'inoltro: con richieste concorrenti, contare dopo lascia
-passare più di N.
+With `max_requests`, request N+1 gets rejected locally. The counter
+increments **before** forwarding: counting afterward would let more than N
+through under concurrent requests.
 
 ---
 
-## Provarlo
+## Try it
 
-Serve solo `cargo`. Il giro completo si vede senza una chiave vera e senza
-spendere: `capshell mock-upstream` è un finto provider che riporta quello che ha
-ricevuto.
+Just `cargo` is needed. The whole round trip can be seen without a real key
+and without spending anything: `capshell mock-upstream` is a fake provider
+that echoes back what it received.
 
 ```bash
 cargo build
-cargo test                 # 30 test: INV-SECRET, INV-DEST, budget, canali, attacchi
+cargo test                 # 30 tests: INV-SECRET, INV-DEST, budget, channels, attacks
 
-# terminale 1 — il finto provider
+# terminal 1 — the fake provider
 ./target/debug/capshell mock-upstream --port 9000
 
-# terminale 2 — una shell sotto Capshell
+# terminal 2 — a shell under Capshell
 ./target/debug/capshell run \
   --config examples/capshell.yaml \
   --env examples/dev.env \
   -- sh
 ```
 
-Dentro quella shell:
+Inside that shell:
 
 ```bash
 env | grep OPENAI
-# OPENAI_API_KEY=sk-capshell...        <- il mock, non la tua chiave
-# OPENAI_BASE_URL=http://127.0.0.1:PORTA/openai
+# OPENAI_API_KEY=sk-capshell...        <- the mock, not your key
+# OPENAI_BASE_URL=http://127.0.0.1:PORT/openai
 
 curl -s "$OPENAI_BASE_URL/v1/models"
-# "authorization":"<ricevuta, 55 byte, inizia con Bearer sk-CANARY-C>"
-#  ^ la chiave vera e' arrivata all'upstream, senza mai passare da qui
+# "authorization":"<received, 55 bytes, starts with Bearer sk-CANARY-R>"
+#  ^ the real key reached the upstream, without ever passing through here
 
-curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:PORTA/openai/v1/models"
-# 404: senza il token di sessione il proxy non serve nessuno, nemmeno
-# un altro processo dello stesso utente che ha trovato la porta
+curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:PORT/openai/v1/models"
+# 404: without the session token the proxy serves no one, not even
+# another process of the same user who found the port
 
 curl -s -H "Host: evil.example" "$OPENAI_BASE_URL/v1/models"
-# stessa risposta: l'header Host non sposta la destinazione (INV-DEST)
+# same response: the Host header doesn't move the destination (INV-DEST)
 
 grep -r "CANARY" /proc/self/environ
-# nessun risultato (INV-SECRET)
+# no results (INV-SECRET)
 
 cat "$XDG_RUNTIME_DIR/bus"
-# No such file or directory: su Linux con bubblewrap il socket del
-# portachiavi non esiste nel mount namespace del figlio
+# No such file or directory: on Linux with bubblewrap, the keyring
+# socket doesn't exist in the child's mount namespace
 ```
 
-`examples/dev.env` dichiara `OPENAI_API_KEY` ma **non** `ANTHROPIC_API_KEY`, di
-proposito: all'avvio Capshell avvisa che quest'ultima passa in chiaro perché non
-è dichiarata. È l'errore più probabile — aggiungere una chiave al `.env` e
-dimenticarsi di dichiararla — e l'avviso è l'unico punto in cui il progetto usa
-un'euristica: per segnalare, mai per decidere cosa proteggere.
+`examples/dev.env` declares `OPENAI_API_KEY` but **not**
+`ANTHROPIC_API_KEY`, on purpose: on startup Capshell warns that the latter
+passes through in plaintext because it isn't declared. It's the most
+likely mistake — adding a key to `.env` and forgetting to declare it — and
+the warning is the one place in the project where a heuristic is used: to
+flag, never to decide what to protect.
 
 ---
 
-## Da dove arrivano i segreti
+## Where the secrets come from
 
-La sorgente è un backend intercambiabile, scelto in base all'ambiente. La
-garanzia non cambia: il valore entra nella memoria di Capshell e il figlio riceve
-sempre e solo il mock.
+The source is a swappable backend, chosen based on the environment. The
+guarantee doesn't change: the value enters Capshell's memory and the child
+always and only receives the mock.
 
-| ambiente | sorgente |
+| environment | source |
 |---|---|
-| host desktop (macOS, Windows, Linux con sessione) | **OS keyring** |
-| container, headless, CI | **environment del processo Capshell**, iniettato dal runtime |
-| primo avvio / migrazione | `--env .env` non committato |
+| desktop host (macOS, Windows, Linux with a session) | **OS keyring** |
+| container, headless, CI | **environment of the Capshell process**, injected by the runtime |
+| first run / migration | `--env .env`, not committed |
 
-I due ambienti si coprono a vicenda: il keyring è facile sull'host e impossibile
-in un container; la separazione di UID è gratis in un container e costosa
-sull'host.
+The two environments cover for each other: the keyring is easy on a host
+and impossible in a container; UID separation is free in a container and
+costly on a host.
 
-### Il keyring non protegge allo stesso modo su tutte le piattaforme
+### The keyring doesn't protect the same way on every platform
 
-Mettere il segreto nel portachiavi lo toglie dal filesystem — niente `cat .env`,
-niente `grep -r`, niente commit per errore. Ma **impedire a un altro processo del
-tuo utente di chiederlo** è una proprietà diversa, e solo una piattaforma ce
-l'ha nativamente.
+Putting the secret in the keyring takes it off the filesystem — no
+`cat .env`, no `grep -r`, no accidental commits. But **stopping another
+process of your own user from asking for it** is a different property, and
+only one platform has it natively.
 
-| | come autorizza | l'agente può chiederlo? |
+| | how it authorizes | can the agent ask for it? |
 |---|---|---|
-| **macOS** — Keychain | ACL per **item** e per **firma del binario** | **no**: binario diverso, prompt o rifiuto |
-| **Windows** — Credential Manager | DPAPI **per utente** | sì, qualunque processo della sessione |
-| **Linux** — Secret Service | **per utente**, via D-Bus di sessione | sì, qualunque processo che raggiunge il bus |
+| **macOS** — Keychain | ACL per **item** and per **binary signature** | **no**: different binary, prompt or refusal |
+| **Windows** — Credential Manager | DPAPI **per user** | yes, any process in the session |
+| **Linux** — Secret Service | **per user**, via the session D-Bus | yes, any process that reaches the bus |
 
-**Su macOS la barriera è già lì**, e va solo non buttata via: il binario dev'essere
-**firmato** (con un binario instabile la ACL non combacia più a ogni
-aggiornamento, il prompt ritorna, e l'utente impara a cliccare "consenti sempre"
-a occhi chiusi), e gli item vanno creati con ACL ristretta alla sola app
-creatrice — il default di `SecItemAdd`.
+**On macOS the barrier is already there**, and just needs to not be thrown
+away: the binary has to be **signed** (with an unstable binary, the ACL no
+longer matches on every update, the prompt comes back, and the user learns
+to click "always allow" without looking), and items need to be created with
+an ACL restricted to the creating app — the default for `SecItemAdd`.
 
-**Su Linux la barriera va costruita**, ed è quello che fa `src/sandbox.rs`. Il
-Secret Service si raggiunge attraverso un socket Unix su un path
-(`/run/user/<uid>/bus`): basta che quel path **non esista nel mount namespace del
-figlio** e la `connect()` fallisce, senza che nessuna variabile d'ambiente possa
-recuperarlo. Il comando viene avvolto in bubblewrap con un tmpfs sopra quella
-directory.
+**On Linux the barrier has to be built**, and that's what `src/sandbox.rs`
+does. The Secret Service is reached through a Unix socket at a path
+(`/run/user/<uid>/bus`): it's enough that the path **doesn't exist in the
+child's mount namespace** for `connect()` to fail, with no environment
+variable able to recover it. The command gets wrapped in bubblewrap with a
+tmpfs over that directory.
 
-Non è un sandbox: `--dev-bind / /` lascia il filesystem esattamente com'è. Non
-stiamo confinando niente, stiamo togliendo dei socket. E **non** si passa
-`--unshare-net`, che taglierebbe anche il loopback e impedirebbe al figlio di
-raggiungere il proxy.
+It's not a sandbox: `--dev-bind / /` leaves the filesystem exactly as it
+is. We're not confining anything, we're removing sockets. And
+`--unshare-net` is **never** passed, since that would also cut the
+loopback and stop the child from reaching the proxy.
 
-Già che il namespace c'è, vengono chiusi anche gli altri oracoli di credenziali
-della sessione: `/run/user/<uid>/keyring/` (socket di controllo di
-gnome-keyring), `$SSH_AUTH_SOCK`, il socket di gpg-agent, `/var/run/docker.sock`
-(che è root-equivalente).
+Since the namespace is already there, the session's other credential
+oracles get closed too: `/run/user/<uid>/keyring/` (gnome-keyring's control
+socket), `$SSH_AUTH_SOCK`, the gpg-agent socket, `/var/run/docker.sock`
+(which is root-equivalent).
 
-Non è un requisito. Se bubblewrap manca o gli unprivileged user namespace sono
-disabilitati, **Capshell parte lo stesso e lo dice** — *"il portachiavi resta
-raggiungibile dal processo figlio"*. Degradare con un avviso, non rifiutarsi di
-funzionare. L'utilizzabilità di bwrap viene verificata **prima** di lanciarci il
-comando vero: un fallimento a metà strada sarebbe indistinguibile da un errore
-del comando dell'utente.
+It's not a requirement. If bubblewrap is missing or unprivileged user
+namespaces are disabled, **Capshell starts anyway and says so** — *"the
+keyring stays reachable from the child process."* Degrade with a warning,
+don't refuse to work. bwrap's usability is checked **before** launching the
+real command with it: a failure halfway through would be indistinguishable
+from an error in the user's own command.
 
-Un caso resta scoperto e viene segnalato: se il bus è su un **socket astratto**
-(`unix:abstract=`), quello vive nel network namespace e non nel filesystem, e un
-mount namespace non lo tocca.
+One case is left uncovered and gets flagged: if the bus is on an
+**abstract socket** (`unix:abstract=`), it lives in the network namespace
+rather than the filesystem, and a mount namespace can't touch it.
 
-Puoi verificare tutto questo da solo — è la proprietà su cui poggia il supporto
-Linux, quindi non fidarti sulla parola:
+You can verify all of this yourself — it's the property Linux support
+rests on, so don't take it on faith:
 
 ```bash
-./scripts/verifica-portachiavi-linux.sh
+./scripts/verify-keyring-linux.sh
 ```
 
 ```
---- fuori da capshell ---
-sk-CANARY-NON-DEVE-USCIRE
---- dentro capshell, stesso comando ---
+--- outside capshell ---
+sk-CANARY-MUST-NOT-LEAK
+--- inside capshell, same command ---
 secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY
 ```
 
-Stesso comando, stesso utente, stesso portachiavi.
+Same command, same user, same keyring.
 
-### Perché su Linux si chiama `secret-tool` e su macOS no
+### Why Linux calls `secret-tool` and macOS doesn't
 
-Su Linux il portachiavi si raggiunge con **`secret-tool`** (pacchetto
-`libsecret-tools`), il client a riga di comando di libsecret. La libreria Rust
-equivalente costa **79 crate** per implementare D-Bus, e non comprerebbe nessuna
-garanzia in più: come dice la tabella qui sopra, il Secret Service autorizza per
-utente, quindi la barriera verso l'agente la mette comunque il mount namespace.
-Al portachiavi resta un solo mestiere — non lasciare il valore in chiaro su disco
-— e per quello la CLI basta.
+On Linux the keyring is reached with **`secret-tool`** (package
+`libsecret-tools`), libsecret's command-line client. The equivalent Rust
+library costs **79 crates** to implement D-Bus, and wouldn't buy any extra
+guarantee: as the table above shows, the Secret Service authorizes by
+user, so the barrier against the agent is set by the mount namespace
+regardless. The keyring is left with a single job — not leaving the value
+in plaintext on disk — and the CLI is enough for that.
 
-Su macOS **no, e non è una scelta di gusto**: la ACL del Keychain è legata alla
-firma del binario che chiede. Invocando `/usr/bin/security` da riga di comando la
-garanzia si attaccherebbe a *quello*, e qualunque processo potrebbe ottenerla.
-Lì la libreria è obbligatoria.
+On macOS **no, and it's not a matter of taste**: the Keychain's ACL is tied
+to the signature of the binary asking. Invoking `/usr/bin/security` from
+the command line would attach the guarantee to *that* binary instead, and
+any process could obtain it. There, the library is mandatory.
 
-Da cui la regola: **libreria dove l'identità del chiamante conta, sottoprocesso
-dove non conta.**
+Hence the rule: **library where the caller's identity matters, subprocess
+where it doesn't.**
 
-**Su Windows** non esiste un equivalente semplice, quindi la garanzia si ferma
-alla protezione dall'esposizione.
+**On Windows** there's no simple equivalent, so the guarantee stops at
+protection from exposure.
 
-### Il `.env` non è una modalità, è un percorso di migrazione
+### `.env` isn't a mode, it's a migration path
 
 ```bash
 capshell secret import .env
 ```
 
-Sposta i valori nel keyring e riscrive il `.env` con i placeholder. Da quel
-momento il file non contiene più segreti e può anche finire in git senza danni.
-`--env` resta per il primo avvio e per chi un keyring non ce l'ha.
+Moves the values into the keyring and rewrites `.env` with placeholders.
+From that point on the file no longer holds secrets and can safely go into
+git. `--env` remains for the first run and for anyone without a keyring.
 
-### Nel container
+### Inside a container
 
-Vale un principio unico:
+A single principle applies:
 
-> **Capshell e l'agente devono essere separati da qualcosa: un UID, un container
-> o una macchina.** Se condividono UID e namespace, non c'è niente da proteggere.
+> **Capshell and the agent need to be separated by something: a UID, a
+> container, or a machine.** If they share a UID and namespace, there's
+> nothing to protect.
 
-In ordine di preferenza:
+In order of preference:
 
-1. **Due container** — Capshell in uno, l'agente nell'altro, che parla col proxy
-   sulla rete interna. Nessun privilegio, nessun namespace condiviso, dieci righe
-   di compose. È il pattern sidecar con entrambi containerizzati.
-2. **Un container, due UID** — Capshell parte come root e spawna il figlio sotto
-   un utente non privilegiato. La sequenza è `setgroups()` → `setgid()` →
-   `setuid()`, **in quest'ordine**; poi si verifica che il drop sia avvenuto e si
-   fallisce chiuso in caso contrario, si chiudono i descrittori ereditati con
-   `close_range()`, e solo allora `execve()`.
-3. **Un container, un UID** — sopravvivibile ma con una difesa sola, e non è la
-   modalità consigliata. Regge su `prctl(PR_SET_DUMPABLE, 0)`: contro un processo
-   non-dumpable il kernel richiede `CAP_SYS_PTRACE` per leggere `environ`, `mem`
-   e `maps`, anche a parità di UID. Perché funzioni servono due condizioni: il
-   segreto arriva dall'environment e **non** da un file leggibile dall'agente, e
-   Capshell è l'**entrypoint** — se lo lancia uno script di shell, quello resta
-   vivo come PID 1 con il segreto nel proprio `environ`.
+1. **Two containers** — Capshell in one, the agent in the other, talking to
+   the proxy over the internal network. No privileges, no shared
+   namespace, ten lines of compose. It's the sidecar pattern with both
+   sides containerized.
+2. **One container, two UIDs** — Capshell starts as root and spawns the
+   child under an unprivileged user. The sequence is `setgroups()` →
+   `setgid()` → `setuid()`, **in that order**; then it verifies the drop
+   actually happened and fails closed if not, closes inherited file
+   descriptors with `close_range()`, and only then `execve()`.
+3. **One container, one UID** — survivable but with a single line of
+   defense, and not the recommended mode. It relies on
+   `prctl(PR_SET_DUMPABLE, 0)`: against a non-dumpable process the kernel
+   requires `CAP_SYS_PTRACE` to read `environ`, `mem`, and `maps`, even at
+   the same UID. Two conditions are needed for this to work: the secret
+   comes from the environment and **not** from a file the agent can read,
+   and Capshell is the **entrypoint** — if a shell script launches it, that
+   script stays alive as PID 1 with the secret in its own `environ`.
 
-   Yama non basta da solo: `ptrace_scope` filtra `PTRACE_MODE_ATTACH`, mentre la
-   lettura di `/proc/<pid>/environ` passa da `PTRACE_MODE_READ`. È `dumpable=0` a
-   chiudere entrambe le vie.
+   Yama isn't enough on its own: `ptrace_scope` filters
+   `PTRACE_MODE_ATTACH`, while reading `/proc/<pid>/environ` goes through
+   `PTRACE_MODE_READ`. It's `dumpable=0` that closes both paths.
 
-### Non-goal: cifratura a riposo
+### Non-goal: encryption at rest
 
-Capshell **non persiste niente**. Legge la sorgente all'avvio, tiene il valore in
-memoria per la durata del processo, e muore con esso. Non esiste un "at rest" da
-cifrare, quindi non esiste un cifrario da scegliere, una chiave di cifratura da
-custodire, né un file di stato da proteggere.
+Capshell **persists nothing**. It reads the source at startup, holds the
+value in memory for the life of the process, and dies with it. There's no
+"at rest" to encrypt, so there's no cipher to choose, no encryption key to
+guard, and no state file to protect.
 
-Se un giorno servisse persistere segreti su disco, la risposta giusta non è
-aggiungere un cifrario: è usare il keyring, o iniettarli a runtime.
+If secrets ever needed to be persisted to disk, the right answer isn't
+adding a cipher: it's using the keyring, or injecting them at runtime.
 
 ---
 
-## Piattaforme
+## Platforms
 
-Il nucleo — processo figlio, environment mockato, proxy locale — è
-**cross-platform**: funziona su macOS, Windows e Linux senza namespace,
-container o privilegi.
+The core — child process, mocked environment, local proxy — is
+**cross-platform**: it works on macOS, Windows, and Linux without
+namespaces, containers, or privileges.
 
-L'unico uso di namespace è quello descritto sopra: rimuovere dalla vista del
-figlio i socket delle credenziali, su Linux, come hardening opzionale con
+The only use of namespaces is the one described above: removing credential
+sockets from the child's view, on Linux, as optional hardening with a
 fallback.
 
-Su Linux due pacchetti opzionali, sulla stessa riga di `apt`:
+On Linux, two optional packages, on the same `apt` line:
 
 ```bash
 apt install bubblewrap libsecret-tools
 ```
 
-`bubblewrap` chiude i canali, `libsecret-tools` dà accesso al portachiavi. Senza
-il primo Capshell funziona e avvisa; senza il secondo si usa `--env`. Nessuno
-dei due è un requisito di compilazione.
+`bubblewrap` closes the channels, `libsecret-tools` gives access to the
+keyring. Without the first, Capshell works and warns; without the second,
+use `--env`. Neither is a build requirement.
 
-**Non è previsto un confinamento del filesystem costruito da Capshell.** Chi
-vuole confinare davvero il filesystem usa Docker, che lo fa meglio ed è già nel
-percorso consigliato.
+**Filesystem confinement built by Capshell is not planned.** Anyone who
+wants real filesystem confinement should use Docker, which does it better
+and is already on the recommended path.
 
 ---
 
 ## Roadmap
 
-**v0 — nucleo e keyring desktop.** Un comando, un file di config, connector per
-provider LLM bearer-token (OpenAI, Anthropic, OpenAI-compatible), le due
-proprietà con la loro suite di test, `budget` opzionale.
+**v0 — core and desktop keyring.** One command, one config file, connectors
+for bearer-token LLM providers (OpenAI, Anthropic, OpenAI-compatible), the
+two properties with their test suite, optional `budget`.
 
-Sorgente dei segreti: **OS keyring su macOS e Windows**, con `capshell secret
-import` come percorso di migrazione dal `.env`. Si parte da qui perché è il caso
-in cui il portachiavi funziona senza costruirci niente attorno — e su macOS la
-ACL per firma del binario dà da subito la garanzia più forte del progetto.
+Secret source: **OS keyring on macOS and Windows**, with `capshell secret
+import` as the migration path from `.env`. This is the starting point
+because it's the case where the keyring works without building anything
+around it — and on macOS the signature-based ACL gives the project's
+strongest guarantee from day one.
 
-> Il keyring non è un dettaglio rimandabile: finché la sorgente è un file su
-> disco serve mascherarlo, e quel mascheramento è codice. Il keyring **toglie**
-> codice al progetto invece di aggiungerne. Per questo sta in v0 e non dopo.
+> The keyring isn't a detail that can wait: as long as the source is a file
+> on disk, it needs masking, and that masking is code. The keyring
+> **removes** code from the project instead of adding to it. That's why
+> it's in v0, not later.
 
-Linux è coperto allo stesso modo: Secret Service come sorgente, e la chiusura
-del canale D-Bus verso il figlio via bubblewrap, con fallback dove non è
-disponibile.
+Linux is covered the same way: Secret Service as the source, and closing
+the D-Bus channel to the child via bubblewrap, with a fallback where it
+isn't available.
 
-**M1 — container.** Iniezione dei segreti a runtime, drop verso un UID non
-privilegiato per il processo figlio, Capshell come entrypoint.
+**M1 — containers.** Injecting secrets at runtime, dropping to an
+unprivileged UID for the child process, Capshell as the entrypoint.
 
-**M2 — controllo del consumo, oltre il contatore.** Il cap sulle richieste c'è
-già in v0. Restano i byte inviati upstream e il costo per-token
-provider-specific: il numero di chiamate è un proxy debole per la spesa, 500
-richieste con contesto pieno valgono centinaia di dollari.
+**M2 — usage control, beyond the counter.** The request cap is already in
+v0. What's left is upstream bytes sent and provider-specific per-token
+cost: request count is a weak proxy for spend — 500 requests with a full
+context are worth hundreds of dollars.
 
-**M3 — copertura.** Connector protocol-aware (AWS SigV4, client senza override
-del base URL come Stripe). Scansione pre-flight dei segreti committati per errore
-nel repository — problema di igiene di git più che di agenti, ma facile da
-segnalare quando si è già lì.
+**M3 — coverage.** Protocol-aware connectors (AWS SigV4, clients without a
+base-URL override like Stripe). Pre-flight scan for secrets accidentally
+committed to the repository — more a git hygiene problem than an agent one,
+but easy to flag once you're already there.
 
-Ogni fase mantiene fallback espliciti e non indebolisce in silenzio le garanzie
-già dichiarate.
-
----
-
-## Cosa resta possibile a un agente malevolo
-
-- **Usare** la chiave attraverso il proxy, verso l'endpoint dichiarato, finché
-  la sessione vive — senza limite, se non configuri `budget`.
-- **Esfiltrare** codice e dati codificandoli in un prompt. Non arginabile.
-- **Modificare o distruggere** i file su cui lavora. Usa git.
-- **Leggere altre credenziali** presenti sulla macchina, se non lo isoli.
-  Usa Docker.
-- **Chiedere al portachiavi i tuoi item su Windows**, dove l'autorizzazione è
-  per utente e non per applicazione. Su macOS no: lì la ACL è per firma del
-  binario. Su Linux no, se bubblewrap è disponibile: il socket del bus non
-  esiste nel suo mount namespace.
-- Sfruttare un bug in Capshell, nel kernel, o nel provider upstream.
-
-Quello che **non** può fare è ottenere il valore di una chiave gestita **dal
-processo di Capshell**, o usarla verso una destinazione che non hai dichiarato.
+Every phase keeps its fallbacks explicit and never silently weakens a
+guarantee already made.
 
 ---
 
-## Vincoli di progetto
+## What a malicious agent can still do
 
-Tre regole che decidono cosa entra e cosa no:
+- **Use** the key through the proxy, toward the declared endpoint, for as
+  long as the session lasts — with no limit, if you don't configure
+  `budget`.
+- **Exfiltrate** code and data by encoding it in a prompt. Not something
+  this can stop.
+- **Modify or destroy** the files it works on. Use git.
+- **Read other credentials** on the machine, if you don't isolate it.
+  Use Docker.
+- **Ask the keyring for your items on Windows**, where authorization is
+  per user rather than per application. Not on macOS: there the ACL is by
+  binary signature. Not on Linux either, if bubblewrap is available: the
+  bus socket doesn't exist in its mount namespace.
+- Exploit a bug in Capshell, the kernel, or the upstream provider.
 
-1. **Manutenibile da una persona.** Se una funzionalità richiede più di un
-   manutentore per restare corretta, non entra.
-2. **Nessun privilegio richiesto.** Niente root, niente setuid, niente daemon di
-   sistema per il percorso principale.
-3. **Componibile, non sostitutivo.** Capshell si affianca a Docker, git e ai
-   keyring esistenti. Non li rimpiazza e non li richiede.
+What it **cannot** do is obtain the value of a managed key **from
+Capshell's process**, or use it against a destination you didn't declare.
 
 ---
 
-## Sulle affermazioni
+## Project constraints
 
-Questo documento evita "100% sicuro", "rischio zero" e "matematicamente
-verificabile". Le due proprietà sopra sono condizioni testabili, non
-dimostrazioni: una suite di test non è una prova. Il valore sta nell'averle
-scritte in modo che un test possa smentirle.
+Three rules that decide what gets in and what doesn't:
+
+1. **Maintainable by one person.** If a feature needs more than one
+   maintainer to stay correct, it doesn't get in.
+2. **No privilege required.** No root, no setuid, no system daemon on the
+   main path.
+3. **Composable, not a replacement.** Capshell sits alongside Docker, git,
+   and existing keyrings. It doesn't replace them and doesn't require them.
+
+---
+
+## On the claims made here
+
+This document avoids "100% secure," "zero risk," and "mathematically
+verifiable." The two properties above are testable conditions, not
+proofs: a test suite is not a demonstration. The value is in having
+written them so that a test can disprove them.

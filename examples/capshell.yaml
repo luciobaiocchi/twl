@@ -1,10 +1,10 @@
-# Config di prova: punta al finto provider invece che a OpenAI, cosi' si vede
-# tutto il giro senza spendere e senza una chiave vera.
+# Test config: points at the fake provider instead of OpenAI, so the whole
+# round trip can be seen without spending money and without a real key.
 #
 #   capshell mock-upstream --port 9000
 #   capshell run --config examples/capshell.yaml --env examples/dev.env -- sh
 #
-# In produzione si toglie `upstream:` e il connector usa il suo host cablato.
+# In production, drop `upstream:` and the connector uses its hardwired host.
 
 secrets:
   - name: OPENAI_API_KEY

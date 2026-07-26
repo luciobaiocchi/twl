@@ -1,5 +1,5 @@
-// Ogni file di test include questo modulo ma ne usa solo una parte: senza
-// questo, ciascun binario segnala come morto cio' che serve agli altri.
+// Every test file includes this module but only uses part of it: without
+// this, each binary would flag as dead what the others need.
 #![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
@@ -21,17 +21,17 @@ impl Seen {
     }
 }
 
-/// Finto provider: registra quello che riceve invece di rimandarlo indietro,
-/// cosi' i test possono verificare l'iniezione della chiave senza che il valore
-/// passi dalla risposta.
+/// Fake provider: records what it receives instead of echoing it back, so
+/// tests can verify key injection without the value passing through the
+/// response.
 pub fn upstream() -> (String, Log) {
     let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
     let port = server.server_addr().to_ip().unwrap().port();
     let log: Log = Arc::new(Mutex::new(Vec::new()));
 
-    // Un solo thread accetta e passa ogni richiesta a un thread suo. Servire in
-    // sequenza strozzerebbe i worker del proxy, che tengono connessioni
-    // keep-alive: la prima si prende il servitore e le altre aspettano.
+    // A single thread accepts and hands each request to a thread of its own.
+    // Serving in sequence would choke the proxy's workers, which hold
+    // keep-alive connections: the first one grabs the server and the rest wait.
     let sink = log.clone();
     std::thread::spawn(move || {
         while let Ok(req) = server.recv() {
@@ -66,7 +66,7 @@ pub fn upstream() -> (String, Log) {
                                 .unwrap(),
                         )
                 } else if url.starts_with("/echo-key") {
-                    // Upstream che riflette la credenziale: il proxy deve scartarla.
+                    // Upstream that reflects the credential: the proxy must discard it.
                     tiny_http::Response::from_data(auth.into_bytes()).with_status_code(200)
                 } else {
                     tiny_http::Response::from_data(b"ok".to_vec()).with_status_code(200)
@@ -78,10 +78,10 @@ pub fn upstream() -> (String, Log) {
     (format!("http://127.0.0.1:{port}"), log)
 }
 
-/// Richiesta grezza: i client HTTP normalizzano il path e rifiutano di mandare
-/// un URI assoluto, quindi per verificare cosa fa il server davanti a un input
-/// ostile bisogna scrivere sul socket a mano. Ritorna 0 se il server chiude
-/// senza rispondere, che e' anch'esso un rifiuto.
+/// Raw request: HTTP clients normalize the path and refuse to send an
+/// absolute URI, so verifying what the server does with hostile input means
+/// writing to the socket by hand. Returns 0 if the server closes without
+/// responding, which is also a rejection.
 pub fn raw(port: u16, request_line: &str) -> u16 {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -98,11 +98,11 @@ pub fn raw(port: u16, request_line: &str) -> u16 {
         .unwrap_or(0)
 }
 
-/// Client con connessione riusata, come un SDK vero. Aprire una connessione
-/// nuova per ogni richiesta e' un caso di stress diverso, non il caso d'uso.
+/// Client with a reused connection, like a real SDK. Opening a new connection
+/// per request is a different stress scenario, not the actual use case.
 ///
-/// Il timeout non e' decorativo: un test che si blocca e' molto peggio di uno
-/// che fallisce, perche' inchioda la suite invece di dire cosa non va.
+/// The timeout isn't decorative: a test that hangs is much worse than one
+/// that fails, because it jams the suite instead of saying what's wrong.
 pub fn client() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .redirects(0)
@@ -110,14 +110,14 @@ pub fn client() -> ureq::Agent {
         .build()
 }
 
-pub fn call_con(agent: &ureq::Agent, port: u16, method: &str, path: &str) -> u16 {
+pub fn call_with(agent: &ureq::Agent, port: u16, method: &str, path: &str) -> u16 {
     match agent
         .request(method, &format!("http://127.0.0.1:{port}{path}"))
         .call()
     {
         Ok(r) => r.status(),
         Err(ureq::Error::Status(code, _)) => code,
-        Err(e) => panic!("richiesta fallita: {e}"),
+        Err(e) => panic!("request failed: {e}"),
     }
 }
 
@@ -130,6 +130,6 @@ pub fn call(port: u16, method: &str, path: &str, headers: &[(&str, &str)]) -> (u
     match r.call() {
         Ok(resp) => (resp.status(), resp.into_string().unwrap_or_default()),
         Err(ureq::Error::Status(code, resp)) => (code, resp.into_string().unwrap_or_default()),
-        Err(e) => panic!("richiesta fallita: {e}"),
+        Err(e) => panic!("request failed: {e}"),
     }
 }

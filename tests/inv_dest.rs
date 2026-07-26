@@ -5,7 +5,7 @@ use capshell::proxy::{self, resolve, Route};
 use common::{call, raw, upstream};
 use std::collections::HashMap;
 
-const KEY: &str = "sk-CANARY-CHIAVE-VERA-0123456789";
+const KEY: &str = "sk-CANARY-REAL-KEY-0123456789";
 
 fn routes(up: &str) -> HashMap<String, Route> {
     HashMap::from([(
@@ -18,17 +18,17 @@ fn routes(up: &str) -> HashMap<String, Route> {
     )])
 }
 
-/// L'Handle va tenuto vivo: quando cade, il proxy si spegne.
-fn proxy_su(up: &str, budget: Option<u64>) -> (proxy::Handle, String) {
+/// The Handle must stay alive: when it's dropped, the proxy shuts down.
+fn proxy_on(up: &str, budget: Option<u64>) -> (proxy::Handle, String) {
     let h = proxy::spawn(routes(up), budget).unwrap();
-    let prefisso = format!("/{}", h.token);
-    (h, prefisso)
+    let prefix = format!("/{}", h.token);
+    (h, prefix)
 }
 
 #[test]
-fn la_chiave_vera_arriva_all_upstream_cablato() {
+fn the_real_key_reaches_the_hardwired_upstream() {
     let (up, log) = upstream();
-    let (h, t) = proxy_su(&up, None);
+    let (h, t) = proxy_on(&up, None);
 
     let (code, _) = call(h.port, "GET", &format!("{t}/openai/v1/models"), &[]);
     assert_eq!(code, 200);
@@ -43,9 +43,9 @@ fn la_chiave_vera_arriva_all_upstream_cablato() {
 }
 
 #[test]
-fn host_ostile_non_cambia_la_destinazione() {
+fn a_hostile_host_header_does_not_change_the_destination() {
     let (up, log) = upstream();
-    let (h, t) = proxy_su(&up, None);
+    let (h, t) = proxy_on(&up, None);
 
     let (code, _) = call(
         h.port,
@@ -54,20 +54,20 @@ fn host_ostile_non_cambia_la_destinazione() {
         &[("Host", "evil.example")],
     );
 
-    assert_eq!(code, 200, "la richiesta deve comunque andare a buon fine");
+    assert_eq!(code, 200, "the request must still succeed");
     let seen = log.lock().unwrap();
     assert_eq!(
         seen.len(),
         1,
-        "l'unico upstream contattato e' quello del connector"
+        "the only upstream contacted is the connector's"
     );
     assert_ne!(seen[0].header("host"), Some("evil.example"));
 }
 
 #[test]
-fn gli_header_di_forwarding_non_passano() {
+fn forwarding_headers_do_not_pass_through() {
     let (up, log) = upstream();
-    let (h, t) = proxy_su(&up, None);
+    let (h, t) = proxy_on(&up, None);
 
     call(
         h.port,
@@ -85,15 +85,15 @@ fn gli_header_di_forwarding_non_passano() {
 }
 
 #[test]
-fn il_client_non_puo_sovrascrivere_authorization() {
+fn the_client_cannot_override_authorization() {
     let (up, log) = upstream();
-    let (h, t) = proxy_su(&up, None);
+    let (h, t) = proxy_on(&up, None);
 
     call(
         h.port,
         "GET",
         &format!("{t}/openai/v1/models"),
-        &[("Authorization", "Bearer sk-scelta-dall-agente")],
+        &[("Authorization", "Bearer sk-chosen-by-the-agent")],
     );
 
     let seen = log.lock().unwrap();
@@ -104,35 +104,35 @@ fn il_client_non_puo_sovrascrivere_authorization() {
 }
 
 #[test]
-fn i_redirect_non_vengono_seguiti() {
+fn redirects_are_not_followed() {
     let (up, log) = upstream();
-    let (h, t) = proxy_su(&up, None);
+    let (h, t) = proxy_on(&up, None);
 
     let (code, _) = call(h.port, "GET", &format!("{t}/openai/redirect"), &[]);
 
-    assert_eq!(code, 302, "il 3xx torna al client cosi' com'e'");
+    assert_eq!(code, 302, "the 3xx goes back to the client as-is");
     assert_eq!(
         log.lock().unwrap().len(),
         1,
-        "nessuna seconda richiesta con la chiave allegata"
+        "no second request with the key attached"
     );
 }
 
 #[test]
-fn connector_sconosciuto_rifiutato() {
+fn unknown_connector_is_rejected() {
     let (up, log) = upstream();
-    let (h, t) = proxy_su(&up, None);
+    let (h, t) = proxy_on(&up, None);
 
-    let (code, _) = call(h.port, "GET", &format!("{t}/altro/v1/models"), &[]);
+    let (code, _) = call(h.port, "GET", &format!("{t}/other/v1/models"), &[]);
 
     assert_eq!(code, 404);
     assert!(log.lock().unwrap().is_empty());
 }
 
 #[test]
-fn metodo_non_consentito_rifiutato() {
+fn disallowed_method_is_rejected() {
     let (up, log) = upstream();
-    let (h, t) = proxy_su(&up, None);
+    let (h, t) = proxy_on(&up, None);
 
     let (code, _) = call(h.port, "DELETE", &format!("{t}/openai/v1/models"), &[]);
 
@@ -141,9 +141,9 @@ fn metodo_non_consentito_rifiutato() {
 }
 
 #[test]
-fn traversal_rifiutato() {
+fn traversal_is_rejected() {
     let (up, log) = upstream();
-    let (h, t) = proxy_su(&up, None);
+    let (h, t) = proxy_on(&up, None);
 
     assert_eq!(
         raw(h.port, &format!("GET {t}/openai/../../etc/passwd HTTP/1.1")),
@@ -153,58 +153,58 @@ fn traversal_rifiutato() {
 }
 
 #[test]
-fn uri_assoluto_rifiutato() {
+fn absolute_uri_is_rejected() {
     let (up, log) = upstream();
-    let (h, _t) = proxy_su(&up, None);
+    let (h, _t) = proxy_on(&up, None);
 
     let code = raw(h.port, "GET http://evil.example/v1/models HTTP/1.1");
 
     assert!(
         code == 400 || code == 0,
-        "rifiutato o connessione chiusa, mai inoltrato: {code}"
+        "rejected or connection closed, never forwarded: {code}"
     );
     assert!(log.lock().unwrap().is_empty());
 }
 
 #[test]
-fn nessun_path_puo_cambiare_l_host_di_destinazione() {
+fn no_path_can_change_the_destination_host() {
     let r = routes("https://api.openai.com");
-    const T: &str = "tokenditest";
-    for ostile in [
+    const T: &str = "testtoken";
+    for hostile in [
         "http://evil.example/v1",
         "//evil.example/v1",
         &format!("/{T}/openai/../../../evil.example"),
         &format!("/{T}/openai/@evil.example/v1"),
         &format!("/{T}/openai/v1#@evil.example"),
     ] {
-        match resolve(ostile, T, &r) {
+        match resolve(hostile, T, &r) {
             Err(_) => {}
             Ok((_, target)) => assert!(
                 target.starts_with("https://api.openai.com/"),
-                "{ostile} ha prodotto {target}"
+                "{hostile} produced {target}"
             ),
         }
     }
 }
 
 #[test]
-fn la_chiave_non_torna_indietro_nella_risposta() {
+fn the_key_does_not_come_back_in_the_response() {
     let (up, _log) = upstream();
-    let (h, t) = proxy_su(&up, None);
+    let (h, t) = proxy_on(&up, None);
 
     let (code, body) = call(h.port, "GET", &format!("{t}/openai/echo-key"), &[]);
 
     assert_eq!(
         code, 502,
-        "una risposta che contiene la credenziale viene scartata"
+        "a response containing the credential gets discarded"
     );
     assert!(!body.contains(KEY));
 }
 
 #[test]
-fn il_budget_fallisce_chiuso() {
+fn the_budget_fails_closed() {
     let (up, log) = upstream();
-    let (h, t) = proxy_su(&up, Some(2));
+    let (h, t) = proxy_on(&up, Some(2));
 
     assert_eq!(call(h.port, "GET", &format!("{t}/openai/a"), &[]).0, 200);
     assert_eq!(call(h.port, "GET", &format!("{t}/openai/b"), &[]).0, 200);
@@ -215,6 +215,6 @@ fn il_budget_fallisce_chiuso() {
     assert_eq!(
         log.lock().unwrap().len(),
         2,
-        "la terza non raggiunge l'upstream"
+        "the third one never reaches the upstream"
     );
 }

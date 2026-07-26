@@ -1,21 +1,21 @@
-use capshell::sandbox::{bwrap_utilizzabile, canali, Canali};
+use capshell::sandbox::{bwrap_usable, channels, Channels};
 use std::path::{Path, PathBuf};
 
-fn finto(vars: &[(&str, &str)], esistenti: &[&str]) -> Canali {
+fn fake(vars: &[(&str, &str)], existing: &[&str]) -> Channels {
     let vars: Vec<(String, String)> = vars
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    let esistenti: Vec<PathBuf> = esistenti.iter().map(PathBuf::from).collect();
-    canali(
+    let existing: Vec<PathBuf> = existing.iter().map(PathBuf::from).collect();
+    channels(
         |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()),
-        |p: &Path| esistenti.iter().any(|e| e == p),
+        |p: &Path| existing.iter().any(|e| e == p),
     )
 }
 
 #[test]
-fn la_runtime_dir_copre_bus_e_keyring() {
-    let c = finto(
+fn the_runtime_dir_covers_bus_and_keyring() {
+    let c = fake(
         &[
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
             ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
@@ -25,14 +25,14 @@ fn la_runtime_dir_copre_bus_e_keyring() {
 
     assert_eq!(c.xdg_runtime, Some(PathBuf::from("/run/user/1000")));
     assert!(
-        c.socket.is_empty(),
-        "il bus sta dentro la runtime dir: coprirlo due volte non serve"
+        c.sockets.is_empty(),
+        "the bus sits inside the runtime dir: covering it twice is pointless"
     );
 }
 
 #[test]
-fn un_bus_fuori_dalla_runtime_dir_viene_coperto_a_parte() {
-    let c = finto(
+fn a_bus_outside_the_runtime_dir_gets_covered_separately() {
+    let c = fake(
         &[
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
             (
@@ -43,12 +43,12 @@ fn un_bus_fuori_dalla_runtime_dir_viene_coperto_a_parte() {
         &["/run/user/1000", "/tmp/dbus-abc"],
     );
 
-    assert!(c.socket.contains(&PathBuf::from("/tmp/dbus-abc")));
+    assert!(c.sockets.contains(&PathBuf::from("/tmp/dbus-abc")));
 }
 
 #[test]
-fn il_bus_su_socket_astratto_viene_segnalato_non_chiuso() {
-    let c = finto(
+fn a_bus_on_an_abstract_socket_is_reported_not_closed() {
+    let c = fake(
         &[(
             "DBUS_SESSION_BUS_ADDRESS",
             "unix:abstract=/tmp/dbus-Xyz,guid=1",
@@ -56,52 +56,55 @@ fn il_bus_su_socket_astratto_viene_segnalato_non_chiuso() {
         &[],
     );
 
-    // Un socket astratto vive nel network namespace: il mount namespace non lo
-    // vede, quindi non c'e' niente da montarci sopra. Va detto, non nascosto.
-    assert!(c.bus_astratto);
-    assert!(c.socket.is_empty());
+    // An abstract socket lives in the network namespace: the mount namespace
+    // can't see it, so there's nothing to mount over. That needs saying, not hiding.
+    assert!(c.abstract_bus);
+    assert!(c.sockets.is_empty());
 }
 
 #[test]
-fn gli_altri_oracoli_di_credenziali_vengono_chiusi() {
-    let c = finto(
+fn other_credential_oracles_get_closed() {
+    let c = fake(
         &[
             ("SSH_AUTH_SOCK", "/tmp/ssh-XXX/agent.42"),
-            ("HOME", "/home/tizio"),
+            ("HOME", "/home/someone"),
         ],
         &[
             "/tmp/ssh-XXX/agent.42",
-            "/home/tizio/.gnupg/S.gpg-agent",
+            "/home/someone/.gnupg/S.gpg-agent",
             "/var/run/docker.sock",
         ],
     );
 
-    for atteso in [
+    for expected in [
         "/tmp/ssh-XXX/agent.42",
-        "/home/tizio/.gnupg/S.gpg-agent",
+        "/home/someone/.gnupg/S.gpg-agent",
         "/var/run/docker.sock",
     ] {
-        assert!(c.socket.contains(&PathBuf::from(atteso)), "manca {atteso}");
+        assert!(
+            c.sockets.contains(&PathBuf::from(expected)),
+            "missing {expected}"
+        );
     }
 }
 
 #[test]
-fn cio_che_non_esiste_non_viene_montato() {
-    let c = finto(
+fn what_does_not_exist_is_not_mounted() {
+    let c = fake(
         &[
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
-            ("SSH_AUTH_SOCK", "/tmp/mai-esistito"),
+            ("SSH_AUTH_SOCK", "/tmp/never-existed"),
         ],
         &[],
     );
 
-    assert!(c.nulla_da_chiudere());
+    assert!(c.nothing_to_close());
     assert!(c.bwrap_args().iter().all(|a| a != "--tmpfs"));
 }
 
 #[test]
-fn gli_argomenti_non_confinano_ne_la_rete_ne_il_filesystem() {
-    let c = finto(
+fn the_arguments_confine_neither_network_nor_filesystem() {
+    let c = fake(
         &[
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
             ("SSH_AUTH_SOCK", "/tmp/agent.42"),
@@ -113,11 +116,11 @@ fn gli_argomenti_non_confinano_ne_la_rete_ne_il_filesystem() {
     assert_eq!(
         &args[..3],
         &["--dev-bind", "/", "/"],
-        "il filesystem resta com'e'"
+        "the filesystem stays as-is"
     );
     assert!(
         !args.iter().any(|a| a.starts_with("--unshare")),
-        "unshare-net taglierebbe il loopback e il figlio non arriverebbe piu' al proxy: {args:?}"
+        "unshare-net would cut the loopback and the child couldn't reach the proxy anymore: {args:?}"
     );
     assert!(args.windows(2).any(|w| w == ["--tmpfs", "/run/user/1000"]));
     assert!(args
@@ -125,28 +128,28 @@ fn gli_argomenti_non_confinano_ne_la_rete_ne_il_filesystem() {
         .any(|w| w == ["--bind", "/dev/null", "/tmp/agent.42"]));
 }
 
-/// Il test che conta: dopo bwrap il socket non e' piu' raggiungibile dal figlio.
+/// The test that matters: after bwrap the socket is no longer reachable by the child.
 #[cfg(target_os = "linux")]
 #[test]
-fn bwrap_toglie_davvero_il_socket_al_figlio() {
+fn bwrap_really_removes_the_socket_from_the_child() {
     let dir = std::env::temp_dir().join(format!("capshell-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("bus"), b"finto socket del bus").unwrap();
+    std::fs::write(dir.join("bus"), b"fake bus socket").unwrap();
 
-    let c = Canali {
+    let c = Channels {
         xdg_runtime: Some(dir.clone()),
         ..Default::default()
     };
     let args = c.bwrap_args();
 
-    let Ok(()) = bwrap_utilizzabile(&args) else {
-        eprintln!("bwrap non utilizzabile qui: il test verifica solo il fallback");
+    let Ok(()) = bwrap_usable(&args) else {
+        eprintln!("bwrap not usable here: the test only verifies the fallback");
         return;
     };
 
-    let visibile = |dentro: bool| {
-        let mut cmd = std::process::Command::new(if dentro { "bwrap" } else { "sh" });
-        if dentro {
+    let visible = |inside: bool| {
+        let mut cmd = std::process::Command::new(if inside { "bwrap" } else { "sh" });
+        if inside {
             cmd.args(&args).arg("--").arg("sh");
         }
         let out = cmd
@@ -154,13 +157,13 @@ fn bwrap_toglie_davvero_il_socket_al_figlio() {
             .arg(format!("cat {}/bus 2>/dev/null", dir.display()))
             .output()
             .unwrap();
-        String::from_utf8_lossy(&out.stdout).contains("finto socket")
+        String::from_utf8_lossy(&out.stdout).contains("fake bus socket")
     };
 
-    assert!(visibile(false), "fuori dal namespace il file si legge");
+    assert!(visible(false), "the file reads outside the namespace");
     assert!(
-        !visibile(true),
-        "dentro il namespace il file non deve esistere"
+        !visible(true),
+        "the file must not exist inside the namespace"
     );
 
     std::fs::remove_dir_all(&dir).ok();

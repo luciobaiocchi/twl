@@ -11,9 +11,9 @@ pub struct Config {
 pub struct SecretDecl {
     pub name: String,
     pub connector: String,
-    /// Sovrascrive l'upstream cablato del connector. Serve per puntare a un
-    /// finto provider durante i test: e' dichiarato dall'umano nel file di
-    /// config, e resta comunque fuori dalla portata dell'agente.
+    /// Overrides the connector's hardwired upstream. Used to point at a fake
+    /// provider during tests: it's declared by the human in the config file,
+    /// and stays out of the agent's reach either way.
     #[serde(default)]
     pub upstream: Option<String>,
 }
@@ -33,9 +33,9 @@ pub struct Connector {
     pub upstream: &'static str,
     pub auth: Auth,
     pub mock_prefix: &'static str,
-    /// Ogni SDK guarda un nome diverso per il base URL. Se ne manca uno, il
-    /// client chiama il provider vero, prende 401, e l'utente da' la colpa a
-    /// Capshell. Vanno settati tutti.
+    /// Every SDK looks at a different name for the base URL. Miss one and the
+    /// client calls the real provider, gets a 401, and the user blames
+    /// Capshell. All of them need to be set.
     pub base_url_vars: &'static [&'static str],
 }
 
@@ -62,7 +62,7 @@ impl Config {
         let cfg: Config = serde_yaml::from_str(raw).map_err(|e| e.to_string())?;
         for s in &cfg.secrets {
             if connector(&s.connector).is_none() {
-                return Err(format!("connector sconosciuto: {}", s.connector));
+                return Err(format!("unknown connector: {}", s.connector));
             }
         }
         Ok(cfg)

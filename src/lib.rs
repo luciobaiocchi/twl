@@ -8,23 +8,24 @@ use proxy::Route;
 use std::collections::HashMap;
 use std::process::Command;
 
-/// Variabili che non passano al figlio. Su Linux `DBUS_SESSION_BUS_ADDRESS` e'
-/// la strada per il Secret Service: toglierla da sola alzerebbe solo l'asticella,
-/// perche' il socket resta indovinabile su `/run/user/<uid>/bus`. La barriera la
-/// mette `sandbox`, togliendo il path dal mount namespace; questa e' la prima
-/// riga di difesa, e l'unica quando bwrap non c'e'.
+/// Variables that never pass to the child. On Linux, `DBUS_SESSION_BUS_ADDRESS`
+/// is the path to the Secret Service: removing it on its own would only raise
+/// the bar, because the socket is still guessable at `/run/user/<uid>/bus`.
+/// The actual barrier is set by `sandbox`, which drops the path from the mount
+/// namespace; this is the first line of defense, and the only one when bwrap
+/// isn't available.
 pub const STRIP: &[&str] = &["DBUS_SESSION_BUS_ADDRESS"];
 
 pub struct Prepared {
     pub routes: HashMap<String, Route>,
-    /// (nome della variabile, valore finto) — quello che vede l'agente.
+    /// (variable name, fake value) — what the agent sees.
     pub mocks: Vec<(String, String)>,
-    /// (nome della variabile, nome del connector) per i base URL.
+    /// (variable name, connector name) for the base URLs.
     pub base_urls: Vec<(String, String)>,
 }
 
-/// Risolve i valori reali, genera i mock e costruisce le rotte del proxy.
-/// `source` e' l'unico punto in cui il valore vero entra nel processo.
+/// Resolves the real values, generates the mocks, and builds the proxy routes.
+/// `source` is the only point where the real value enters the process.
 pub fn prepare(
     cfg: &Config,
     source: impl Fn(&str) -> Result<String, String>,
@@ -35,9 +36,9 @@ pub fn prepare(
         base_urls: Vec::new(),
     };
     for decl in &cfg.secrets {
-        let c = connector(&decl.connector).ok_or("connector sconosciuto")?;
+        let c = connector(&decl.connector).ok_or("unknown connector")?;
         if p.routes.contains_key(&decl.connector) {
-            return Err(format!("due segreti sul connector {}", decl.connector));
+            return Err(format!("two secrets on connector {}", decl.connector));
         }
         p.routes.insert(
             decl.connector.clone(),
@@ -60,10 +61,10 @@ pub fn prepare(
 }
 
 impl Prepared {
-    /// Il token di sessione e' il primo segmento del path. Il proxy ascolta su
-    /// loopback, raggiungibile da qualunque processo della macchina: senza
-    /// token, un altro utente locale potrebbe scoprire la porta e spendere la
-    /// tua chiave. Il figlio lo riceve qui dentro, nessun altro lo conosce.
+    /// The session token is the first path segment. The proxy listens on
+    /// loopback, reachable by any process on the machine: without a token,
+    /// another local user could discover the port and spend your key. The
+    /// child receives it here, and no one else knows it.
     pub fn env_overrides(&self, port: u16, token: &str) -> Vec<(String, String)> {
         let mut out = self.mocks.clone();
         for (var, conn) in &self.base_urls {
@@ -76,9 +77,9 @@ impl Prepared {
     }
 }
 
-/// Il figlio eredita l'environment corrente, meno le variabili di STRIP e con i
-/// mock al posto dei valori dichiarati. Tutto il resto passa invariato:
-/// Capshell tocca solo cio' che gli e' stato detto di toccare.
+/// The child inherits the current environment, minus the STRIP variables and
+/// with mocks in place of the declared values. Everything else passes through
+/// unchanged: Capshell only touches what it's been told to touch.
 pub fn child_command(program: &str, args: &[String], overrides: &[(String, String)]) -> Command {
     let mut cmd = Command::new(program);
     cmd.args(args);
@@ -91,52 +92,51 @@ pub fn child_command(program: &str, args: &[String], overrides: &[(String, Strin
     cmd
 }
 
-/// Esito del tentativo di chiudere i canali di credenziali della sessione.
-pub enum Chiusura {
-    /// I socket elencati non esistono nel mount namespace del figlio.
-    Chiusi(String),
-    /// Non c'era niente da chiudere, o la piattaforma non ne ha bisogno.
-    NonNecessaria,
-    /// Il comando parte comunque: degradare con un avviso, non rifiutarsi
-    /// di funzionare.
-    Fallita(String),
+/// Outcome of the attempt to close the session's credential channels.
+pub enum Isolation {
+    /// The listed sockets don't exist in the child's mount namespace.
+    Closed(String),
+    /// There was nothing to close, or the platform doesn't need it.
+    NotNeeded,
+    /// The command runs anyway: degrade with a warning, don't refuse to work.
+    Failed(String),
 }
 
-/// Su Linux avvolge il comando in bwrap per togliere al figlio i socket del
-/// portachiavi e degli agent. Su macOS non serve: il Keychain autorizza per
-/// firma del binario, quindi la barriera c'e' gia' ed e' piu' precisa.
-pub fn child_command_isolato(
+/// On Linux, wraps the command in bwrap to strip the keyring and agent
+/// sockets from the child. Not needed on macOS: the Keychain authorizes by
+/// binary signature, so the barrier is already there and more precise.
+pub fn isolated_child_command(
     program: &str,
     args: &[String],
     overrides: &[(String, String)],
-) -> (Command, Chiusura) {
+) -> (Command, Isolation) {
     if !cfg!(target_os = "linux") {
         return (
             child_command(program, args, overrides),
-            Chiusura::NonNecessaria,
+            Isolation::NotNeeded,
         );
     }
-    let canali = sandbox::dall_ambiente();
-    if canali.nulla_da_chiudere() {
+    let channels = sandbox::from_environment();
+    if channels.nothing_to_close() {
         return (
             child_command(program, args, overrides),
-            Chiusura::NonNecessaria,
+            Isolation::NotNeeded,
         );
     }
-    let bwrap_args = canali.bwrap_args();
-    match sandbox::bwrap_utilizzabile(&bwrap_args) {
-        Err(motivo) => (
+    let bwrap_args = channels.bwrap_args();
+    match sandbox::bwrap_usable(&bwrap_args) {
+        Err(reason) => (
             child_command(program, args, overrides),
-            Chiusura::Fallita(motivo),
+            Isolation::Failed(reason),
         ),
         Ok(()) => {
-            let mut tutti = bwrap_args;
-            tutti.push("--".into());
-            tutti.push(program.to_string());
-            tutti.extend(args.iter().cloned());
+            let mut all = bwrap_args;
+            all.push("--".into());
+            all.push(program.to_string());
+            all.extend(args.iter().cloned());
             (
-                child_command("bwrap", &tutti, overrides),
-                Chiusura::Chiusi(canali.descrizione()),
+                child_command("bwrap", &all, overrides),
+                Isolation::Closed(channels.description()),
             )
         }
     }

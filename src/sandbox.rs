@@ -1,83 +1,83 @@
-//! Chiusura dei canali di credenziali della sessione, su Linux.
+//! Closing the session's credential channels, on Linux.
 //!
-//! Il Secret Service non autorizza per applicazione: qualunque processo del tuo
-//! utente che raggiunge il bus D-Bus puo' chiedere i tuoi item. Ma il bus e' un
-//! socket su un path del filesystem, quindi basta che quel path non esista nel
-//! mount namespace del figlio: la `connect()` fallisce e nessuna variabile
-//! d'ambiente puo' recuperarlo.
+//! The Secret Service doesn't authorize per application: any process running
+//! as your user that reaches the D-Bus session bus can ask for your items.
+//! But the bus is a socket on a filesystem path, so it's enough that the path
+//! doesn't exist in the child's mount namespace: `connect()` fails and no
+//! environment variable can recover it.
 //!
-//! Non stiamo confinando il filesystem — `/` resta montato com'e'. Stiamo
-//! togliendo dei socket. Lo stesso vale per ssh-agent, gpg-agent e il socket
-//! Docker, che sono gli altri oracoli di credenziali a portata dell'agente.
+//! We're not confining the filesystem — `/` stays mounted as-is. We're
+//! removing sockets. Same for ssh-agent, gpg-agent, and the Docker socket,
+//! which are the other credential oracles within the agent's reach.
 
 use std::path::{Path, PathBuf};
 
-/// Cosa nascondere al figlio, risolto dall'ambiente del padre.
+/// What to hide from the child, resolved from the parent's environment.
 #[derive(Debug, Default, PartialEq)]
-pub struct Canali {
-    /// Va coperta con un tmpfs: contiene `bus`, `keyring/`, `gnupg/`.
+pub struct Channels {
+    /// Needs a tmpfs on top: holds `bus`, `keyring/`, `gnupg/`.
     pub xdg_runtime: Option<PathBuf>,
-    /// Socket singoli, coperti uno a uno con /dev/null.
-    pub socket: Vec<PathBuf>,
-    /// Un bus su socket astratto vive nel network namespace, non nel
-    /// filesystem: il mount namespace non lo tocca e va detto.
-    pub bus_astratto: bool,
+    /// Individual sockets, each covered with /dev/null.
+    pub sockets: Vec<PathBuf>,
+    /// A bus on an abstract socket lives in the network namespace, not the
+    /// filesystem: the mount namespace can't touch it, and that needs saying.
+    pub abstract_bus: bool,
 }
 
-const SOCKET_NOTI: &[&str] = &["/var/run/docker.sock", "/run/docker.sock"];
+const KNOWN_SOCKETS: &[&str] = &["/var/run/docker.sock", "/run/docker.sock"];
 
-pub fn canali(var: impl Fn(&str) -> Option<String>, esiste: impl Fn(&Path) -> bool) -> Canali {
-    let mut c = Canali::default();
+pub fn channels(var: impl Fn(&str) -> Option<String>, exists: impl Fn(&Path) -> bool) -> Channels {
+    let mut c = Channels::default();
 
     let xdg = var("XDG_RUNTIME_DIR").map(PathBuf::from);
-    if let Some(dir) = xdg.as_ref().filter(|d| esiste(d)) {
+    if let Some(dir) = xdg.as_ref().filter(|d| exists(d)) {
         c.xdg_runtime = Some(dir.clone());
     }
 
-    // `unix:path=/run/user/1000/bus` oppure `unix:abstract=/tmp/dbus-XXXX`.
+    // `unix:path=/run/user/1000/bus` or `unix:abstract=/tmp/dbus-XXXX`.
     if let Some(addr) = var("DBUS_SESSION_BUS_ADDRESS") {
         if addr.contains("abstract=") {
-            c.bus_astratto = true;
+            c.abstract_bus = true;
         } else if let Some(path) = addr.split("path=").nth(1) {
             let path = PathBuf::from(path.split(',').next().unwrap_or(path));
-            let dentro_xdg = c.xdg_runtime.as_ref().is_some_and(|d| path.starts_with(d));
-            if !dentro_xdg && esiste(&path) {
-                c.socket.push(path);
+            let inside_xdg = c.xdg_runtime.as_ref().is_some_and(|d| path.starts_with(d));
+            if !inside_xdg && exists(&path) {
+                c.sockets.push(path);
             }
         }
     }
 
-    let mut aggiungi = |path: PathBuf| {
-        let dentro_xdg = c.xdg_runtime.as_ref().is_some_and(|d| path.starts_with(d));
-        if !dentro_xdg && esiste(&path) {
-            c.socket.push(path);
+    let mut add = |path: PathBuf| {
+        let inside_xdg = c.xdg_runtime.as_ref().is_some_and(|d| path.starts_with(d));
+        if !inside_xdg && exists(&path) {
+            c.sockets.push(path);
         }
     };
 
     if let Some(path) = var("SSH_AUTH_SOCK") {
-        aggiungi(PathBuf::from(path));
+        add(PathBuf::from(path));
     }
     if let Some(home) = var("HOME") {
-        aggiungi(PathBuf::from(home).join(".gnupg/S.gpg-agent"));
+        add(PathBuf::from(home).join(".gnupg/S.gpg-agent"));
     }
-    for noto in SOCKET_NOTI {
-        aggiungi(PathBuf::from(noto));
+    for known in KNOWN_SOCKETS {
+        add(PathBuf::from(known));
     }
 
     c
 }
 
-impl Canali {
-    pub fn nulla_da_chiudere(&self) -> bool {
-        self.xdg_runtime.is_none() && self.socket.is_empty()
+impl Channels {
+    pub fn nothing_to_close(&self) -> bool {
+        self.xdg_runtime.is_none() && self.sockets.is_empty()
     }
 
-    /// Argomenti di bwrap fino al `--`, escluso il comando.
+    /// bwrap arguments up to `--`, excluding the command.
     ///
-    /// `--dev-bind / /` tiene il filesystem come sta: non e' un sandbox, e'
-    /// una vista da cui mancano dei socket. In particolare **non** si passa
-    /// `--unshare-net`, altrimenti il figlio perderebbe anche il loopback e
-    /// non arriverebbe piu' al proxy.
+    /// `--dev-bind / /` keeps the filesystem as-is: this isn't a sandbox,
+    /// it's a view with a few sockets missing. In particular, `--unshare-net`
+    /// is **never** passed — that would also take away the loopback, and the
+    /// child would no longer be able to reach the proxy.
     pub fn bwrap_args(&self) -> Vec<String> {
         let mut a = vec![
             "--dev-bind".into(),
@@ -89,7 +89,7 @@ impl Canali {
             a.push("--tmpfs".into());
             a.push(dir.display().to_string());
         }
-        for s in &self.socket {
+        for s in &self.sockets {
             a.push("--bind".into());
             a.push("/dev/null".into());
             a.push(s.display().to_string());
@@ -97,30 +97,30 @@ impl Canali {
         a
     }
 
-    pub fn descrizione(&self) -> String {
-        let mut parti = Vec::new();
+    pub fn description(&self) -> String {
+        let mut parts = Vec::new();
         if let Some(d) = &self.xdg_runtime {
-            parti.push(d.display().to_string());
+            parts.push(d.display().to_string());
         }
-        parti.extend(self.socket.iter().map(|s| s.display().to_string()));
-        parti.join(", ")
+        parts.extend(self.sockets.iter().map(|s| s.display().to_string()));
+        parts.join(", ")
     }
 }
 
-pub fn dall_ambiente() -> Canali {
-    canali(|k| std::env::var(k).ok(), |p| p.exists())
+pub fn from_environment() -> Channels {
+    channels(|k| std::env::var(k).ok(), |p| p.exists())
 }
 
-/// Verifica che bwrap sia utilizzabile *prima* di lanciarci il comando vero:
-/// gli unprivileged user namespace possono essere disabilitati, e un fallimento
-/// a meta' strada sarebbe indistinguibile da un errore del comando dell'utente.
-pub fn bwrap_utilizzabile(args: &[String]) -> Result<(), String> {
-    let mut prova = std::process::Command::new("bwrap");
-    prova.args(args).arg("--").arg("true");
-    match prova.output() {
+/// Checks that bwrap is usable *before* launching the real command with it:
+/// unprivileged user namespaces can be disabled, and a failure halfway
+/// through would be indistinguishable from an error in the user's command.
+pub fn bwrap_usable(args: &[String]) -> Result<(), String> {
+    let mut probe = std::process::Command::new("bwrap");
+    probe.args(args).arg("--").arg("true");
+    match probe.output() {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("bwrap non installato".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("bwrap not installed".into()),
         Err(e) => Err(e.to_string()),
     }
 }

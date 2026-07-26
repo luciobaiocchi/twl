@@ -1,19 +1,19 @@
 #!/bin/bash
-# Dimostra la proprieta' che regge il supporto Linux:
+# Demonstrates the property Linux support rests on:
 #
-#   il portachiavi autorizza per UTENTE, non per applicazione, quindi da solo
-#   non ferma l'agente. La barriera la mette il mount namespace, togliendogli
-#   il socket del bus.
+#   the keyring authorizes by USER, not by application, so on its own it
+#   doesn't stop the agent. The barrier is set by the mount namespace, which
+#   removes the bus socket from it.
 #
-# Lo stesso identico comando viene eseguito fuori e dentro capshell.
+# The exact same command runs both outside and inside capshell.
 #
-# Serve: bubblewrap, libsecret-tools, gnome-keyring, dbus-x11.
-# Usa un portachiavi usa-e-getta: non tocca il tuo.
+# Requires: bubblewrap, libsecret-tools, gnome-keyring, dbus-x11.
+# Uses a throwaway keyring: it doesn't touch yours.
 set -u
 cd "$(dirname "$0")/.."
 
 BIN=./target/debug/capshell
-[ -x "$BIN" ] || { echo "compila prima: cargo build"; exit 1; }
+[ -x "$BIN" ] || { echo "build first: cargo build"; exit 1; }
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -33,15 +33,15 @@ dbus-run-session -- bash -c '
   eval "$(echo -n passphrase | gnome-keyring-daemon --unlock --components=secrets 2>/dev/null)"
   export GNOME_KEYRING_CONTROL
 
-  echo "sk-CANARY-NON-DEVE-USCIRE" | '"$BIN"' secret set CAPSHELL_CANARY >/dev/null
+  echo "sk-CANARY-MUST-NOT-LEAK" | '"$BIN"' secret set CAPSHELL_CANARY >/dev/null
 
-  echo "--- fuori da capshell ---"
+  echo "--- outside capshell ---"
   secret-tool lookup service capshell account CAPSHELL_CANARY 2>&1 | head -1
 
-  echo "--- dentro capshell, stesso comando ---"
+  echo "--- inside capshell, same command ---"
   '"$BIN"' run --config '"$TMP"'/capshell.yaml -- \
     sh -c "secret-tool lookup service capshell account CAPSHELL_CANARY 2>&1 | head -1"
 ' 2>&1 | grep -vE "dbus-daemon\[|Gtk-WARNING|gcr-prompter|discover_other_daemon|^$"
 
 echo
-echo "Atteso: fuori il valore si legge, dentro il bus non e' raggiungibile."
+echo "Expected: the value reads outside, the bus is unreachable inside."

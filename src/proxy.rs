@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 const MAX_BODY: u64 = 32 << 20;
 
-/// Gli unici header che arrivano all'upstream. Allowlist, non denylist: cosi'
-/// `Host`, `X-Forwarded-*`, `Authorization` del client e tutto il resto non
-/// possono influenzare la richiesta autenticata.
+/// The only headers that reach the upstream. Allowlist, not denylist: this
+/// way `Host`, `X-Forwarded-*`, the client's `Authorization`, and everything
+/// else can't influence the authenticated request.
 const FORWARD: &[&str] = &[
     "content-type",
     "accept",
@@ -26,15 +26,16 @@ pub struct Route {
     pub key: String,
 }
 
-/// Finche' esiste, il proxy ascolta. Quando cade, il thread che accetta esce:
-/// senza questo resterebbe bloccato in `recv()` per sempre, e con piu' sessioni
-/// nello stesso processo i thread si accumulerebbero fino a inchiodarlo.
+/// The proxy listens for as long as this exists. When it's dropped, the
+/// accepting thread exits: without this it would stay blocked in `recv()`
+/// forever, and with multiple sessions in the same process the threads would
+/// pile up until they choked it.
 pub struct Handle {
     pub port: u16,
-    /// Segreto di sessione, primo segmento di ogni URL. Il proxy ascolta su
-    /// loopback, che e' raggiungibile da *qualunque* processo della macchina:
-    /// senza questo, un altro utente locale potrebbe scoprire la porta e
-    /// spendere la tua chiave. Il figlio ce l'ha nell'environment, nessun altro.
+    /// Session secret, the first segment of every URL. The proxy listens on
+    /// loopback, which is reachable by *any* process on the machine: without
+    /// this, another local user could discover the port and spend your key.
+    /// The child has it in its environment; no one else does.
     pub token: String,
     pub seen: Arc<AtomicU64>,
     server: Arc<tiny_http::Server>,
@@ -48,7 +49,7 @@ impl Drop for Handle {
 
 type Denied = (u16, &'static str);
 
-fn token_casuale() -> String {
+fn random_token() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(32)
@@ -56,22 +57,23 @@ fn token_casuale() -> String {
         .collect()
 }
 
-/// Confronto senza uscita anticipata: il tempo di risposta non deve dire
-/// quanti caratteri del token erano giusti.
-fn uguali(a: &str, b: &str) -> bool {
+/// Comparison without early exit: response time must not reveal how many
+/// characters of the token were right.
+fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// INV-DEST: l'host di destinazione viene dal connector, mai dalla richiesta.
-/// L'unica cosa che l'agente sceglie e' il path dopo il nome del connector.
+/// INV-DEST: the destination host comes from the connector, never from the
+/// request. The only thing the agent chooses is the path after the
+/// connector's name.
 pub fn resolve<'a>(
     url: &str,
     token: &str,
     routes: &'a HashMap<String, Route>,
 ) -> Result<(&'a Route, String), Denied> {
     if !url.starts_with('/') {
-        return Err((400, "richiesta non in origin-form"));
+        return Err((400, "request is not in origin-form"));
     }
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p, Some(q)),
@@ -79,20 +81,20 @@ pub fn resolve<'a>(
     };
     let mut segs = path.split('/').filter(|s| !s.is_empty());
 
-    // Un token sbagliato risponde come un path sconosciuto: chi sonda la porta
-    // non deve nemmeno capire che c'e' un proxy.
-    if !segs.next().is_some_and(|t| uguali(t, token)) {
-        return Err((404, "non trovato"));
+    // A wrong token gets the same response as an unknown path: whoever is
+    // probing the port shouldn't even learn there's a proxy behind it.
+    if !segs.next().is_some_and(|t| constant_time_eq(t, token)) {
+        return Err((404, "not found"));
     }
-    let name = segs.next().ok_or((404, "non trovato"))?;
+    let name = segs.next().ok_or((404, "not found"))?;
     let rest: Vec<&str> = segs.collect();
     if rest
         .iter()
         .any(|s| *s == ".." || *s == "." || s.contains('\\'))
     {
-        return Err((400, "path non normalizzato"));
+        return Err((400, "non-normalized path"));
     }
-    let route = routes.get(name).ok_or((404, "connector sconosciuto"))?;
+    let route = routes.get(name).ok_or((404, "unknown connector"))?;
     let mut target = format!(
         "{}/{}",
         route.upstream.trim_end_matches('/'),
@@ -110,38 +112,38 @@ pub fn spawn(routes: HashMap<String, Route>, max_requests: Option<u64>) -> std::
         tiny_http::Server::http("127.0.0.1:0").map_err(|e| std::io::Error::other(e.to_string()))?,
     );
     let port = server.server_addr().to_ip().expect("socket ip").port();
-    let token = Arc::new(token_casuale());
+    let token = Arc::new(random_token());
     let routes = Arc::new(routes);
     let seen = Arc::new(AtomicU64::new(0));
 
-    // Ogni richiesta va servita subito, in un thread suo. Metterle in coda per
-    // un pool di worker sembra piu' ordinato ma si inceppa: finche' tratteniamo
-    // un `Request` senza rispondere, tiny_http non legge la richiesta successiva
-    // da quella connessione, e sotto carico concorrente smette di consegnarne.
-    // Misurato: con un pool il proxy ne riceveva 111 su 120, e i client rimasti
-    // senza risposta aspettavano per sempre.
+    // Every request gets served right away, on a thread of its own. Queuing
+    // them for a worker pool looks tidier but jams up: as long as we hold a
+    // `Request` without answering it, tiny_http won't read the next request
+    // off that connection, and under concurrent load it stops delivering
+    // them. Measured: with a pool the proxy only received 111 of 120, and the
+    // clients left without a response waited forever.
     let agent = Arc::new(
         ureq::AgentBuilder::new()
             .redirects(0)
-            // Un upstream che non risponde mai non deve tenere appeso il figlio.
+            // An upstream that never answers must not hang the child forever.
             .timeout(std::time::Duration::from_secs(120))
             .build(),
     );
-    let token_pubblico = token.to_string();
-    let accettatore = server.clone();
-    let contatore = seen.clone();
+    let public_token = token.to_string();
+    let acceptor = server.clone();
+    let counter = seen.clone();
     std::thread::spawn(move || {
-        while let Ok(req) = accettatore.recv() {
-            // Il contatore si incrementa PRIMA di inoltrare: contare a valle
-            // lascerebbe passare piu' di N con richieste concorrenti.
-            let n = contatore.fetch_add(1, Ordering::SeqCst) + 1;
+        while let Ok(req) = acceptor.recv() {
+            // The counter increments BEFORE forwarding: counting afterward
+            // would let more than N through under concurrent requests.
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
             let (routes, token, agent) = (routes.clone(), token.clone(), agent.clone());
             std::thread::spawn(move || serve(req, &token, &routes, &agent, max_requests, n));
         }
     });
     Ok(Handle {
         port,
-        token: token_pubblico,
+        token: public_token,
         seen,
         server,
     })
@@ -170,8 +172,8 @@ fn serve(
     let mut body = Vec::new();
     let _ = req.as_reader().take(MAX_BODY).read_to_end(&mut body);
 
-    let esito = forward(&url, token, &method, &headers, body, routes, agent, max, n);
-    let (code, ctype, data) = match esito {
+    let outcome = forward(&url, token, &method, &headers, body, routes, agent, max, n);
+    let (code, ctype, data) = match outcome {
         Ok(v) => v,
         Err((code, msg)) => (
             code,
@@ -201,10 +203,10 @@ fn forward(
     n: u64,
 ) -> Result<(u16, String, Vec<u8>), Denied> {
     if max.is_some_and(|m| n > m) {
-        return Err((429, "budget della sessione esaurito"));
+        return Err((429, "session budget exhausted"));
     }
     if !matches!(method, "GET" | "POST") {
-        return Err((405, "metodo non consentito"));
+        return Err((405, "method not allowed"));
     }
     let (route, target) = resolve(url, token, routes)?;
 
@@ -213,11 +215,11 @@ fn forward(
         if !FORWARD.contains(&k.as_str()) {
             continue;
         }
-        // Un valore con caratteri di controllo puo' spezzare la richiesta e
-        // iniettare header nostri. Non deleghiamo il controllo al client HTTP:
-        // se e' malformato la richiesta muore qui.
+        // A value with control characters could split the request and inject
+        // headers of its own. We don't delegate this check to the HTTP
+        // client: if it's malformed, the request dies here.
         if v.bytes().any(|b| b < 0x20 || b == 0x7f) {
-            return Err((400, "header con caratteri di controllo"));
+            return Err((400, "header contains control characters"));
         }
         r = r.set(k, v);
     }
@@ -226,9 +228,9 @@ fn forward(
         Auth::XApiKey => r.set("x-api-key", &route.key),
     };
 
-    // redirects(0): un 3xx torna al client cosi' com'e', e non lo seguiamo mai.
-    // Location non viene inoltrato indietro, quindi la chiave non puo' finire
-    // su una destinazione scelta dalla risposta dell'upstream.
+    // redirects(0): a 3xx goes back to the client as-is, and we never follow
+    // it. Location isn't forwarded back either, so the key can't end up going
+    // to a destination chosen by the upstream's response.
     let resp = match if body.is_empty() {
         r.call()
     } else {
@@ -236,7 +238,7 @@ fn forward(
     } {
         Ok(resp) => resp,
         Err(ureq::Error::Status(_, resp)) => resp,
-        Err(_) => return Err((502, "upstream irraggiungibile")),
+        Err(_) => return Err((502, "upstream is unreachable")),
     };
     let code = resp.status();
     let ctype = resp
@@ -247,11 +249,14 @@ fn forward(
     resp.into_reader()
         .take(MAX_BODY)
         .read_to_end(&mut data)
-        .map_err(|_| (502u16, "risposta upstream illeggibile"))?;
+        .map_err(|_| (502u16, "upstream response is unreadable"))?;
 
-    // INV-SECRET: la chiave non torna indietro nemmeno se l'upstream la riflette.
+    // INV-SECRET: the key never goes back, even if the upstream reflects it.
     if contains(&data, route.key.as_bytes()) {
-        return Err((502, "risposta upstream scartata: conteneva la credenziale"));
+        return Err((
+            502,
+            "upstream response discarded: it contained the credential",
+        ));
     }
     Ok((code, ctype, data))
 }
