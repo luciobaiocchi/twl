@@ -1,7 +1,0 @@
-# This file only selects the runtime connector. The real credential and
-# upstream are supplied directly to the trusted mtl parent at startup.
-connectors:
-  - application
-
-budget:
-  max_requests: 5

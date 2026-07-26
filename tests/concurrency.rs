@@ -1,11 +1,7 @@
 mod common;
 
 use common::{call_with, client, upstream};
-use mithril::config::{AllowedRoute, Auth};
 use mithril::proxy::{self, Route};
-use std::collections::HashMap;
-
-const RULES: &[AllowedRoute] = &[AllowedRoute::exact("GET", "/v1/models")];
 
 #[test]
 fn concurrent_budget_is_reserved_before_forwarding() {
@@ -13,18 +9,16 @@ fn concurrent_budget_is_reserved_before_forwarding() {
     const BUDGET: u64 = 5;
 
     let (upstream, log) = upstream();
-    let routes = HashMap::from([(
-        "openai".to_string(),
+    let handle = proxy::spawn(
         Route {
             upstream,
-            auth: Auth::Bearer,
-            key: "sk-CANARY".into(),
-            allowed: RULES,
+            key: "project-canary".into(),
         },
-    )]);
-    let handle = proxy::spawn(routes, Some(BUDGET)).unwrap();
+        Some(BUDGET),
+    )
+    .unwrap();
     let port = handle.port;
-    let path = format!("/{}/openai/v1/models", handle.token);
+    let path = format!("/{}/v1/models", handle.token);
 
     let workers: Vec<_> = (0..CLIENTS)
         .map(|_| {

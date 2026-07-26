@@ -1,9 +1,8 @@
-use crate::config::{AllowedRoute, Auth};
+use crate::config::ALLOWED_METHODS;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
-use std::collections::HashMap;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -11,21 +10,12 @@ use std::time::Duration;
 
 const MAX_BODY: u64 = 16 << 20;
 const MAX_IN_FLIGHT: usize = 16;
+const FORWARD_HEADERS: &[&str] = &["content-type", "accept"];
 
-const FORWARD: &[&str] = &[
-    "content-type",
-    "accept",
-    "anthropic-version",
-    "anthropic-beta",
-    "openai-organization",
-    "openai-beta",
-];
-
+/// The only destination and credential authorized for a session.
 pub struct Route {
     pub upstream: String,
-    pub auth: Auth,
     pub key: String,
-    pub allowed: &'static [AllowedRoute],
 }
 
 /// The listener exists only while its session handle exists.
@@ -62,14 +52,9 @@ fn equal_constant_time(left: &str, right: &str) -> bool {
             == 0
 }
 
-/// Resolve a local request using only compiled route policy. The first path
-/// segment is a session capability; the second is a connector identifier.
-pub fn resolve<'a>(
-    url: &str,
-    token: &str,
-    method: &str,
-    routes: &'a HashMap<String, Route>,
-) -> Result<(&'a Route, String), Denied> {
+/// Resolve an origin-form request beneath the unguessable session prefix.
+/// The destination is always derived from the trusted parent-owned route.
+pub fn resolve(url: &str, token: &str, method: &str, route: &Route) -> Result<String, Denied> {
     if !url.starts_with('/') || url.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
         return Err((400, "request target is not valid origin-form"));
     }
@@ -77,51 +62,45 @@ pub fn resolve<'a>(
         Some((path, query)) => (path, Some(query)),
         None => (url, None),
     };
-    if path.contains('\\') || path.contains('%') {
+    if path.contains(['\\', '%', '#']) {
         return Err((400, "encoded or non-normalized path"));
     }
 
-    let segments: Vec<&str> = path.split('/').collect();
-    if segments.first() != Some(&"") {
+    let mut segments = path.splitn(3, '/');
+    if segments.next() != Some("") {
         return Err((400, "non-normalized path"));
     }
     if segments
-        .get(1)
+        .next()
         .is_none_or(|candidate| !equal_constant_time(candidate, token))
     {
         return Err((404, "not found"));
     }
-    if segments.len() < 4
-        || segments[1..]
-            .iter()
-            .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
-    {
+    let application_path = segments
+        .next()
+        .ok_or((400, "application path is missing"))?;
+    let path_segments: Vec<_> = application_path.split('/').collect();
+    if path_segments.iter().enumerate().any(|(index, segment)| {
+        *segment == "."
+            || *segment == ".."
+            || (segment.is_empty() && path_segments.len() > 1 && index + 1 != path_segments.len())
+    }) {
         return Err((400, "non-normalized path"));
     }
-
-    let route = routes.get(segments[2]).ok_or((404, "not found"))?;
-    let provider_path = format!("/{}", segments[3..].join("/"));
-    let path_allowed = route
-        .allowed
-        .iter()
-        .any(|rule| rule.matches_path(&provider_path));
-    if !path_allowed {
-        return Err((403, "provider path is not allowed"));
-    }
-    if !route
-        .allowed
-        .iter()
-        .any(|rule| rule.allows(method, &provider_path))
-    {
+    if !ALLOWED_METHODS.contains(&method) {
         return Err((405, "method is not allowed"));
     }
 
-    let mut target = format!("{}{}", route.upstream.trim_end_matches('/'), provider_path);
+    let mut target = format!(
+        "{}/{}",
+        route.upstream.trim_end_matches('/'),
+        application_path
+    );
     if let Some(query) = query {
         target.push('?');
         target.push_str(query);
     }
-    Ok((route, target))
+    Ok(target)
 }
 
 struct InFlight(Arc<AtomicUsize>);
@@ -132,7 +111,7 @@ impl Drop for InFlight {
     }
 }
 
-pub fn spawn(routes: HashMap<String, Route>, max_requests: Option<u64>) -> std::io::Result<Handle> {
+pub fn spawn(route: Route, max_requests: Option<u64>) -> std::io::Result<Handle> {
     let server = Arc::new(
         tiny_http::Server::http("127.0.0.1:0")
             .map_err(|error| std::io::Error::other(error.to_string()))?,
@@ -140,7 +119,7 @@ pub fn spawn(routes: HashMap<String, Route>, max_requests: Option<u64>) -> std::
     let port = server.server_addr().to_ip().expect("socket ip").port();
     let token = Arc::new(random_token());
     let public_token = token.to_string();
-    let routes = Arc::new(routes);
+    let route = Arc::new(route);
     let seen = Arc::new(AtomicU64::new(0));
     let active = Arc::new(AtomicUsize::new(0));
     let agent = Arc::new(
@@ -161,13 +140,13 @@ pub fn spawn(routes: HashMap<String, Route>, max_requests: Option<u64>) -> std::
                 continue;
             }
             let guard = InFlight(active.clone());
-            let routes = routes.clone();
+            let route = route.clone();
             let token = token.clone();
             let agent = agent.clone();
             let accepted = accepted.clone();
             std::thread::spawn(move || {
                 let _guard = guard;
-                serve(request, &token, &routes, &agent, &accepted, max_requests);
+                serve(request, &token, &route, &agent, &accepted, max_requests);
             });
         }
     });
@@ -210,15 +189,15 @@ fn read_limited(reader: impl Read) -> Result<Vec<u8>, ()> {
 fn serve(
     mut request: tiny_http::Request,
     token: &str,
-    routes: &HashMap<String, Route>,
+    route: &Route,
     agent: &ureq::Agent,
     accepted: &AtomicU64,
     max_requests: Option<u64>,
 ) {
     let url = request.url().to_string();
     let method = request.method().as_str().to_string();
-    let (route, target) = match resolve(&url, token, &method, routes) {
-        Ok(resolved) => resolved,
+    let target = match resolve(&url, token, &method, route) {
+        Ok(target) => target,
         Err((code, message)) => {
             respond_error(request, code, message);
             return;
@@ -278,14 +257,11 @@ fn forward(
 ) -> Result<(u16, &'static str, Vec<u8>), Denied> {
     let mut upstream = agent.request(method, target);
     for (name, value) in headers {
-        if FORWARD.contains(&name.as_str()) {
+        if FORWARD_HEADERS.contains(&name.as_str()) {
             upstream = upstream.set(name, value);
         }
     }
-    upstream = match route.auth {
-        Auth::Bearer => upstream.set("authorization", &format!("Bearer {}", route.key)),
-        Auth::XApiKey => upstream.set("x-api-key", &route.key),
-    };
+    upstream = upstream.set("authorization", &format!("Bearer {}", route.key));
 
     let response = match if body.is_empty() {
         upstream.call()

@@ -1,146 +1,63 @@
-use crate::config::{connector, validate_runtime_upstream, Config, Connector, CredentialSource};
-use crate::secret;
-use crate::SessionMaterial;
-use std::collections::HashMap;
+use crate::config::{validate_upstream, PARENT_SECRET_ENV, PARENT_UPSTREAM_ENV};
+use crate::{secret, SessionMaterial};
 #[cfg(unix)]
 use std::io::Read;
-
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
 
 #[cfg(unix)]
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 
-/// Parent-only inputs collected from CLI flags before a session is prepared.
+/// Parent-only inputs collected before the application session is prepared.
 #[derive(Default)]
 pub struct Inputs {
-    secret_fds: HashMap<String, i32>,
-    upstreams: HashMap<String, String>,
+    secret_fd: Option<i32>,
+    upstream: Option<String>,
 }
 
-/// Validated runtime material retained by the parent until it enters a route.
-#[derive(Default)]
 pub struct Resolved {
-    materials: HashMap<String, SessionMaterial>,
-    environment_secrets: Vec<(&'static str, &'static str)>,
+    pub material: SessionMaterial,
+    pub used_environment_secret: bool,
 }
 
 impl Inputs {
-    pub fn add_upstream(&mut self, connector: String, upstream: String) -> Result<(), String> {
-        if self.upstreams.insert(connector.clone(), upstream).is_some() {
-            return Err(format!("duplicate upstream for connector {connector}"));
+    pub fn set_upstream(&mut self, upstream: String) -> Result<(), String> {
+        if self.upstream.replace(upstream).is_some() {
+            return Err("--upstream was specified more than once".into());
         }
         Ok(())
     }
 
-    pub fn add_secret_fd(&mut self, connector: String, fd: i32) -> Result<(), String> {
+    pub fn set_secret_fd(&mut self, fd: i32) -> Result<(), String> {
         if fd < 3 {
             return Err("secret file descriptors must be 3 or greater".into());
         }
-        if self.secret_fds.values().any(|candidate| *candidate == fd) {
-            return Err(format!("file descriptor {fd} is assigned more than once"));
-        }
-        if self.secret_fds.insert(connector.clone(), fd).is_some() {
-            return Err(format!("duplicate secret source for connector {connector}"));
+        if self.secret_fd.replace(fd).is_some() {
+            return Err("--secret-fd was specified more than once".into());
         }
         Ok(())
     }
 
     pub fn resolve(
         self,
-        config: &Config,
-        prompt: impl FnMut(&Connector) -> Result<String, String>,
+        prompt: impl FnOnce() -> Result<String, String>,
     ) -> Result<Resolved, String> {
-        self.validate(config)?;
-        let has_runtime = config
-            .connectors
-            .iter()
-            .filter_map(|name| connector(name))
-            .any(|connector| {
-                matches!(
-                    connector.credential_source,
-                    CredentialSource::Runtime { .. }
-                )
-            });
-        if !has_runtime {
-            return Ok(Resolved::default());
-        }
-
+        // Harden the parent before reading any credential source.
         secret::process_preflight()?;
-        self.resolve_protected(config, prompt)
-    }
 
-    fn resolve_protected(
-        mut self,
-        config: &Config,
-        mut prompt: impl FnMut(&Connector) -> Result<String, String>,
-    ) -> Result<Resolved, String> {
-        let mut resolved = Resolved::default();
-        for name in &config.connectors {
-            let connector = connector(name).ok_or_else(|| format!("unknown connector: {name}"))?;
-            let CredentialSource::Runtime {
-                parent_secret_env,
-                parent_upstream_env,
-            } = connector.credential_source
-            else {
-                continue;
-            };
-
-            let upstream = choose_upstream(
-                connector.id,
-                self.upstreams.remove(connector.id),
-                take_environment(parent_upstream_env)?,
-                parent_upstream_env,
-            )?;
-            let (key, used_environment) = choose_secret(
-                connector,
-                self.secret_fds.remove(connector.id),
-                take_environment(parent_secret_env)?,
-                &mut prompt,
-            )?;
-            if key.is_empty() {
-                return Err(format!("empty credential for connector {}", connector.id));
-            }
-            if used_environment {
-                resolved
-                    .environment_secrets
-                    .push((connector.id, parent_secret_env));
-            }
-            resolved
-                .materials
-                .insert(connector.id.to_string(), SessionMaterial { key, upstream });
+        let environment_upstream = take_environment(PARENT_UPSTREAM_ENV)?;
+        let upstream = choose_upstream(self.upstream, environment_upstream)?;
+        let environment_secret = take_environment(PARENT_SECRET_ENV)?;
+        let (key, used_environment_secret) =
+            choose_secret(self.secret_fd, environment_secret, prompt)?;
+        if key.is_empty() {
+            return Err("empty application credential".into());
         }
-        Ok(resolved)
-    }
 
-    fn validate(&self, config: &Config) -> Result<(), String> {
-        for name in self.secret_fds.keys().chain(self.upstreams.keys()) {
-            let selected = config.connectors.iter().any(|candidate| candidate == name);
-            let runtime = connector(name).is_some_and(|connector| {
-                matches!(
-                    connector.credential_source,
-                    CredentialSource::Runtime { .. }
-                )
-            });
-            if !selected || !runtime {
-                return Err(format!(
-                    "runtime option refers to unselected or non-runtime connector {name}"
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Resolved {
-    pub fn take_material(&mut self, connector: &Connector) -> Result<SessionMaterial, String> {
-        self.materials
-            .remove(connector.id)
-            .ok_or_else(|| format!("missing runtime material for connector {}", connector.id))
-    }
-
-    pub fn environment_secrets(&self) -> &[(&'static str, &'static str)] {
-        &self.environment_secrets
+        Ok(Resolved {
+            material: SessionMaterial { key, upstream },
+            used_environment_secret,
+        })
     }
 }
 
@@ -156,42 +73,29 @@ fn take_environment(name: &str) -> Result<Option<String>, String> {
         .transpose()
 }
 
-fn choose_upstream(
-    connector: &str,
-    command: Option<String>,
-    environment: Option<String>,
-    environment_name: &str,
-) -> Result<String, String> {
+fn choose_upstream(command: Option<String>, environment: Option<String>) -> Result<String, String> {
     let value = match (command, environment) {
-        (Some(_), Some(_)) => {
-            return Err(format!(
-                "upstream for connector {connector} was supplied twice"
-            ))
-        }
+        (Some(_), Some(_)) => return Err("upstream was supplied twice".into()),
         (Some(value), None) | (None, Some(value)) => value,
         (None, None) => {
             return Err(format!(
-                "connector {connector} requires --upstream {connector}=URL or {environment_name}"
+                "application requires --upstream URL or {PARENT_UPSTREAM_ENV}"
             ))
         }
     };
-    validate_runtime_upstream(&value)
+    validate_upstream(&value)
 }
 
 fn choose_secret(
-    connector: &Connector,
     descriptor: Option<i32>,
     environment: Option<String>,
-    prompt: &mut impl FnMut(&Connector) -> Result<String, String>,
+    prompt: impl FnOnce() -> Result<String, String>,
 ) -> Result<(String, bool), String> {
     match (descriptor, environment) {
-        (Some(_), Some(_)) => Err(format!(
-            "credential for connector {} was supplied twice",
-            connector.id
-        )),
+        (Some(_), Some(_)) => Err("application credential was supplied twice".into()),
         (Some(fd), None) => read_secret_fd(fd).map(|secret| (secret, false)),
         (None, Some(secret)) => Ok((secret, true)),
-        (None, None) => prompt(connector).map(|secret| (secret, false)),
+        (None, None) => prompt().map(|secret| (secret, false)),
     }
 }
 
@@ -242,25 +146,20 @@ mod tests {
 
     #[test]
     fn dedicated_descriptor_is_consumed_and_closed() {
-        let config = Config::parse("connectors: [openai, application]\n").unwrap();
         let (reader, mut writer) = UnixStream::pair().unwrap();
         writer.write_all(b"real-test-key\n").unwrap();
         drop(writer);
         let fd = reader.into_raw_fd();
 
         let mut inputs = Inputs::default();
-        inputs
-            .add_upstream("application".into(), "http://127.0.0.1:8080".into())
-            .unwrap();
-        inputs.add_secret_fd("application".into(), fd).unwrap();
-        let mut resolved = inputs
-            .resolve_protected(&config, |_| Err("prompt must not run".into()))
+        inputs.set_upstream("http://127.0.0.1:8080".into()).unwrap();
+        inputs.set_secret_fd(fd).unwrap();
+        let resolved = inputs
+            .resolve_protected_for_test(|| Err("prompt must not run".into()))
             .unwrap();
 
         assert_eq!(
-            resolved
-                .take_material(connector("application").unwrap())
-                .unwrap(),
+            resolved.material,
             SessionMaterial {
                 key: "real-test-key".into(),
                 upstream: "http://127.0.0.1:8080".into(),
@@ -270,17 +169,18 @@ mod tests {
     }
 
     #[test]
-    fn one_descriptor_cannot_be_assigned_twice() {
+    fn duplicate_inputs_are_rejected() {
         let mut inputs = Inputs::default();
-        inputs.add_secret_fd("application".into(), 7).unwrap();
-        assert!(inputs.add_secret_fd("another".into(), 7).is_err());
+        inputs.set_secret_fd(7).unwrap();
+        assert!(inputs.set_secret_fd(8).is_err());
+        inputs.set_upstream("https://one.example".into()).unwrap();
+        assert!(inputs.set_upstream("https://two.example".into()).is_err());
     }
 
     #[test]
     fn conflicting_sources_do_not_echo_the_secret() {
-        let application = connector("application").unwrap();
         let secret = "DO-NOT-PRINT-THIS";
-        let error = choose_secret(application, Some(7), Some(secret.into()), &mut |_| {
+        let error = choose_secret(Some(7), Some(secret.into()), || {
             Err("prompt must not run".into())
         })
         .unwrap_err();
@@ -290,13 +190,27 @@ mod tests {
     }
 
     #[test]
-    fn runtime_options_are_scoped_to_selected_runtime_connectors() {
-        let config = Config::parse("connectors: [openai]\n").unwrap();
-        let mut inputs = Inputs::default();
-        inputs
-            .add_upstream("application".into(), "https://service.example".into())
-            .unwrap();
+    fn environment_secret_is_marked_as_weaker_input() {
+        let (secret, used_environment) = choose_secret(None, Some("canary".into()), || {
+            Err("prompt must not run".into())
+        })
+        .unwrap();
 
-        assert!(inputs.validate(&config).is_err());
+        assert_eq!(secret, "canary");
+        assert!(used_environment);
+    }
+
+    impl Inputs {
+        fn resolve_protected_for_test(
+            self,
+            prompt: impl FnOnce() -> Result<String, String>,
+        ) -> Result<Resolved, String> {
+            let upstream = choose_upstream(self.upstream, None)?;
+            let (key, used_environment_secret) = choose_secret(self.secret_fd, None, prompt)?;
+            Ok(Resolved {
+                material: SessionMaterial { key, upstream },
+                used_environment_secret,
+            })
+        }
     }
 }

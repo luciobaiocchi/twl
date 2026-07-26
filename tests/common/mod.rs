@@ -49,7 +49,7 @@ fn serve_upstream(request: tiny_http::Request, sink: &Log) {
         .collect();
     let authentication = headers
         .iter()
-        .find(|(name, _)| name == "authorization" || name == "x-api-key")
+        .find(|(name, _)| name == "authorization")
         .map(|(_, value)| value.clone())
         .unwrap_or_default();
     sink.lock().unwrap().push(Seen {

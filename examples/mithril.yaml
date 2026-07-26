@@ -1,7 +1,4 @@
-# Workspace configuration selects a compiled connector policy. It cannot name
-# a secret, change authentication, or replace the provider destination.
-connectors:
-  - openai
-
+# Project configuration is intentionally low-authority. The credential and
+# upstream are supplied directly to the trusted mtl parent at startup.
 budget:
   max_requests: 5

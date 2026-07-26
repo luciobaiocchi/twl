@@ -3,8 +3,7 @@
 mod common;
 
 use common::upstream;
-use mithril::config::Config;
-use mithril::{child_command, prepare_session, proxy, SessionMaterial};
+use mithril::{child_command, prepare_session, SessionMaterial};
 use std::process::Command;
 
 const REAL_KEY: &str = "third-party-real-test-key";
@@ -32,17 +31,12 @@ fn python_app_uses_the_service_without_receiving_the_real_key() {
     }
 
     let (upstream, log) = upstream();
-    let config = Config::parse("connectors: [application]\n").unwrap();
-    let mut prepared = prepare_session(&config, |_| {
-        Ok(SessionMaterial {
-            key: REAL_KEY.to_string(),
-            upstream: upstream.clone(),
-        })
+    let prepared = prepare_session(SessionMaterial {
+        key: REAL_KEY.to_string(),
+        upstream,
     })
     .unwrap();
-    let routes = std::mem::take(&mut prepared.routes);
-    let handle = proxy::spawn(routes, None).unwrap();
-    let overrides = prepared.env_overrides(handle.port, &handle.token);
+    let (handle, overrides) = prepared.start(None).unwrap();
     let app = format!(
         "{}/examples/application_client.py",
         env!("CARGO_MANIFEST_DIR")
@@ -68,4 +62,5 @@ fn python_app_uses_the_service_without_receiving_the_real_key() {
         seen[0].header("authorization"),
         Some(&*format!("Bearer {REAL_KEY}"))
     );
+    drop(handle);
 }
