@@ -1,207 +1,343 @@
 mod common;
 
-use common::{call, raw, upstream};
+use common::{call, call_body, grant, granted_route, raw, upstream};
 use std::io::{Read, Write};
-use twl::proxy::{self, resolve, Route};
+use twl::proxy;
 
-const KEY: &str = "project-canary-real-key-0123456789";
+const ALPHA_KEY: &str = "alpha-real-key-0123456789";
+const BETA_KEY: &str = "beta-real-key-9876543210";
 
-fn route(upstream: &str) -> Route {
-    Route {
-        upstream: upstream.to_string(),
-        key: KEY.to_string(),
-    }
+fn test_proxy(routes: Vec<twl::grant::GrantedRoute>) -> proxy::Handle {
+    proxy::spawn(grant(routes)).unwrap()
 }
 
-fn test_proxy(upstream: &str, budget: Option<u64>) -> (proxy::Handle, String) {
-    let handle = proxy::spawn(route(upstream), budget).unwrap();
-    let prefix = format!("/{}", handle.token);
-    (handle, prefix)
+fn route_path(handle: &proxy::Handle, route: &str, path: &str) -> String {
+    format!("/{}/{route}{path}", handle.token)
 }
 
 #[test]
-fn real_key_reaches_only_the_fixed_upstream() {
-    let (upstream, log) = upstream();
-    let (handle, prefix) = test_proxy(&upstream, None);
-    assert_eq!(
-        call(handle.port, "GET", &format!("{prefix}/v1/models"), &[]).0,
-        200
-    );
-
-    let seen = log.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].url, "/v1/models");
-    assert_eq!(
-        seen[0].header("authorization"),
-        Some(&*format!("Bearer {KEY}"))
-    );
-}
-
-#[test]
-fn ordinary_application_paths_and_methods_are_forwarded() {
-    let (upstream, log) = upstream();
-    let (handle, prefix) = test_proxy(&upstream, None);
+fn two_routes_keep_destinations_and_credentials_isolated() {
+    let (alpha_upstream, alpha_log) = upstream();
+    let (beta_upstream, beta_log) = upstream();
+    let handle = test_proxy(vec![
+        granted_route("alpha", &alpha_upstream, ALPHA_KEY),
+        granted_route("beta", &beta_upstream, BETA_KEY),
+    ]);
 
     assert_eq!(
         call(
             handle.port,
-            "POST",
-            &format!("{prefix}/projects/42/tasks?dry_run=true"),
-            &[],
+            "GET",
+            &route_path(&handle, "alpha", "/v1/models"),
+            &[]
         )
         .0,
         200
     );
-    assert_eq!(call(handle.port, "GET", &format!("{prefix}/"), &[]).0, 200);
+    assert_eq!(
+        call(
+            handle.port,
+            "POST",
+            &route_path(&handle, "beta", "/projects/42?dry_run=true"),
+            &[]
+        )
+        .0,
+        200
+    );
 
-    let seen = log.lock().unwrap();
-    assert_eq!(seen[0].url, "/projects/42/tasks?dry_run=true");
-    assert_eq!(seen[1].url, "/");
+    let alpha = alpha_log.lock().unwrap();
+    let beta = beta_log.lock().unwrap();
+    assert_eq!(alpha.len(), 1);
+    assert_eq!(beta.len(), 1);
+    assert_eq!(alpha[0].url, "/v1/models");
+    assert_eq!(beta[0].url, "/projects/42?dry_run=true");
+    assert_eq!(
+        alpha[0].header("authorization"),
+        Some(&*format!("Bearer {ALPHA_KEY}"))
+    );
+    assert_eq!(
+        beta[0].header("authorization"),
+        Some(&*format!("Bearer {BETA_KEY}"))
+    );
+    assert!(!alpha[0]
+        .headers
+        .iter()
+        .any(|(_, value)| value.contains(BETA_KEY)));
+    assert!(!beta[0]
+        .headers
+        .iter()
+        .any(|(_, value)| value.contains(ALPHA_KEY)));
 }
 
 #[test]
-fn hostile_host_and_auth_headers_are_ignored() {
+fn route_method_and_path_policies_are_enforced() {
     let (upstream, log) = upstream();
-    let (handle, prefix) = test_proxy(&upstream, None);
+    let mut route = granted_route("limited", &upstream, ALPHA_KEY);
+    route.policy.allowed_methods = vec!["GET".into(), "POST".into()];
+    route.policy.path_prefixes = Some(vec!["/v1".into()]);
+    let handle = test_proxy(vec![route]);
+
+    assert_eq!(
+        call(
+            handle.port,
+            "GET",
+            &route_path(&handle, "limited", "/v1/models"),
+            &[]
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            handle.port,
+            "DELETE",
+            &route_path(&handle, "limited", "/v1/models"),
+            &[]
+        )
+        .0,
+        405
+    );
+    for path in ["/admin", "/v10", "/"] {
+        assert_eq!(
+            call(
+                handle.port,
+                "GET",
+                &route_path(&handle, "limited", path),
+                &[]
+            )
+            .0,
+            403,
+            "{path}"
+        );
+    }
+    assert_eq!(log.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn hostile_auth_host_and_forwarding_headers_are_stripped() {
+    let (upstream, log) = upstream();
+    let handle = test_proxy(vec![granted_route("alpha", &upstream, ALPHA_KEY)]);
     let headers = [
         ("Host", "evil.example"),
+        ("Forwarded", "host=evil.example"),
         ("X-Forwarded-Host", "evil.example"),
+        ("X-Forwarded-For", "203.0.113.9"),
         ("X-Original-URL", "http://evil.example"),
+        ("Proxy-Authorization", "Basic attacker"),
         ("Authorization", "Bearer attacker-choice"),
         ("X-Api-Key", "attacker-choice"),
     ];
     assert_eq!(
-        call(handle.port, "GET", &format!("{prefix}/v1/models"), &headers).0,
+        call(
+            handle.port,
+            "GET",
+            &route_path(&handle, "alpha", "/v1/models"),
+            &headers
+        )
+        .0,
         200
     );
 
     let seen = log.lock().unwrap();
     assert_ne!(seen[0].header("host"), Some("evil.example"));
-    assert_eq!(seen[0].header("x-forwarded-host"), None);
-    assert_eq!(seen[0].header("x-original-url"), None);
-    assert_eq!(seen[0].header("x-api-key"), None);
+    for name in [
+        "forwarded",
+        "x-forwarded-host",
+        "x-forwarded-for",
+        "x-original-url",
+        "proxy-authorization",
+        "x-api-key",
+    ] {
+        assert_eq!(seen[0].header(name), None, "forwarded {name}");
+    }
     assert_eq!(
         seen[0].header("authorization"),
-        Some(&*format!("Bearer {KEY}"))
+        Some(&*format!("Bearer {ALPHA_KEY}"))
     );
 }
 
 #[test]
-fn missing_or_wrong_session_token_reaches_nothing() {
-    let (upstream, log) = upstream();
-    let (handle, _prefix) = test_proxy(&upstream, None);
-    for path in ["/v1/models", "/wrong/v1/models", "/wrong"] {
-        assert_eq!(call(handle.port, "GET", path, &[]).0, 404, "{path}");
+fn token_is_bound_to_only_the_routes_in_its_session() {
+    let (alpha_upstream, alpha_log) = upstream();
+    let (beta_upstream, beta_log) = upstream();
+    let alpha = test_proxy(vec![granted_route("alpha", &alpha_upstream, ALPHA_KEY)]);
+    let beta = test_proxy(vec![granted_route("beta", &beta_upstream, BETA_KEY)]);
+
+    for path in [
+        "/v1/models".to_string(),
+        "/wrong/alpha/v1/models".to_string(),
+        format!("/{}/beta/v1/models", alpha.token),
+        format!("/{}/alpha/v1/models", beta.token),
+    ] {
+        assert_eq!(call(alpha.port, "GET", &path, &[]).0, 404, "{path}");
     }
-    assert!(log.lock().unwrap().is_empty());
+    assert_eq!(
+        call(
+            beta.port,
+            "GET",
+            &format!("/{}/beta/v1/models", alpha.token),
+            &[]
+        )
+        .0,
+        404
+    );
+    assert!(alpha_log.lock().unwrap().is_empty());
+    assert!(beta_log.lock().unwrap().is_empty());
 }
 
 #[test]
-fn redirects_are_returned_but_never_followed() {
+fn redirects_are_not_followed_and_location_is_not_exposed() {
     let (upstream, log) = upstream();
-    let (handle, prefix) = test_proxy(&upstream, None);
-    let (code, _) = call(handle.port, "GET", &format!("{prefix}/v1/redirect"), &[]);
+    let handle = test_proxy(vec![granted_route("alpha", &upstream, ALPHA_KEY)]);
+    let path = route_path(&handle, "alpha", "/redirect");
+    let (code, response) = raw(handle.port, &format!("GET {path} HTTP/1.1"));
+
     assert_eq!(code, 302);
+    assert!(!response.to_ascii_lowercase().contains("\r\nlocation:"));
     assert_eq!(log.lock().unwrap().len(), 1);
 }
 
 #[test]
-fn unsupported_methods_are_rejected() {
+fn malformed_targets_never_reach_an_upstream() {
     let (upstream, log) = upstream();
-    let (handle, prefix) = test_proxy(&upstream, None);
+    let handle = test_proxy(vec![granted_route("alpha", &upstream, ALPHA_KEY)]);
+    let prefix = format!("/{}/alpha", handle.token);
 
-    assert_eq!(
-        call(handle.port, "OPTIONS", &format!("{prefix}/v1/models"), &[]).0,
-        405
-    );
-    assert!(log.lock().unwrap().is_empty());
-}
-
-#[test]
-fn malformed_targets_never_reach_upstream() {
-    let (upstream, log) = upstream();
-    let (handle, prefix) = test_proxy(&upstream, None);
-
-    assert_eq!(
-        raw(
-            handle.port,
-            &format!("GET {prefix}/v1/../../etc/passwd HTTP/1.1")
-        ),
-        400
-    );
-    assert_eq!(
-        raw(
-            handle.port,
-            &format!("GET {prefix}/v1/models/%2e%2e/admin HTTP/1.1")
-        ),
-        400
-    );
-    let absolute = raw(handle.port, "GET http://evil.example/v1/models HTTP/1.1");
+    for target in [
+        format!("{prefix}/v1/../../etc/passwd"),
+        format!("{prefix}/v1/models/%2e%2e/admin"),
+        format!("{prefix}//evil.example/v1"),
+    ] {
+        assert_eq!(
+            raw(handle.port, &format!("GET {target} HTTP/1.1")).0,
+            400,
+            "{target}"
+        );
+    }
+    let absolute = raw(handle.port, "GET http://evil.example/v1/models HTTP/1.1").0;
     assert!(absolute == 400 || absolute == 0);
     assert!(log.lock().unwrap().is_empty());
 }
 
 #[test]
-fn no_path_can_change_the_destination_host() {
-    let route = route("https://service.example/api");
-    let token = "TESTTOKEN";
-    for hostile in [
-        "http://evil.example/v1",
-        "//evil.example/v1",
-        "/TESTTOKEN//evil.example/v1",
-        "/TESTTOKEN/v1/@evil.example",
-        "/TESTTOKEN/v1/models#@evil.example",
-    ] {
-        match resolve(hostile, token, "GET", &route) {
-            Err(_) => {}
-            Ok(target) => assert!(target.starts_with("https://service.example/api/")),
-        }
-    }
-}
-
-#[test]
 fn credential_reflection_is_blocked_in_plaintext_base64_and_headers() {
     let (upstream, _log) = upstream();
-    let (handle, prefix) = test_proxy(&upstream, None);
+    let handle = test_proxy(vec![granted_route("alpha", &upstream, ALPHA_KEY)]);
 
-    for path in ["echo-key", "echo-key-base64", "echo-key-base64-no-pad"] {
-        let (code, body) = call(handle.port, "GET", &format!("{prefix}/v1/{path}"), &[]);
+    for path in [
+        "/echo-key",
+        "/echo-key-base64",
+        "/echo-key-base64-no-pad",
+        "/echo-key-base64-url",
+        "/echo-key-base64-url-no-pad",
+    ] {
+        let (code, body) = call(handle.port, "GET", &route_path(&handle, "alpha", path), &[]);
         assert_eq!(code, 502, "{path}");
-        assert!(!body.contains(KEY));
+        assert!(!body.contains(ALPHA_KEY));
     }
 
     let (code, body) = call(
         handle.port,
         "GET",
-        &format!("{prefix}/v1/echo-key-header"),
+        &route_path(&handle, "alpha", "/echo-key-header"),
         &[],
     );
     assert_eq!(code, 200);
-    assert!(!body.contains(KEY));
+    assert!(!body.contains(ALPHA_KEY));
 }
 
 #[test]
-fn invalid_requests_do_not_consume_budget() {
+fn invalid_requests_do_not_consume_route_budget() {
     let (upstream, log) = upstream();
-    let (handle, prefix) = test_proxy(&upstream, Some(1));
+    let mut route = granted_route("alpha", &upstream, ALPHA_KEY);
+    route.policy.request_count_budget = 1;
+    let handle = test_proxy(vec![route]);
 
-    assert_eq!(call(handle.port, "GET", "/wrong/v1/models", &[]).0, 404);
+    assert_eq!(call(handle.port, "GET", "/wrong/alpha/v1", &[]).0, 404);
     assert_eq!(
-        call(handle.port, "GET", &format!("{prefix}/v1/a"), &[]).0,
+        call(
+            handle.port,
+            "GET",
+            &route_path(&handle, "alpha", "/v1/a"),
+            &[]
+        )
+        .0,
         200
     );
     assert_eq!(
-        call(handle.port, "GET", &format!("{prefix}/v1/b"), &[]).0,
+        call(
+            handle.port,
+            "GET",
+            &route_path(&handle, "alpha", "/v1/b"),
+            &[]
+        )
+        .0,
         429
     );
     assert_eq!(log.lock().unwrap().len(), 1);
 }
 
 #[test]
+fn request_and_response_size_limits_are_route_specific() {
+    let (upstream, log) = upstream();
+    let mut route = granted_route("alpha", &upstream, ALPHA_KEY);
+    route.policy.max_request_bytes = 4;
+    route.policy.max_response_bytes = 100;
+    let handle = test_proxy(vec![route]);
+
+    assert_eq!(
+        call_body(
+            handle.port,
+            "POST",
+            &route_path(&handle, "alpha", "/upload"),
+            &[],
+            b"12345",
+        )
+        .0,
+        413
+    );
+    assert!(log.lock().unwrap().is_empty());
+
+    assert_eq!(
+        call(
+            handle.port,
+            "GET",
+            &route_path(&handle, "alpha", "/large-response"),
+            &[]
+        )
+        .0,
+        502
+    );
+    assert_eq!(log.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn expired_route_fails_before_forwarding() {
+    let (upstream, log) = upstream();
+    let mut route = granted_route("alpha", &upstream, ALPHA_KEY);
+    route.policy.session_expiry_seconds = 1;
+    let handle = test_proxy(vec![route]);
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+    assert_eq!(
+        call(
+            handle.port,
+            "GET",
+            &route_path(&handle, "alpha", "/v1/models"),
+            &[]
+        )
+        .0,
+        401
+    );
+    assert!(log.lock().unwrap().is_empty());
+}
+
+#[test]
 fn rejected_body_is_drained_before_keep_alive_reuse() {
     let (upstream, log) = upstream();
-    let (handle, prefix) = test_proxy(&upstream, None);
-    let body = "x".repeat(2048);
+    let handle = test_proxy(vec![granted_route("alpha", &upstream, ALPHA_KEY)]);
+    let valid = route_path(&handle, "alpha", "/v1/models");
+    let body = "x".repeat(2_048);
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", handle.port)).unwrap();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -209,7 +345,7 @@ fn rejected_body_is_drained_before_keep_alive_reuse() {
 
     write!(
         stream,
-        "POST /wrong/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}GET {prefix}/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        "POST /wrong/alpha/v1 HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}GET {valid} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
         body.len(),
         body
     )

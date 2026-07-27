@@ -1,29 +1,50 @@
-use crate::config::ALLOWED_METHODS;
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use crate::grant::{GrantedRoute, TrustedGrant};
+use crate::policy::{validate_path, RoutePolicy, SecretValue};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
-use rand::distributions::Alphanumeric;
-use rand::Rng;
+use rand::rngs::OsRng;
+use rand::RngCore;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const MAX_BODY: u64 = 16 << 20;
-const MAX_IN_FLIGHT: usize = 16;
+const MAX_SESSION_IN_FLIGHT: usize = 32;
 const FORWARD_HEADERS: &[&str] = &["content-type", "accept"];
 
-/// The only destination and credential authorized for a session.
-pub struct Route {
-    pub upstream: String,
-    pub key: String,
+pub type Denied = (u16, &'static str);
+
+struct ActiveRoute {
+    policy: RoutePolicy,
+    base_url: String,
+    credential: SecretValue,
+    accepted: Arc<AtomicU64>,
+    active: Arc<AtomicUsize>,
+    expires_at: Instant,
 }
 
-/// The listener exists only while its session handle exists.
+struct Session {
+    routes: BTreeMap<String, Arc<ActiveRoute>>,
+    reflection_patterns: Vec<Vec<u8>>,
+    active: Arc<AtomicUsize>,
+}
+
+/// The listener and its route-bound token exist only while this handle exists.
 pub struct Handle {
     pub port: u16,
     pub token: String,
     pub seen: Arc<AtomicU64>,
+    route_seen: BTreeMap<String, Arc<AtomicU64>>,
     server: Arc<tiny_http::Server>,
+}
+
+impl Handle {
+    pub fn route_seen(&self, route_id: &str) -> Option<u64> {
+        self.route_seen
+            .get(route_id)
+            .map(|value| value.load(Ordering::SeqCst))
+    }
 }
 
 impl Drop for Handle {
@@ -32,96 +53,38 @@ impl Drop for Handle {
     }
 }
 
-pub type Denied = (u16, &'static str);
-
-fn random_token() -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect()
-}
-
-fn equal_constant_time(left: &str, right: &str) -> bool {
-    let (left, right) = (left.as_bytes(), right.as_bytes());
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
-            == 0
-}
-
-/// Resolve an origin-form request beneath the unguessable session prefix.
-/// The destination is always derived from the trusted parent-owned route.
-pub fn resolve(url: &str, token: &str, method: &str, route: &Route) -> Result<String, Denied> {
-    if !url.starts_with('/') || url.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
-        return Err((400, "request target is not valid origin-form"));
-    }
-    let (path, query) = match url.split_once('?') {
-        Some((path, query)) => (path, Some(query)),
-        None => (url, None),
-    };
-    if path.contains(['\\', '%', '#']) {
-        return Err((400, "encoded or non-normalized path"));
-    }
-
-    let mut segments = path.splitn(3, '/');
-    if segments.next() != Some("") {
-        return Err((400, "non-normalized path"));
-    }
-    if segments
-        .next()
-        .is_none_or(|candidate| !equal_constant_time(candidate, token))
-    {
-        return Err((404, "not found"));
-    }
-    let application_path = segments
-        .next()
-        .ok_or((400, "application path is missing"))?;
-    let path_segments: Vec<_> = application_path.split('/').collect();
-    if path_segments.iter().enumerate().any(|(index, segment)| {
-        *segment == "."
-            || *segment == ".."
-            || (segment.is_empty() && path_segments.len() > 1 && index + 1 != path_segments.len())
-    }) {
-        return Err((400, "non-normalized path"));
-    }
-    if !ALLOWED_METHODS.contains(&method) {
-        return Err((405, "method is not allowed"));
-    }
-
-    let mut target = format!(
-        "{}/{}",
-        route.upstream.trim_end_matches('/'),
-        application_path
-    );
-    if let Some(query) = query {
-        target.push('?');
-        target.push_str(query);
-    }
-    Ok(target)
-}
-
-struct InFlight(Arc<AtomicUsize>);
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-pub fn spawn(route: Route, max_requests: Option<u64>) -> std::io::Result<Handle> {
+pub fn spawn(grant: TrustedGrant) -> Result<Handle, String> {
+    grant.validate()?;
     let server = Arc::new(
         tiny_http::Server::http("127.0.0.1:0")
-            .map_err(|error| std::io::Error::other(error.to_string()))?,
+            .map_err(|error| format!("binding loopback proxy: {error}"))?,
     );
-    let port = server.server_addr().to_ip().expect("socket ip").port();
-    let token = Arc::new(random_token());
-    let public_token = token.to_string();
-    let route = Arc::new(route);
+    let port = server
+        .server_addr()
+        .to_ip()
+        .ok_or("loopback proxy did not bind an IP socket")?
+        .port();
+    let token = random_token();
     let seen = Arc::new(AtomicU64::new(0));
     let active = Arc::new(AtomicUsize::new(0));
+
+    let mut routes = BTreeMap::new();
+    let mut route_seen = BTreeMap::new();
+    let mut reflection_patterns = Vec::new();
+    for route in grant.routes {
+        add_reflection_patterns(&mut reflection_patterns, route.credential.expose());
+        let (id, active_route) = activate_route(route)?;
+        route_seen.insert(id.clone(), active_route.accepted.clone());
+        routes.insert(id, Arc::new(active_route));
+    }
+    reflection_patterns.sort();
+    reflection_patterns.dedup();
+
+    let session = Arc::new(Session {
+        routes,
+        reflection_patterns,
+        active,
+    });
     let agent = Arc::new(
         ureq::AgentBuilder::new()
             .try_proxy_from_env(false)
@@ -129,81 +92,186 @@ pub fn spawn(route: Route, max_requests: Option<u64>) -> std::io::Result<Handle>
             .timeout(Duration::from_secs(120))
             .build(),
     );
+    let private_token = Arc::new(token.clone());
 
     let listener = server.clone();
     let accepted = seen.clone();
     std::thread::spawn(move || {
         while let Ok(request) = listener.recv() {
-            if active.fetch_add(1, Ordering::SeqCst) >= MAX_IN_FLIGHT {
-                active.fetch_sub(1, Ordering::SeqCst);
-                respond_error(request, 503, "local proxy concurrency limit reached");
-                continue;
-            }
-            let guard = InFlight(active.clone());
-            let route = route.clone();
-            let token = token.clone();
+            let method = request.method().as_str().to_string();
+            let resolved = match authorize(request.url(), &private_token, &method, &session) {
+                Ok(resolved) => resolved,
+                Err((code, message)) => {
+                    respond_error(request, code, message);
+                    continue;
+                }
+            };
+            let guard = match InFlight::reserve(
+                &session.active,
+                &resolved.route.active,
+                resolved.route.policy.max_concurrent_requests as usize,
+            ) {
+                Ok(guard) => guard,
+                Err((code, message)) => {
+                    respond_error(request, code, message);
+                    continue;
+                }
+            };
+
             let agent = agent.clone();
+            let session = session.clone();
             let accepted = accepted.clone();
             std::thread::spawn(move || {
                 let _guard = guard;
-                serve(request, &token, &route, &agent, &accepted, max_requests);
+                serve(request, resolved, &agent, &session, &accepted);
             });
         }
     });
 
     Ok(Handle {
         port,
-        token: public_token,
+        token,
         seen,
+        route_seen,
         server,
     })
 }
 
-fn reserve(counter: &AtomicU64, max: Option<u64>) -> Result<(), Denied> {
-    match max {
-        Some(max) => counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                (current < max).then_some(current + 1)
-            })
-            .map(|_| ())
-            .map_err(|_| (429, "session request budget exhausted")),
-        None => {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+struct Resolved {
+    route: Arc<ActiveRoute>,
+    target: String,
+    method: String,
+}
+
+fn activate_route(route: GrantedRoute) -> Result<(String, ActiveRoute), String> {
+    let base_url = route.policy.origin.base_url()?;
+    let expires_at = Instant::now()
+        .checked_add(Duration::from_secs(route.policy.session_expiry_seconds))
+        .ok_or("route expiry is outside the supported clock range")?;
+    Ok((
+        route.id,
+        ActiveRoute {
+            policy: route.policy,
+            base_url,
+            credential: route.credential,
+            accepted: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            expires_at,
+        },
+    ))
+}
+
+fn authorize(url: &str, token: &str, method: &str, session: &Session) -> Result<Resolved, Denied> {
+    if !url.starts_with('/') || url.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        return Err((400, "request target is not valid origin-form"));
+    }
+    let (path, query) = match url.split_once('?') {
+        Some((path, query)) => {
+            if query
+                .bytes()
+                .any(|byte| byte < 0x20 || byte == 0x7f || byte == b'#')
+            {
+                return Err((400, "query contains invalid characters"));
+            }
+            (path, Some(query))
         }
+        None => (url, None),
+    };
+    if path.contains(['\\', '%', '#']) {
+        return Err((400, "encoded or non-normalized path"));
+    }
+
+    let mut segments = path[1..].splitn(3, '/');
+    let candidate = segments.next().unwrap_or_default();
+    if !equal_constant_time(candidate, token) {
+        return Err((404, "not found"));
+    }
+    let route_id = segments.next().ok_or((404, "not found"))?;
+    let route = session
+        .routes
+        .get(route_id)
+        .cloned()
+        .ok_or((404, "not found"))?;
+    if Instant::now() >= route.expires_at {
+        return Err((401, "session route has expired"));
+    }
+    if !route
+        .policy
+        .allowed_methods
+        .iter()
+        .any(|allowed| allowed == method)
+    {
+        return Err((405, "method is not allowed for this route"));
+    }
+
+    let application_path = match segments.next() {
+        Some("") | None => "/".to_string(),
+        Some(value) => format!("/{value}"),
+    };
+    validate_path(&application_path).map_err(|_| (400, "non-normalized application path"))?;
+    if !route.policy.allows_path(&application_path) {
+        return Err((403, "path is not allowed for this route"));
+    }
+
+    let mut target = format!("{}{}", route.base_url, application_path);
+    if let Some(query) = query {
+        target.push('?');
+        target.push_str(query);
+    }
+    Ok(Resolved {
+        route,
+        target,
+        method: method.to_string(),
+    })
+}
+
+struct InFlight {
+    session: Arc<AtomicUsize>,
+    route: Arc<AtomicUsize>,
+}
+
+impl InFlight {
+    fn reserve(
+        session: &Arc<AtomicUsize>,
+        route: &Arc<AtomicUsize>,
+        route_maximum: usize,
+    ) -> Result<Self, Denied> {
+        if !try_reserve(session, MAX_SESSION_IN_FLIGHT) {
+            return Err((503, "local proxy concurrency limit reached"));
+        }
+        if !try_reserve(route, route_maximum) {
+            session.fetch_sub(1, Ordering::SeqCst);
+            return Err((503, "route concurrency limit reached"));
+        }
+        Ok(Self {
+            session: session.clone(),
+            route: route.clone(),
+        })
     }
 }
 
-fn read_limited(reader: impl Read) -> Result<Vec<u8>, ()> {
-    let mut data = Vec::new();
-    reader
-        .take(MAX_BODY + 1)
-        .read_to_end(&mut data)
-        .map_err(|_| ())?;
-    if data.len() as u64 > MAX_BODY {
-        return Err(());
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.route.fetch_sub(1, Ordering::SeqCst);
+        self.session.fetch_sub(1, Ordering::SeqCst);
     }
-    Ok(data)
+}
+
+fn try_reserve(counter: &AtomicUsize, maximum: usize) -> bool {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            (current < maximum).then_some(current + 1)
+        })
+        .is_ok()
 }
 
 fn serve(
     mut request: tiny_http::Request,
-    token: &str,
-    route: &Route,
+    resolved: Resolved,
     agent: &ureq::Agent,
-    accepted: &AtomicU64,
-    max_requests: Option<u64>,
+    session: &Session,
+    total_accepted: &AtomicU64,
 ) {
-    let url = request.url().to_string();
-    let method = request.method().as_str().to_string();
-    let target = match resolve(&url, token, &method, route) {
-        Ok(target) => target,
-        Err((code, message)) => {
-            respond_error(request, code, message);
-            return;
-        }
-    };
-
     let headers: Vec<(String, String)> = request
         .headers()
         .iter()
@@ -222,19 +290,35 @@ fn serve(
         return;
     }
 
-    let body = match read_limited(request.as_reader()) {
+    let body = match read_limited(request.as_reader(), resolved.route.policy.max_request_bytes) {
         Ok(body) => body,
         Err(()) => {
             respond_error(request, 413, "request body is too large or unreadable");
             return;
         }
     };
-    if let Err((code, message)) = reserve(accepted, max_requests) {
-        respond_error(request, code, message);
+    if Instant::now() >= resolved.route.expires_at {
+        respond_error(request, 401, "session route has expired");
         return;
     }
+    if reserve_budget(
+        &resolved.route.accepted,
+        resolved.route.policy.request_count_budget,
+    )
+    .is_err()
+    {
+        respond_error(request, 429, "route request budget exhausted");
+        return;
+    }
+    total_accepted.fetch_add(1, Ordering::SeqCst);
 
-    match forward(route, &target, &method, &headers, body, agent) {
+    match forward(
+        &resolved,
+        &headers,
+        body,
+        agent,
+        &session.reflection_patterns,
+    ) {
         Ok((code, content_type, data)) => {
             let header = tiny_http::Header::from_bytes("content-type", content_type).unwrap();
             let _ = request.respond(
@@ -247,21 +331,44 @@ fn serve(
     }
 }
 
+fn reserve_budget(counter: &AtomicU64, maximum: u64) -> Result<(), ()> {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            (current < maximum).then_some(current + 1)
+        })
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
+fn read_limited(reader: impl Read, maximum: u64) -> Result<Vec<u8>, ()> {
+    let mut data = Vec::new();
+    reader
+        .take(maximum + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| ())?;
+    if data.len() as u64 > maximum {
+        return Err(());
+    }
+    Ok(data)
+}
+
 fn forward(
-    route: &Route,
-    target: &str,
-    method: &str,
+    resolved: &Resolved,
     headers: &[(String, String)],
     body: Vec<u8>,
     agent: &ureq::Agent,
+    reflection_patterns: &[Vec<u8>],
 ) -> Result<(u16, &'static str, Vec<u8>), Denied> {
-    let mut upstream = agent.request(method, target);
+    let mut upstream = agent.request(&resolved.method, &resolved.target);
     for (name, value) in headers {
         if FORWARD_HEADERS.contains(&name.as_str()) {
             upstream = upstream.set(name, value);
         }
     }
-    upstream = upstream.set("authorization", &format!("Bearer {}", route.key));
+    upstream = upstream.set(
+        "authorization",
+        &format!("Bearer {}", resolved.route.credential.expose()),
+    );
 
     let response = match if body.is_empty() {
         upstream.call()
@@ -274,10 +381,13 @@ fn forward(
     };
     let status = response.status();
     let content_type = canonical_content_type(response.header("content-type"));
-    let data = read_limited(response.into_reader())
-        .map_err(|_| (502, "upstream response is too large or unreadable"))?;
-    if contains_secret(&data, &route.key) {
-        return Err((502, "upstream response contained the credential"));
+    let data = read_limited(
+        response.into_reader(),
+        resolved.route.policy.max_response_bytes,
+    )
+    .map_err(|_| (502, "upstream response is too large or unreadable"))?;
+    if contains_reflection(&data, reflection_patterns) {
+        return Err((502, "upstream response contained a session credential"));
     }
     Ok((status, content_type, data))
 }
@@ -286,28 +396,47 @@ fn canonical_content_type(value: Option<&str>) -> &'static str {
     let value = value.unwrap_or_default().to_ascii_lowercase();
     if value.starts_with("application/json") {
         "application/json"
-    } else if value.starts_with("text/event-stream") {
-        "text/event-stream"
+    } else if value.starts_with("text/plain") {
+        "text/plain; charset=utf-8"
     } else {
         "application/octet-stream"
     }
 }
 
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+fn add_reflection_patterns(patterns: &mut Vec<Vec<u8>>, credential: &str) {
+    let bearer = format!("Bearer {credential}");
+    for secret in [credential, bearer.as_str()] {
+        patterns.push(secret.as_bytes().to_vec());
+        patterns.push(STANDARD.encode(secret).into_bytes());
+        patterns.push(STANDARD_NO_PAD.encode(secret).into_bytes());
+        patterns.push(URL_SAFE.encode(secret).into_bytes());
+        patterns.push(URL_SAFE_NO_PAD.encode(secret).into_bytes());
+    }
 }
 
-fn contains_secret(data: &[u8], key: &str) -> bool {
-    let bearer = format!("Bearer {key}");
-    [key, bearer.as_str()].iter().any(|secret| {
-        contains_bytes(data, secret.as_bytes())
-            || contains_bytes(data, STANDARD.encode(secret).as_bytes())
-            || contains_bytes(data, STANDARD_NO_PAD.encode(secret).as_bytes())
-            || contains_bytes(data, URL_SAFE_NO_PAD.encode(secret).as_bytes())
+fn contains_reflection(data: &[u8], patterns: &[Vec<u8>]) -> bool {
+    patterns.iter().any(|pattern| {
+        !pattern.is_empty()
+            && data
+                .windows(pattern.len())
+                .any(|window| window == pattern.as_slice())
     })
+}
+
+fn random_token() -> String {
+    let mut token = [0u8; 32];
+    OsRng.fill_bytes(&mut token);
+    URL_SAFE_NO_PAD.encode(token)
+}
+
+fn equal_constant_time(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
 }
 
 fn respond_error(request: tiny_http::Request, code: u16, message: &'static str) {

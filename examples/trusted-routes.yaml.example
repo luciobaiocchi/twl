@@ -1,0 +1,31 @@
+# Trusted input: keep the populated copy outside the repository and agent
+# filesystem. Seal it into a vault, then remove it according to your local
+# secret-handling policy. This checked-in value is only a placeholder.
+version: 1
+credentials:
+  application-key: replace-with-narrow-development-token
+routes:
+  application:
+    origin:
+      scheme: https
+      hostname: api.example.com
+      port: 443
+    credential: application-key
+    authentication:
+      location: header
+      name: Authorization
+      format: bearer
+    allowed_methods:
+      - GET
+      - POST
+      - PUT
+      - PATCH
+      - DELETE
+    # Omit path_prefixes to allow every normalized path on this exact origin.
+    path_prefixes:
+      - /v1
+    request_count_budget: 20
+    max_request_bytes: 1048576
+    max_response_bytes: 4194304
+    max_concurrent_requests: 4
+    session_expiry_seconds: 900

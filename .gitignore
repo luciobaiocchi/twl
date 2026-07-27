@@ -4,3 +4,7 @@ __pycache__/
 .env
 *.env
 *.bak
+*.vault
+.towel/
+towel-session.json
+trusted-routes.yaml

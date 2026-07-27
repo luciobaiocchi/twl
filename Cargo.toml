@@ -3,7 +3,7 @@ name = "twl"
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.82"
-description = "Keep project credentials out of coding-agent processes"
+description = "Portable HTTP secrets broker for AI coding agents"
 license = "Apache-2.0"
 repository = "https://github.com/luciobaiocchi/twl"
 homepage = "https://luciobaiocchi.github.io/twl/"
@@ -17,14 +17,25 @@ name = "twl"
 path = "src/main.rs"
 
 [dependencies]
+argon2 = "0.5"
+# Argon2's password-hash dependency permits newer base64ct releases whose
+# Cargo/MSRV exceeds Towel's declared Rust 1.82 floor.
+base64ct = "=1.7.3"
+chacha20poly1305 = "0.10"
+# url/idna also permit a newer adapter stack whose Cargo/MSRV exceeds 1.82.
+idna_adapter = "=1.1.0"
+# serde_yaml_ng permits an edition-2024 indexmap release.
+indexmap = "=2.13.0"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serde_yaml_ng = "0.10"
 tiny_http = "0.12"
 ureq = "2"
 rand = "0.8"
-rpassword = "7"
+rpassword = "=7.4.0"
 base64 = "0.22"
 url = "2"
+zeroize = "=1.8.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

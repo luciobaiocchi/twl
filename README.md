@@ -1,98 +1,111 @@
 # Towel (`twl`)
 
-Towel keeps a project application's API key out of a coding agent's process.
-The application receives a fake `APP_API_KEY` and a session-local
-`APP_BASE_URL`; the separate Towel parent adds the real key only while
-forwarding requests to one upstream chosen at startup.
+Towel is a lightweight, portable HTTP secrets broker for AI coding agents. It
+keeps reusable provider credentials in a trusted process and injects them only
+into requests that match encrypted, destination-bound policies.
 
-Towel does **not** hide the agent's own Codex, OpenHands, or model-provider
-credential. It is not a persistent secret store.
+The agent and its applications receive fake credentials, loopback broker URLs,
+and a short-lived session token. They can exercise the API authority explicitly
+granted to that session, but Towel never gives them a reusable provider key.
 
 [Website](https://luciobaiocchi.github.io/twl/) ·
-[Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md) ·
-[Apache-2.0 license](LICENSE)
+[Security policy](SECURITY.md) · [Deployments](deploy/README.md) ·
+[Contributing](CONTRIBUTING.md) · [Apache-2.0 license](LICENSE)
 
-The name is a concise nod to Douglas Adams's famously indispensable towel:
-lightweight, unassuming, and useful in more situations than expected. Keep it
-beside the agent, put the dangerous credential behind it, and don't panic.
-Towel is an independent project and is not affiliated with Douglas Adams's
-estate or publishers.
+> Experimental security software: Towel has not been independently audited.
+> Use narrowly scoped, disposable development credentials while evaluating it.
 
-> Experimental security software: it has not been independently audited. Use
-> disposable or tightly limited credentials while evaluating it.
+## Why a separate broker process?
 
-## Current contract
+An out-of-process broker is a stronger secret-isolation boundary than
+in-process Python inside OpenHands. The reusable credentials live outside the
+agent's memory and privilege boundary; the trusted codebase is smaller; the
+broker is independent of the agent language and runtime; and the same core can
+be reused on a laptop, in Docker, and in Kubernetes. Compromise of OpenHands or
+one of its dependencies therefore does not automatically disclose the real
+credential.
 
-The intentionally small first version supports one project credential:
+That boundary is operationally more demanding: it adds IPC, lifecycle, and
+deployment work. Towel accepts that cost where secret isolation matters. It
+does not pretend that an in-process helper and a separately isolated broker
+offer the same protection.
 
-- `Authorization: Bearer <secret>` authentication;
-- an HTTPS upstream, with HTTP allowed only for loopback testing;
-- ordinary `GET`, `POST`, `PUT`, `PATCH`, and `DELETE` application paths;
-- an optional per-session request-count budget.
+## Security model
 
-The upstream and real credential are trusted parent inputs. Project YAML can
-only set the request budget, so an agent that edits the repository cannot
-redirect the real key.
-
-Towel prevents direct credential disclosure; it does not prevent the agent
-from using the local proxy to exercise the credential's API authority. Use a
-narrowly scoped, development-only key and a budget. It is also not a process or
-filesystem sandbox: other ambient secrets, sockets, and files remain the
-caller's responsibility.
-
-The proxy binds only to loopback, requires an unguessable session path, ignores
-client authentication and forwarding headers, never follows redirects, caps
-bodies at 16 MiB, and blocks accidental plaintext or base64 reflection of the
-real key. Responses are buffered, so streaming is not supported yet. At most
-16 requests are forwarded concurrently; excess requests fail with `503`.
-
-## Installation and release status
-
-Towel has not published its first public package yet. Until then, build it
-from source using the instructions below.
-
-The planned primary installation method is a Homebrew tap backed by prebuilt
-GitHub Release artifacts:
-
-```bash
-brew install luciobaiocchi/tap/twl
+```text
+trusted user / control plane
+        │ encrypted vault + explicit allow-route set
+        ▼
+  Towel process ── HTTPS + real Bearer key ──► fixed upstream A
+        │       └─ HTTPS + real Bearer key ──► fixed upstream B
+        │
+        └─ loopback URLs + fake keys + expiring token
+                                │
+                                ▼
+                         agent + application
 ```
 
-That command will become available with the first public release. The tap will
-select the appropriate macOS or Linux artifact and verify its checksum. macOS
-artifacts must be Developer ID-signed, hardened, and notarized; an ordinary
-`cargo install` binary cannot open a real macOS session.
+The encrypted vault contains both credential values and every policy field
+that controls where and how they may be used. Towel uses Argon2id for password
+derivation and XChaCha20-Poly1305 for authenticated encryption. Changing a
+destination, credential reference, injection policy, method, path, budget,
+size limit, concurrency limit, or expiry invalidates authentication of the
+vault.
 
-Cargo installation may be offered later as a Linux-oriented source-install
-option under the `twl` package name. It should not be advertised as the macOS
-installation path because locally compiled binaries lack the required
-distribution signature.
+The vault file is the primary portable storage mechanism on macOS, Linux, and
+containers. Towel does not depend on OS-specific keyring behavior; a keyring
+may later be offered only as an optional way to store or unlock the vault key.
 
-Prebuilt packages will not require Rust or Python. Python is used only by the
-example application and tests.
+Each route defines:
 
-### Runtime requirements
+- a unique route ID;
+- an exact scheme, hostname, and port (HTTPS, except loopback tests);
+- a credential reference and `Authorization: Bearer` injection policy;
+- allowed `GET`, `POST`, `PUT`, `PATCH`, and/or `DELETE` methods;
+- optional normalized path prefixes;
+- request-count, request-size, response-size, concurrency, and expiry limits.
 
-- The project application must use `APP_API_KEY` and `APP_BASE_URL`, or provide
-  a small adapter that maps them to its own configuration.
-- The current protocol supports one static Bearer credential and one HTTPS
-  upstream per session. HTTP is accepted only for loopback development.
-- The host must allow a loopback listener and outbound HTTPS connections.
-- On macOS, real sessions require the signed and hardened release binary.
-- On Linux, run the agent as an unprivileged user without `CAP_SYS_PTRACE`.
-  Running the agent as container root weakens the process boundary.
-- In containers, `twl`, the agent, and the project application must share a
-  network namespace so they can use the same loopback interface.
+At runtime Towel denies by default, binds a random 256-bit session token to the
+selected route set, binds natively to loopback, never accepts a destination
+from the client, never follows redirects, strips client authentication and
+forwarding headers, and injects a credential only at its configured location.
+Responses are buffered, size-limited, stripped to a safe content type, and
+blocked if they contain plaintext or standard/URL-safe base64 forms of any
+session credential.
 
-### Before the first public tag
+The real credentials are never placed by Towel in the agent environment,
+filesystem, process memory, command line, or inherited file descriptors. This
+claim depends on preserving the process/container boundary described below: an
+agent with host root, a shared PID namespace, `CAP_SYS_PTRACE`, the vault
+password, or equivalent access can defeat it.
 
-The release still requires making the repository public, verifying the first
-CI and dependency-audit runs, producing checksummed multi-architecture
-artifacts, macOS Developer ID signing and notarization, a Homebrew tap, and
-installation tests on clean machines. The intended first version is an
-explicitly experimental `v0.1.0-alpha.1`, not a stable security guarantee.
+## Supported scope
+
+The first version supports ordinary non-streaming HTTP requests and static
+Bearer authentication. HTTPS is required for real upstreams; HTTP is accepted
+only for loopback testing.
+
+Towel is the lightweight data-plane broker. It is not an enterprise identity
+or multi-tenant credential platform. Systems such as OpenHands may later
+provide identity, tenant authorization, credential lifecycle, rotation,
+revocation, auditing, and short-lived grants through the `GrantProvider`
+interface.
+
+Explicit non-goals for this version include:
+
+- generic TCP, database, SSH, or other non-HTTP protocols;
+- arbitrary authentication templates, API-key headers, AWS SigV4, or request
+  signing;
+- streaming responses;
+- applications that fundamentally require a raw local secret;
+- judging shell commands as a security boundary;
+- stopping an authorized agent from using the API authority it was granted;
+- hiding the agent's own Codex/OpenHands model login unless that provider is
+  separately integrated as an application route.
 
 ## Build and test
+
+Towel requires Rust 1.82 or newer until prebuilt packages are published.
 
 ```bash
 cargo build --locked
@@ -102,101 +115,139 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo build --release --locked
 ```
 
-Building from source requires Rust 1.82 or newer and a native build toolchain
-(Xcode Command Line Tools on macOS, or a C compiler and linker on Linux).
-
-On macOS, real-key mode requires a hardened binary:
+On macOS, operations that read real credentials (vault sealing and real
+sessions) require a signed hardened-runtime binary:
 
 ```bash
 scripts/build-macos.sh
 ```
 
-For distribution, set `TWL_CODESIGN_IDENTITY` to a stable signing identity.
-On Linux, Towel disables same-user process inspection before reading the
-credential. `twl doctor` reports whether the current binary can open a real
-session.
+Set `TWL_CODESIGN_IDENTITY` for a distributable build. On Linux, Towel disables
+same-user process inspection before opening the vault. `twl doctor` reports
+whether the current binary can open a protected session.
 
-## Safe local demo
+## Safe canary demo
 
-The demo uses a generated canary and a generated local service:
+The demo creates a generated credential and local upstream, then launches an
+ordinary application through the same grant and route-map implementation:
 
 ```bash
 ./target/debug/twl demo --config examples/towel.yaml -- \
   python3 examples/application_client.py
 ```
 
-The application succeeds while seeing only the fake key and local URL.
+No vault or real credential is used.
 
-## Run a project through an agent
+## Create an encrypted vault
 
-Start the disposable example service in one terminal:
+Copy [the trusted-route template](examples/trusted-routes.yaml.example) to a
+trusted location outside the repository, replace its placeholder credential
+and origin, then seal it:
 
 ```bash
-TWL_TEST_APPLICATION_KEY=third-party-test-key \
-  python3 examples/application_upstream.py
+./target/release/twl vault seal \
+  --input /secure/towel/trusted-routes.yaml \
+  --output /secure/towel/towel.vault
 ```
 
-Then start the agent through the hardened release binary:
+Towel prompts twice for a new password, refuses to overwrite an existing
+vault, and creates the encrypted file with mode `0600` on Unix. The plaintext
+source is not removed automatically. A trusted secret-producing process may
+instead pipe YAML with `--input -` so no plaintext route document is stored.
+
+For noninteractive native automation, connect a trusted producer directly to
+a dedicated descriptor:
+
+```bash
+./target/release/twl vault seal \
+  --input - --output /secure/towel/towel.vault \
+  --password-fd 3 3</secure/towel/unlock-password
+```
+
+The descriptor is marked close-on-exec, consumed, and closed. Container secret
+mounts can use `--password-file`; that file must be mounted only in the Towel
+container, never in the agent container.
+
+## Launch an agent natively
+
+The trusted launcher chooses the maximum route authority explicitly. A project
+configuration can select only a subset of this list and can only reduce limits:
 
 ```bash
 ./target/release/twl run \
+  --vault /secure/towel/towel.vault \
+  --allow-route application \
   --config examples/towel.yaml \
-  --upstream http://127.0.0.1:8765 \
   -- codex
 ```
 
-Towel reads `APP_API_KEY` through a hidden terminal prompt before launching
-Codex. Ask the agent to run:
-
-```bash
-python3 examples/application_client.py
-```
-
-The app receives a successful response, but both Codex and the app can see only
-a `twl-app-...` placeholder. The real test key exists only in the parent and
-in the outbound request received by the fixed service.
-
-Applications opt in by reading:
+For a one-route session, Towel preserves the simple application contract:
 
 ```text
-APP_API_KEY   fake value suitable for the application's key field
-APP_BASE_URL  local session URL used instead of the real service URL
+APP_API_KEY   unique fake value
+APP_BASE_URL  http://127.0.0.1:<port>/<session-token>/<route-id>
 ```
 
-## Noninteractive secret input
+Every session also receives `TWL_BROKER_URL`, `TWL_SESSION_TOKEN`, and one pair
+per route. Route IDs are uppercased and hyphens become underscores:
 
-A dedicated file descriptor keeps the secret separate from the child's
-terminal input. `twl` reads it, marks it close-on-exec, and closes it before
-launching the agent:
-
-```bash
-./target/release/twl run \
-  --upstream http://127.0.0.1:8765 \
-  --secret-fd 3 \
-  3< <(printf %s 'disposable-test-key') \
-  -- codex
+```text
+TWL_ROUTE_APPLICATION_URL
+TWL_ROUTE_APPLICATION_CREDENTIAL
 ```
 
-The literal is only for local testing. In production, connect FD 3 directly to
-a trusted secret-producing process. The descriptor number is explicit because
-the parent launcher owns descriptor allocation; `twl` cannot safely guess
-which inherited descriptor contains the secret.
+The application sends its ordinary request to the local URL. Client-provided
+authentication is discarded; Towel adds the real Bearer credential only after
+the token, route, method, path, expiry, size, budget, and concurrency checks
+pass.
 
-For simple deployment environments, `TWL_APPLICATION_API_KEY` and
-`TWL_APPLICATION_UPSTREAM` are also accepted as parent inputs. Towel removes
-them from the child environment and installs the fake application variables,
-but warns that parent environment values may be exposed by shell history,
-logs, crash reports, or process inspection before Towel hardens itself.
+## Low-authority repository configuration
 
-## Configuration
-
-Configuration is optional. A project file contains only low-authority session
-limits:
+Repository-controlled YAML may contain route references and reductions only:
 
 ```yaml
-budget:
+routes:
+  - application
+limits:
   max_requests: 5
+  max_request_bytes: 1048576
+  max_response_bytes: 2097152
+  max_concurrent_requests: 2
+  session_expiry_seconds: 300
 ```
 
-The credential and destination never belong in this file. Omit `--config` for
-an unlimited session.
+It cannot contain credentials, origins, credential references, or
+authentication policy. A route reference not present in the trusted
+`--allow-route` set fails closed.
+
+## Docker and Kubernetes
+
+`twl serve` creates the same isolated session without launching a child and
+writes an agent-visible JSON manifest containing only local URLs, fake
+credentials, and the expiring capability token. It never writes provider
+credentials or upstream destinations to that shared file.
+
+See [deploy/README.md](deploy/README.md) for Docker Compose and Kubernetes
+sidecar templates. The essential rules are separate PID and filesystem
+boundaries, no provider-vault or unlock mount in the agent, an unprivileged
+agent with all capabilities dropped (including `CAP_SYS_PTRACE`), a shared
+network namespace only where loopback requires it, and one Towel session per
+agent runtime or conversation.
+
+## Release status
+
+The planned first public build is an experimental `v0.1.0-alpha.1`. The
+intended installation path is a checksummed Homebrew release:
+
+```bash
+brew install luciobaiocchi/tap/twl
+```
+
+That command is not available until the first release. macOS artifacts must be
+Developer ID-signed, hardened, and notarized; ordinary `cargo install` builds
+cannot open protected macOS sessions.
+
+The name is a concise nod to Douglas Adams's famously indispensable towel:
+lightweight, unassuming, and useful in more situations than expected. Towel is
+an independent project and is not affiliated with Douglas Adams's estate or
+publishers.

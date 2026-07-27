@@ -1,0 +1,64 @@
+name: towel-sidecar-example
+
+services:
+  towel:
+    build:
+      context: ..
+    image: towel:local
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - serve
+      - --vault
+      - /run/secrets/towel_vault
+      - --password-file
+      - /run/secrets/towel_password
+      - --allow-route
+      - application
+      - --config
+      - /run/towel-private/towel.yaml
+      - --session-file
+      - /run/towel-session/session.json
+    volumes:
+      - ../examples/towel.yaml:/run/towel-private/towel.yaml:ro
+      - towel-session:/run/towel-session
+    secrets:
+      - towel_vault
+      - towel_password
+
+  agent:
+    image: ${TWL_AGENT_IMAGE:-python:3.13-slim}
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    network_mode: service:towel
+    depends_on:
+      towel:
+        condition: service_started
+    entrypoint:
+      - python3
+      - /opt/towel/session-entrypoint.py
+      - /run/towel-session/session.json
+    command:
+      - python3
+      - -c
+      - "import os; print('Towel session ready:', os.environ['APP_BASE_URL'])"
+    volumes:
+      - towel-session:/run/towel-session:ro
+      - ./session-entrypoint.py:/opt/towel/session-entrypoint.py:ro
+
+volumes:
+  towel-session: {}
+
+secrets:
+  towel_vault:
+    file: ${TWL_VAULT_PATH:?set TWL_VAULT_PATH to the encrypted vault}
+  towel_password:
+    file: ${TWL_PASSWORD_PATH:?set TWL_PASSWORD_PATH to a Towel-only password file}

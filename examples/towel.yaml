@@ -1,4 +1,7 @@
-# Project configuration is intentionally low-authority. The credential and
-# upstream are supplied directly to the trusted twl parent at startup.
-budget:
+# Project configuration can select only routes already authorized by the
+# trusted --allow-route flags and can only reduce encrypted vault limits.
+routes:
+  - application
+limits:
   max_requests: 5
+  session_expiry_seconds: 300

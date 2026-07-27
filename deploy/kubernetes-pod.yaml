@@ -1,0 +1,129 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: towel-project-config
+data:
+  towel.yaml: |
+    routes:
+      - application
+    limits:
+      max_requests: 20
+      max_request_bytes: 1048576
+      max_response_bytes: 4194304
+      max_concurrent_requests: 4
+      session_expiry_seconds: 900
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: coding-agent-with-towel
+  labels:
+    app.kubernetes.io/name: coding-agent
+    app.kubernetes.io/component: towel-session
+spec:
+  automountServiceAccountToken: false
+  shareProcessNamespace: false
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+
+  # Kubernetes-native sidecar: starts before the agent and remains alive for
+  # the Pod lifetime. Requires Kubernetes 1.29+; the feature is stable in 1.33+.
+  initContainers:
+    - name: towel
+      image: ghcr.io/luciobaiocchi/twl:replace-with-pinned-version
+      imagePullPolicy: IfNotPresent
+      restartPolicy: Always
+      args:
+        - serve
+        - --vault
+        - /run/towel-private/towel.vault
+        - --password-file
+        - /run/towel-unlock/password
+        - --allow-route
+        - application
+        - --config
+        - /run/towel-config/towel.yaml
+        - --session-file
+        - /run/towel-session/session.json
+      startupProbe:
+        exec:
+          command: ["/bin/sh", "-c", "test -s /run/towel-session/session.json"]
+        failureThreshold: 30
+        periodSeconds: 1
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: encrypted-vault
+          mountPath: /run/towel-private
+          readOnly: true
+        - name: vault-unlock
+          mountPath: /run/towel-unlock
+          readOnly: true
+        - name: project-config
+          mountPath: /run/towel-config
+          readOnly: true
+        - name: session
+          mountPath: /run/towel-session
+
+  containers:
+    - name: agent
+      image: ghcr.io/replace-me/coding-agent:replace-with-pinned-version
+      imagePullPolicy: IfNotPresent
+      command:
+        - python3
+        - /opt/towel/session-entrypoint.py
+        - /run/towel-session/session.json
+        - codex
+      workingDir: /workspace
+      env:
+        - name: TWL_SESSION_WAIT_SECONDS
+          value: "60"
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: session
+          mountPath: /run/towel-session
+          readOnly: true
+        - name: session-entrypoint
+          mountPath: /opt/towel
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace
+
+  volumes:
+    # Create these Secrets through the trusted control plane. Neither volume is
+    # mounted in the agent container.
+    - name: encrypted-vault
+      secret:
+        secretName: towel-encrypted-vault
+        defaultMode: 0440
+    - name: vault-unlock
+      secret:
+        secretName: towel-vault-unlock
+        defaultMode: 0440
+    - name: project-config
+      configMap:
+        name: towel-project-config
+    - name: session-entrypoint
+      configMap:
+        name: towel-session-entrypoint
+        defaultMode: 0555
+    - name: session
+      emptyDir:
+        medium: Memory
+        sizeLimit: 1Mi
+    - name: workspace
+      emptyDir:
+        sizeLimit: 1Gi

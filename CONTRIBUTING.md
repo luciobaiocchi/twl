@@ -10,8 +10,8 @@ framework.
 - Search existing issues before opening a new one.
 - For vulnerabilities, follow [SECURITY.md](SECURITY.md) and do not open a
   public issue containing exploit details.
-- Keep changes within Towel's scope: project HTTP credentials, not the agent's
-  own login, general secret storage, or a full process sandbox.
+- Keep changes within Towel's scope: destination-bound HTTP credentials, not a
+  general secret store, enterprise identity platform, or full process sandbox.
 
 ## Local setup
 
@@ -32,13 +32,18 @@ Cargo binaries intentionally fail closed.
 
 Changes must preserve these properties:
 
-- Real credentials never appear in child arguments, environment variables,
-  workspace configuration, logs, or error messages.
-- A credential is bound to the upstream selected by the trusted parent.
+- Real credentials never appear in agent arguments, environment variables,
+  filesystems, logs, errors, or inherited descriptors.
+- Credential values and destination/injection policies remain together inside
+  authenticated vault or trusted grant material.
+- A session token authorizes only an explicit subset of trusted routes.
 - Client authentication, host, and forwarding headers cannot override policy.
-- Redirects never carry credentials to another destination.
-- Secret descriptors are consumed and closed before the child starts.
-- Invalid requests fail before consuming the session request budget.
+- Redirects are never followed and their locations are not exposed.
+- Password descriptors are consumed and closed before the agent starts.
+- Route expiry, budgets, body limits, and concurrency fail closed before an
+  unauthorized request reaches an upstream.
+- Repository configuration can only select pre-authorized route references and
+  reduce trusted limits.
 
 Add a regression test for every security-relevant behavior change. Use only
 disposable canaries in tests and documentation.
