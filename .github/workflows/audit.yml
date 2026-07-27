@@ -1,13 +1,8 @@
 name: Dependency audit
 
 on:
-  push:
-    branches: [main]
-    paths: [Cargo.toml, Cargo.lock]
-  pull_request:
-    paths: [Cargo.toml, Cargo.lock]
-  schedule:
-    - cron: "23 6 * * 1"
+  # Manual dispatch requires repository write access. This keeps the slower
+  # advisory scan under the control of the maintainer or trusted collaborators.
   workflow_dispatch:
 
 permissions:
