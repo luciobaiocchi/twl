@@ -76,7 +76,7 @@ impl ProjectRepository for MacKeychainRepository {
                 return Err(StoreError::MalformedRecord);
             };
             let account_value = attributes
-                .find(unsafe { kSecAttrAccount })
+                .find(unsafe { kSecAttrAccount.cast::<std::ffi::c_void>() })
                 .ok_or(StoreError::MalformedRecord)?;
             // SAFETY: Security Framework owns this live dictionary value and the account
             // attribute is a CFString for the lifetime of `attributes`.
