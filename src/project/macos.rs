@@ -45,7 +45,7 @@ extern "C" {
         access: *mut SecAccessRef,
     ) -> i32;
     fn SecAccessCopyACLList(access: SecAccessRef, acls: *mut CFArrayRef) -> i32;
-    fn SecACLCopyAuthorizations(acl: SecAclRef, authorizations: *mut CFArrayRef) -> i32;
+    fn SecACLCopyAuthorizations(acl: SecAclRef) -> CFArrayRef;
     fn SecACLCopyContents(
         acl: SecAclRef,
         applications: *mut CFArrayRef,
@@ -153,11 +153,12 @@ fn verify_access_acls(access: SecAccessRef, executable: &Path) -> bool {
     eprintln!("ACL diagnostic: {count} ACL entries");
     for index in 0..count {
         let acl = unsafe { CFArrayGetValueAtIndex(acls, index) as SecAclRef };
-        let mut authorizations = ptr::null();
-        if acl.is_null()
-            || unsafe { SecACLCopyAuthorizations(acl, &mut authorizations) } != errSecSuccess
-            || authorizations.is_null()
-        {
+        let authorizations = if acl.is_null() {
+            ptr::null()
+        } else {
+            unsafe { SecACLCopyAuthorizations(acl) }
+        };
+        if authorizations.is_null() {
             unsafe { CFRelease(acls.cast()) };
             return false;
         }
