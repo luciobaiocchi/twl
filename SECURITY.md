@@ -23,17 +23,19 @@ experimental versions may require upgrading rather than receiving backports.
 
 ## Security boundary
 
-Towel is designed to keep one project HTTP credential out of a coding agent's
-process while allowing an application launched by that agent to use a local
-broker. It is not:
+Towel is designed to keep a named project's static Bearer credentials out of a
+coding agent's process while allowing applications launched by that agent to
+use a destination-bound local broker. Real credentials are currently macOS
+only. It is not:
 
 - a process, filesystem, or container sandbox;
-- a general secret store;
+- a portable or general secret store;
 - protection for the agent's own model-provider login;
 - protection against a malicious upstream, which necessarily receives the
   credential;
-- protection against a Linux child running as root or with `CAP_SYS_PTRACE`.
+- a restriction on use of API authority already granted for the session.
 
-The current version supports one static Bearer credential and one fixed HTTPS
-upstream per session. See the README for the complete operating assumptions
-and known limitations.
+One LocalAuthentication approval opens the complete project session. The child
+receives only per-route fake keys and loopback URLs; each real credential and
+exact HTTPS destination remain together in one trusted Keychain record. See the
+README for the complete operating assumptions and known limitations.
