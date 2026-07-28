@@ -1,28 +1,77 @@
 use crate::config::validate_upstream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fmt;
+
+mod repository;
+
+#[cfg(target_os = "macos")]
+mod macos;
+
+pub use repository::{
+    Action, AuthorizationError, ProjectRepository, ProjectService, ProjectServiceError, Revision,
+    SessionAuthorizer, StoreError, StoredProject,
+};
+
+#[cfg(target_os = "macos")]
+pub use macos::{open_project_service, MacProjectService};
 
 const FORMAT_VERSION: u32 = 1;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelError {
+    InvalidIdentifier,
+    InvalidEnvironment,
+    InvalidBaseUrl,
+    InvalidBearer,
+    UnsupportedVersion,
+    EmptyRoutes,
+    DuplicateRoute,
+    DuplicateEnvironment,
+    MalformedPayload,
+    Serialization,
+}
+
+impl fmt::Display for ModelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidIdentifier => "name must be a 1-64 character identifier",
+            Self::InvalidEnvironment => "invalid or reserved environment variable name",
+            Self::InvalidBaseUrl => "base URL must be canonical HTTPS without control characters",
+            Self::InvalidBearer => "API key is not a valid Bearer value",
+            Self::UnsupportedVersion => "unsupported project format version",
+            Self::EmptyRoutes => "a project must contain at least one route",
+            Self::DuplicateRoute => "duplicate route name",
+            Self::DuplicateEnvironment => "duplicate environment variable name",
+            Self::MalformedPayload => "malformed Keychain project payload",
+            Self::Serialization => "serializing project failed",
+        })
+    }
+}
+
+impl std::error::Error for ModelError {}
+
+/// A validated, versioned collection of destination-bound credentials.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
     version: u32,
-    pub name: String,
-    pub routes: Vec<ProjectRoute>,
+    name: String,
+    routes: Vec<ProjectRoute>,
 }
 
+/// A validated route containing a real secret; `Debug` always redacts the key.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectRoute {
-    pub name: String,
-    pub base_url: String,
-    pub api_key: String,
-    pub api_key_env: String,
-    pub base_url_env: String,
+    name: String,
+    base_url: String,
+    api_key: String,
+    api_key_env: String,
+    base_url_env: String,
 }
 
-pub fn validate_identifier(value: &str, kind: &str) -> Result<(), String> {
+pub fn validate_identifier(value: &str, _kind: &str) -> Result<(), ModelError> {
     if value.is_empty()
         || value.len() > 64
         || !value
@@ -30,38 +79,43 @@ pub fn validate_identifier(value: &str, kind: &str) -> Result<(), String> {
             .enumerate()
             .all(|(index, byte)| byte.is_ascii_alphanumeric() || (index > 0 && byte == b'-'))
     {
-        return Err(format!(
-            "{kind} must be 1-64 ASCII letters, digits, or hyphens and start with a letter or digit"
-        ));
+        return Err(ModelError::InvalidIdentifier);
     }
     Ok(())
 }
 
-fn validate_env_name(value: &str, field: &str) -> Result<(), String> {
+fn validate_env_name(value: &str) -> Result<(), ModelError> {
     let mut bytes = value.bytes();
     if value.len() > 128
         || bytes
             .next()
             .is_none_or(|byte| !(byte.is_ascii_alphabetic() || byte == b'_'))
         || bytes.any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
-    {
-        return Err(format!("{field} must be a valid environment variable name"));
-    }
-    if value == "PATH"
+        || value == "PATH"
         || value == "DBUS_SESSION_BUS_ADDRESS"
         || value.starts_with("TWL_")
         || value.starts_with("DYLD_")
         || matches!(value, "LD_PRELOAD" | "LD_LIBRARY_PATH")
     {
-        return Err(format!(
-            "{field} is reserved by Towel or the process runtime"
-        ));
+        return Err(ModelError::InvalidEnvironment);
     }
     Ok(())
 }
 
-impl std::fmt::Debug for Project {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+fn canonical_base_url(value: &str) -> Result<String, ModelError> {
+    if value.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        return Err(ModelError::InvalidBaseUrl);
+    }
+    let canonical = validate_upstream(value).map_err(|_| ModelError::InvalidBaseUrl)?;
+    if url::Url::parse(&canonical).is_ok_and(|parsed| parsed.scheme() == "https") {
+        Ok(canonical)
+    } else {
+        Err(ModelError::InvalidBaseUrl)
+    }
+}
+
+impl fmt::Debug for Project {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Project")
             .field("version", &self.version)
@@ -71,8 +125,8 @@ impl std::fmt::Debug for Project {
     }
 }
 
-impl std::fmt::Debug for ProjectRoute {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ProjectRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProjectRoute")
             .field("name", &self.name)
@@ -85,10 +139,7 @@ impl std::fmt::Debug for ProjectRoute {
 }
 
 impl Project {
-    pub fn new(name: String, mut routes: Vec<ProjectRoute>) -> Result<Self, String> {
-        for route in &mut routes {
-            route.canonicalize()?;
-        }
+    pub fn new(name: String, routes: Vec<ProjectRoute>) -> Result<Self, ModelError> {
         let project = Self {
             version: FORMAT_VERSION,
             name,
@@ -98,50 +149,55 @@ impl Project {
         Ok(project)
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn routes(&self) -> &[ProjectRoute] {
+        &self.routes
+    }
+
+    pub fn into_routes(self) -> Vec<ProjectRoute> {
+        self.routes
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
         if self.version != FORMAT_VERSION {
-            return Err(format!(
-                "unsupported project format version: {}",
-                self.version
-            ));
+            return Err(ModelError::UnsupportedVersion);
         }
         validate_identifier(&self.name, "project name")?;
         if self.routes.is_empty() {
-            return Err("a project must contain at least one route".into());
+            return Err(ModelError::EmptyRoutes);
         }
-
         let mut route_names = HashSet::new();
         let mut env_names = HashSet::new();
         for route in &self.routes {
-            validate_identifier(&route.name, "route name")?;
-            if !route_names.insert(route.name.as_str()) {
-                return Err(format!("duplicate route name: {}", route.name));
-            }
             route.validate()?;
-            for name in [&route.api_key_env, &route.base_url_env] {
-                if !env_names.insert(name.as_str()) {
-                    return Err(format!("duplicate environment variable name: {name}"));
+            if !route_names.insert(route.name()) {
+                return Err(ModelError::DuplicateRoute);
+            }
+            for name in [route.api_key_env(), route.base_url_env()] {
+                if !env_names.insert(name) {
+                    return Err(ModelError::DuplicateEnvironment);
                 }
             }
         }
         Ok(())
     }
 
-    pub fn encode(&self) -> Result<Vec<u8>, String> {
+    pub fn encode(&self) -> Result<Vec<u8>, ModelError> {
         self.validate()?;
         serde_yaml_ng::to_string(self)
             .map(String::into_bytes)
-            .map_err(|_| "serializing project failed".into())
+            .map_err(|_| ModelError::Serialization)
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        let raw = std::str::from_utf8(bytes).map_err(|_| "malformed Keychain project payload")?;
-        let project: Self =
-            serde_yaml_ng::from_str(raw).map_err(|_| "malformed Keychain project payload")?;
-        project
-            .validate()
-            .map_err(|_| "malformed Keychain project payload")?;
-        Ok(project)
+    pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
+        let decoded = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|raw| serde_yaml_ng::from_str::<Self>(raw).ok())
+            .filter(|project| project.validate().is_ok());
+        decoded.ok_or(ModelError::MalformedPayload)
     }
 
     pub fn description(&self) -> String {
@@ -157,42 +213,51 @@ impl Project {
 }
 
 impl ProjectRoute {
-    fn canonicalize(&mut self) -> Result<(), String> {
-        if self
-            .base_url
-            .bytes()
-            .any(|byte| byte < 0x20 || byte == 0x7f)
-        {
-            return Err(format!(
-                "route {} base URL contains control characters",
-                self.name
-            ));
-        }
-        let canonical = validate_upstream(&self.base_url)?;
-        if url::Url::parse(&canonical).is_ok_and(|parsed| parsed.scheme() != "https") {
-            return Err(format!("route {} base URL must use HTTPS", self.name));
-        }
-        self.base_url = canonical;
-        Ok(())
+    pub fn new(
+        name: String,
+        base_url: String,
+        api_key: String,
+        api_key_env: String,
+        base_url_env: String,
+    ) -> Result<Self, ModelError> {
+        let route = Self {
+            name,
+            base_url: canonical_base_url(&base_url)?,
+            api_key,
+            api_key_env,
+            base_url_env,
+        };
+        route.validate()?;
+        Ok(route)
     }
 
-    fn validate(&self) -> Result<(), String> {
-        if self
-            .base_url
-            .bytes()
-            .any(|byte| byte < 0x20 || byte == 0x7f)
-        {
-            return Err(format!(
-                "route {} base URL contains control characters",
-                self.name
-            ));
-        }
-        let canonical = validate_upstream(&self.base_url)?;
-        if canonical != self.base_url {
-            return Err(format!("route {} base URL is not canonical", self.name));
-        }
-        if url::Url::parse(&canonical).is_ok_and(|parsed| parsed.scheme() != "https") {
-            return Err(format!("route {} base URL must use HTTPS", self.name));
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+    pub fn api_key_env(&self) -> &str {
+        &self.api_key_env
+    }
+    pub fn base_url_env(&self) -> &str {
+        &self.base_url_env
+    }
+
+    pub fn into_parts(self) -> (String, String, String, String, String) {
+        (
+            self.name,
+            self.base_url,
+            self.api_key,
+            self.api_key_env,
+            self.base_url_env,
+        )
+    }
+
+    fn validate(&self) -> Result<(), ModelError> {
+        validate_identifier(&self.name, "route name")?;
+        if canonical_base_url(&self.base_url)? != self.base_url {
+            return Err(ModelError::InvalidBaseUrl);
         }
         let unpadded = self.api_key.trim_end_matches('=');
         if unpadded.is_empty()
@@ -200,325 +265,50 @@ impl ProjectRoute {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"-._~+/".contains(&byte))
         {
-            return Err(format!(
-                "route {} API key is not a valid Bearer value",
-                self.name
-            ));
+            return Err(ModelError::InvalidBearer);
         }
-        validate_env_name(&self.api_key_env, "API-key environment variable")?;
-        validate_env_name(&self.base_url_env, "base-URL environment variable")?;
+        validate_env_name(&self.api_key_env)?;
+        validate_env_name(&self.base_url_env)?;
         if self.api_key_env == self.base_url_env {
-            return Err(format!(
-                "route {} uses the same environment variable twice",
-                self.name
-            ));
+            return Err(ModelError::DuplicateEnvironment);
         }
         Ok(())
     }
 }
 
-pub trait ProjectStore {
-    fn list(&self) -> Result<Vec<String>, String>;
-    fn get(&self, name: &str) -> Result<Project, String>;
-    fn create(&self, project: &Project) -> Result<(), String>;
-    fn replace(&self, project: &Project) -> Result<(), String>;
-    fn delete(&self, name: &str) -> Result<(), String>;
-}
-
-pub struct MacKeychainProjectStore;
-
-impl MacKeychainProjectStore {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for MacKeychainProjectStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(target_os = "macos")]
-mod mac_store {
-    use super::*;
-    use crate::secret;
-    use core_foundation::base::TCFType;
-    use security_framework::base::Error;
-    use security_framework::item::{ItemClass, ItemSearchOptions, Limit, SearchResult};
-    use security_framework::os::macos::keychain::SecKeychain;
-    use security_framework::os::macos::keychain_item::SecKeychainItem;
-    use security_framework_sys::base::errSecSuccess;
-    use security_framework_sys::keychain_item::SecKeychainItemDelete;
-
-    const SERVICE: &str = "dev.towel.project";
-    const ITEM_NOT_FOUND: i32 = -25300;
-
-    fn account(name: &str) -> String {
-        format!("project-v1:{name}")
-    }
-
-    fn missing(error: &Error) -> bool {
-        error.code() == ITEM_NOT_FOUND
-    }
-
-    struct ScopedKeychainStore {
-        keychain: SecKeychain,
-    }
-
-    impl ScopedKeychainStore {
-        fn default() -> Result<Self, String> {
-            SecKeychain::default()
-                .map(|keychain| Self { keychain })
-                .map_err(|error| format!("opening the default Keychain: {error}"))
-        }
-
-        fn list(&self) -> Result<Vec<String>, String> {
-            let results = match ItemSearchOptions::new()
-                .keychains(std::slice::from_ref(&self.keychain))
-                .class(ItemClass::generic_password())
-                .service(SERVICE)
-                .load_attributes(true)
-                .limit(Limit::All)
-                .search()
-            {
-                Ok(results) => results,
-                Err(error) if missing(&error) => return Ok(Vec::new()),
-                Err(error) => return Err(format!("listing Keychain projects: {error}")),
-            };
-            let mut names = Vec::with_capacity(results.len());
-            for result in results {
-                let SearchResult::Dict(_) = result else {
-                    return Err("malformed Keychain project record".into());
-                };
-                let attributes = result
-                    .simplify_dict()
-                    .ok_or("malformed Keychain project record")?;
-                let name = attributes
-                    .get("acct")
-                    .and_then(|account| account.strip_prefix("project-v1:"))
-                    .ok_or("malformed Keychain project record")?;
-                validate_identifier(name, "project name")
-                    .map_err(|_| "malformed Keychain project record".to_string())?;
-                if names.iter().any(|existing| existing == name) {
-                    return Err("duplicate Keychain project records".into());
-                }
-                names.push(name.to_string());
-            }
-            names.sort();
-            Ok(names)
-        }
-
-        fn find(&self, name: &str) -> Result<(Project, SecKeychainItem), String> {
-            let (bytes, item) = self
-                .keychain
-                .find_generic_password(SERVICE, &account(name))
-                .map_err(|error| {
-                    if missing(&error) {
-                        format!("project not found: {name}")
-                    } else {
-                        format!("reading project from Keychain: {error}")
-                    }
-                })?;
-            let project = Project::decode(bytes.as_ref())?;
-            if project.name != name {
-                return Err("malformed Keychain project payload".into());
-            }
-            Ok((project, item))
-        }
-
-        fn get(&self, name: &str) -> Result<Project, String> {
-            self.find(name).map(|(project, _)| project)
-        }
-
-        fn create(&self, project: &Project) -> Result<(), String> {
-            self.keychain
-                .add_generic_password(SERVICE, &account(&project.name), &project.encode()?)
-                .map_err(|error| {
-                    if error.code() == -25299 {
-                        format!("project already exists: {}", project.name)
-                    } else {
-                        format!("writing project to Keychain: {error}")
-                    }
-                })
-        }
-
-        fn replace(&self, project: &Project) -> Result<(), String> {
-            let (_, mut item) = self.find(&project.name)?;
-            item.set_password(&project.encode()?)
-                .map_err(|error| format!("replacing project in Keychain: {error}"))
-        }
-
-        fn delete(&self, name: &str) -> Result<(), String> {
-            let (_, item) = self.find(name)?;
-            let status = unsafe { SecKeychainItemDelete(item.as_concrete_TypeRef()) };
-            if status == errSecSuccess {
-                Ok(())
-            } else {
-                Err(format!(
-                    "deleting project from Keychain: {}",
-                    Error::from_code(status)
-                ))
-            }
-        }
-    }
-
-    impl ProjectStore for MacKeychainProjectStore {
-        fn list(&self) -> Result<Vec<String>, String> {
-            secret::authorize("list Towel projects")?;
-            ScopedKeychainStore::default()?.list()
-        }
-
-        fn get(&self, name: &str) -> Result<Project, String> {
-            validate_identifier(name, "project name")?;
-            secret::authorize(&format!("access Towel project {name}"))?;
-            ScopedKeychainStore::default()?.get(name)
-        }
-
-        fn create(&self, project: &Project) -> Result<(), String> {
-            project.validate()?;
-            secret::authorize(&format!("store Towel project {}", project.name))?;
-            ScopedKeychainStore::default()?.create(project)
-        }
-
-        fn replace(&self, project: &Project) -> Result<(), String> {
-            project.validate()?;
-            secret::authorize(&format!("replace Towel project {}", project.name))?;
-            ScopedKeychainStore::default()?.replace(project)
-        }
-
-        fn delete(&self, name: &str) -> Result<(), String> {
-            validate_identifier(name, "project name")?;
-            secret::authorize(&format!("delete Towel project {name}"))?;
-            ScopedKeychainStore::default()?.delete(name)
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use security_framework::os::macos::keychain::CreateOptions;
-        use std::path::PathBuf;
-
-        fn project(name: &str, key: &str) -> Project {
-            Project::new(
-                name.into(),
-                vec![ProjectRoute {
-                    name: "api".into(),
-                    base_url: "https://api.example.test/v1".into(),
-                    api_key: key.into(),
-                    api_key_env: "APP_API_KEY".into(),
-                    base_url_env: "APP_BASE_URL".into(),
-                }],
-            )
-            .unwrap()
-        }
-
-        fn test_store(label: &str) -> (PathBuf, ScopedKeychainStore) {
-            let path = std::env::temp_dir().join(format!(
-                "twl-{label}-{}-{}.keychain",
-                std::process::id(),
-                rand::random::<u64>()
-            ));
-            let keychain = CreateOptions::new()
-                .password("test-password")
-                .create(&path)
-                .unwrap();
-            (path, ScopedKeychainStore { keychain })
-        }
-
-        #[test]
-        fn operations_never_touch_matching_items_in_another_keychain() {
-            let (primary_path, primary) = test_store("primary");
-            let (other_path, other) = test_store("other");
-            let original = b"attacker-controlled";
-            other
-                .keychain
-                .add_generic_password(SERVICE, &account("app"), original)
-                .unwrap();
-
-            primary.create(&project("app", "first-key")).unwrap();
-            primary.replace(&project("app", "second-key")).unwrap();
-            primary.delete("app").unwrap();
-
-            let (other_value, _) = other
-                .keychain
-                .find_generic_password(SERVICE, &account("app"))
-                .unwrap();
-            assert_eq!(other_value.as_ref(), original);
-            drop((primary, other));
-            let _ = std::fs::remove_file(primary_path);
-            let _ = std::fs::remove_file(other_path);
-        }
-
-        #[test]
-        fn authoritative_records_survive_concurrent_creates_and_remain_manageable() {
-            let (path, store) = test_store("concurrent");
-            let keychain = store.keychain.clone();
-            let first = std::thread::spawn(move || {
-                ScopedKeychainStore { keychain }.create(&project("one", "first-key"))
-            });
-            let keychain = store.keychain.clone();
-            let second = std::thread::spawn(move || {
-                ScopedKeychainStore { keychain }.create(&project("two", "second-key"))
-            });
-            first.join().unwrap().unwrap();
-            second.join().unwrap().unwrap();
-
-            assert_eq!(store.list().unwrap(), ["one", "two"]);
-            store.replace(&project("one", "replacement-key")).unwrap();
-            store.delete("one").unwrap();
-            store.delete("two").unwrap();
-            assert!(store.list().unwrap().is_empty());
-            drop(store);
-            let _ = std::fs::remove_file(path);
-        }
-
-        #[test]
-        fn create_is_add_only_and_replace_never_creates() {
-            let (path, store) = test_store("semantics");
-            let candidate = project("app", "first-key");
-            store.create(&candidate).unwrap();
-            assert!(store
-                .create(&candidate)
-                .unwrap_err()
-                .contains("already exists"));
-            assert!(store
-                .replace(&project("missing", "second-key"))
-                .unwrap_err()
-                .contains("not found"));
-            store.delete("app").unwrap();
-            drop(store);
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
 #[cfg(not(target_os = "macos"))]
-impl ProjectStore for MacKeychainProjectStore {
-    fn list(&self) -> Result<Vec<String>, String> {
-        Err("project credentials are currently available only on macOS".into())
+pub struct UnsupportedAuthorizer;
+#[cfg(not(target_os = "macos"))]
+impl SessionAuthorizer for UnsupportedAuthorizer {
+    fn authorize(&self, _action: Action<'_>) -> Result<(), AuthorizationError> {
+        unreachable!()
     }
-
-    fn get(&self, name: &str) -> Result<Project, String> {
-        validate_identifier(name, "project name")?;
-        Err("project credentials are currently available only on macOS".into())
+}
+#[cfg(not(target_os = "macos"))]
+pub struct UnsupportedRepository;
+#[cfg(not(target_os = "macos"))]
+impl ProjectRepository for UnsupportedRepository {
+    fn list(&self) -> Result<Vec<String>, StoreError> {
+        Err(StoreError::UnsupportedPlatform)
     }
-
-    fn create(&self, project: &Project) -> Result<(), String> {
-        project.validate()?;
-        Err("project credentials are currently available only on macOS".into())
+    fn get(&self, _name: &str) -> Result<StoredProject, StoreError> {
+        Err(StoreError::UnsupportedPlatform)
     }
-
-    fn replace(&self, project: &Project) -> Result<(), String> {
-        project.validate()?;
-        Err("project credentials are currently available only on macOS".into())
+    fn create(&self, _project: &Project) -> Result<(), StoreError> {
+        Err(StoreError::UnsupportedPlatform)
     }
-
-    fn delete(&self, name: &str) -> Result<(), String> {
-        validate_identifier(name, "project name")?;
-        Err("project credentials are currently available only on macOS".into())
+    fn replace(&self, _expected: &Revision, _project: &Project) -> Result<(), StoreError> {
+        Err(StoreError::UnsupportedPlatform)
     }
+    fn delete(&self, _name: &str) -> Result<(), StoreError> {
+        Err(StoreError::UnsupportedPlatform)
+    }
+}
+#[cfg(not(target_os = "macos"))]
+pub type MacProjectService = ProjectService<UnsupportedAuthorizer, UnsupportedRepository>;
+#[cfg(not(target_os = "macos"))]
+pub fn open_project_service() -> Result<MacProjectService, StoreError> {
+    Err(StoreError::UnsupportedPlatform)
 }
 
 #[cfg(test)]
@@ -526,13 +316,14 @@ mod tests {
     use super::*;
 
     fn route(name: &str, key_env: &str, url_env: &str) -> ProjectRoute {
-        ProjectRoute {
-            name: name.into(),
-            base_url: "https://api.example.test/v1".into(),
-            api_key: format!("secret-{name}"),
-            api_key_env: key_env.into(),
-            base_url_env: url_env.into(),
-        }
+        ProjectRoute::new(
+            name.into(),
+            "https://api.example.test/v1".into(),
+            format!("secret-{name}"),
+            key_env.into(),
+            url_env.into(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -554,95 +345,116 @@ mod tests {
     #[test]
     fn names_are_identifiers_not_paths() {
         for invalid in ["", ".", "../app", "/tmp/app", "two words", "_hidden"] {
-            assert!(
-                validate_identifier(invalid, "project name").is_err(),
-                "{invalid}"
-            );
+            assert!(validate_identifier(invalid, "project name").is_err());
         }
         for valid in ["app", "my-app", "app2", "2-app"] {
-            assert!(
-                validate_identifier(valid, "project name").is_ok(),
-                "{valid}"
-            );
+            assert!(validate_identifier(valid, "project name").is_ok());
         }
     }
 
     #[test]
     fn duplicate_routes_and_environment_names_are_rejected() {
-        let duplicate_route = Project::new(
-            "app".into(),
-            vec![
-                route("api", "ONE_KEY", "ONE_URL"),
-                route("api", "TWO_KEY", "TWO_URL"),
-            ],
+        assert_eq!(
+            Project::new(
+                "app".into(),
+                vec![
+                    route("api", "ONE_KEY", "ONE_URL"),
+                    route("api", "TWO_KEY", "TWO_URL")
+                ]
+            )
+            .unwrap_err(),
+            ModelError::DuplicateRoute
         );
-        assert!(duplicate_route.unwrap_err().contains("duplicate route"));
-
-        let duplicate_env = Project::new(
-            "app".into(),
-            vec![
-                route("one", "SHARED", "ONE_URL"),
-                route("two", "TWO_KEY", "SHARED"),
-            ],
+        assert_eq!(
+            Project::new(
+                "app".into(),
+                vec![
+                    route("one", "SHARED", "ONE_URL"),
+                    route("two", "TWO_KEY", "SHARED")
+                ]
+            )
+            .unwrap_err(),
+            ModelError::DuplicateEnvironment
         );
-        assert!(duplicate_env.unwrap_err().contains("duplicate environment"));
     }
 
     #[test]
     fn unsafe_urls_and_keys_are_rejected_without_echoing_keys() {
-        let mut candidate = route("api", "API_KEY", "API_URL");
-        candidate.base_url = "http://not-loopback.example".into();
-        assert!(Project::new("app".into(), vec![candidate]).is_err());
-
-        let mut candidate = route("api", "API_KEY", "API_URL");
-        candidate.base_url = "http://127.0.0.1:8080".into();
-        assert!(Project::new("app".into(), vec![candidate]).is_err());
-
-        let secret = "do-not-print\nheader";
-        let mut candidate = route("api", "API_KEY", "API_URL");
-        candidate.api_key = secret.into();
-        let error = Project::new("app".into(), vec![candidate]).unwrap_err();
-        assert!(!error.contains(secret));
-        assert!(!error.contains("do-not-print"));
-
+        for url in ["http://not-loopback.example", "http://127.0.0.1:8080"] {
+            assert!(ProjectRoute::new(
+                "api".into(),
+                url.into(),
+                "key".into(),
+                "API_KEY".into(),
+                "API_URL".into()
+            )
+            .is_err());
+        }
         for invalid in ["   ", "café", "has space", "token:colon", "key\tvalue"] {
-            let mut candidate = route("api", "API_KEY", "API_URL");
-            candidate.api_key = invalid.into();
-            let error = Project::new("app".into(), vec![candidate]).unwrap_err();
-            assert!(!error.contains(invalid));
+            let error = ProjectRoute::new(
+                "api".into(),
+                "https://example.test".into(),
+                invalid.into(),
+                "API_KEY".into(),
+                "API_URL".into(),
+            )
+            .unwrap_err();
+            assert!(!error.to_string().contains(invalid));
         }
     }
 
     #[test]
     fn destinations_are_canonicalized_once_and_controls_are_rejected() {
-        let mut candidate = route("api", "API_KEY", "API_URL");
-        candidate.base_url = "HTTPS://EXAMPLE.TEST:443/safe/%2e%2e/admin".into();
-        let project = Project::new("app".into(), vec![candidate]).unwrap();
-        assert_eq!(project.routes[0].base_url, "https://example.test/admin");
-        assert!(project.description().contains("https://example.test/admin"));
-        assert!(project
-            .encode()
-            .unwrap()
-            .windows(26)
-            .any(|part| part == b"https://example.test/admin"));
-
-        let mut candidate = route("api", "API_KEY", "API_URL");
-        candidate.base_url = "https://éxample.test/路径".into();
-        let project = Project::new("app".into(), vec![candidate]).unwrap();
-        assert!(project.routes[0].base_url.contains("xn--"));
-        assert!(project.routes[0].base_url.contains("%E8%B7%AF%E5%BE%84"));
-
+        let route = ProjectRoute::new(
+            "api".into(),
+            "HTTPS://EXAMPLE.TEST:443/safe/%2e%2e/admin".into(),
+            "key".into(),
+            "API_KEY".into(),
+            "API_URL".into(),
+        )
+        .unwrap();
+        assert_eq!(route.base_url(), "https://example.test/admin");
+        let unicode = ProjectRoute::new(
+            "api".into(),
+            "https://éxample.test/路径".into(),
+            "key".into(),
+            "API_KEY".into(),
+            "API_URL".into(),
+        )
+        .unwrap();
+        assert!(
+            unicode.base_url().contains("xn--")
+                && unicode.base_url().contains("%E8%B7%AF%E5%BE%84")
+        );
         for control in ['\n', '\t', '\u{1b}'] {
-            let mut candidate = route("api", "API_KEY", "API_URL");
-            candidate.base_url = format!("https://example.test/{control}hidden");
-            assert!(Project::new("app".into(), vec![candidate]).is_err());
+            assert!(ProjectRoute::new(
+                "api".into(),
+                format!("https://example.test/{control}hidden"),
+                "key".into(),
+                "API_KEY".into(),
+                "API_URL".into()
+            )
+            .is_err());
         }
-
         let noncanonical = b"version: 1\nname: app\nroutes:\n- name: api\n  base_url: HTTPS://EXAMPLE.TEST:443/path\n  api_key: valid-key\n  api_key_env: API_KEY\n  base_url_env: API_URL\n";
         assert_eq!(
-            Project::decode(noncanonical).unwrap_err(),
-            "malformed Keychain project payload"
+            Project::decode(noncanonical),
+            Err(ModelError::MalformedPayload)
         );
+    }
+
+    #[test]
+    fn malformed_records_and_debug_are_secret_safe() {
+        for payload in [
+            b"not: [valid".as_slice(),
+            b"version: 99\nname: app\nroutes: []\n".as_slice(),
+            b"version: 1\nname: ../app\nroutes: []\n".as_slice(),
+        ] {
+            assert_eq!(Project::decode(payload), Err(ModelError::MalformedPayload));
+        }
+        let project = Project::new("app".into(), vec![route("api", "API_KEY", "API_URL")]).unwrap();
+        assert!(!project.description().contains("secret-api"));
+        assert!(!format!("{project:?}").contains("secret-api"));
     }
 
     #[test]
@@ -654,32 +466,16 @@ mod tests {
             "DYLD_INSERT_LIBRARIES",
             "LD_PRELOAD",
         ] {
-            assert!(Project::new("app".into(), vec![route("api", name, "API_URL")]).is_err());
-        }
-    }
-
-    #[test]
-    fn malformed_and_unknown_versions_fail_generically() {
-        for payload in [
-            b"not: [valid".as_slice(),
-            b"version: 99\nname: app\nroutes: []\n".as_slice(),
-            b"version: 1\nname: ../app\nroutes: []\n".as_slice(),
-        ] {
             assert_eq!(
-                Project::decode(payload).unwrap_err(),
-                "malformed Keychain project payload"
+                ProjectRoute::new(
+                    "api".into(),
+                    "https://example.test".into(),
+                    "key".into(),
+                    name.into(),
+                    "API_URL".into(),
+                ),
+                Err(ModelError::InvalidEnvironment)
             );
         }
-    }
-
-    #[test]
-    fn description_never_contains_secrets_or_fingerprints() {
-        let project = Project::new("app".into(), vec![route("api", "API_KEY", "API_URL")]).unwrap();
-        let shown = project.description();
-        assert!(shown.contains("https://api.example.test/v1"));
-        assert!(shown.contains("API_KEY"));
-        assert!(!shown.contains("secret-api"));
-        assert!(!shown.to_ascii_lowercase().contains("fingerprint"));
-        assert!(!format!("{project:?}").contains("secret-api"));
     }
 }
