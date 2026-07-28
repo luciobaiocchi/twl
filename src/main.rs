@@ -1,10 +1,15 @@
+use std::io::{self, Write};
 use std::process::exit;
-use twl::config::{Config, CHILD_BASE_URL_ENV, CHILD_SECRET_ENV, PARENT_SECRET_ENV};
-use twl::{child_command, prepare_demo, prepare_session, runtime, secret, Prepared};
+use twl::config::Config;
+use twl::project::{
+    validate_identifier, MacKeychainProjectStore, Project, ProjectRoute, ProjectStore,
+};
+use twl::{child_command, prepare_demo, prepare_project, secret, Prepared};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
+        Some("project") => project_command(&args[1..]).map(|_| 0),
         Some("run") => run(&args[1..]),
         Some("demo") => demo(&args[1..]),
         Some("doctor") if args.len() == 1 => {
@@ -25,101 +30,173 @@ fn main() {
 
 fn usage() -> String {
     "usage:\n\
-     twl run [--config towel.yaml] --upstream URL [--secret-fd FD] -- <command> [args...]\n\
+     twl project add <name>\n\
+     twl project list\n\
+     twl project show <name>\n\
+     twl project edit <name>\n\
+     twl project delete <name>\n\
+     twl run --project <name> -- <command> [args...]\n\
      twl demo [--config towel.yaml] -- <command> [args...]\n\
      twl doctor"
         .into()
 }
 
-#[derive(Default)]
-struct RunFlags {
-    config: Option<String>,
-    runtime: runtime::Inputs,
+fn one_name(args: &[String], operation: &str) -> Result<String, String> {
+    let [name] = args else {
+        return Err(format!("usage: twl project {operation} <name>"));
+    };
+    validate_identifier(name, "project name")?;
+    Ok(name.clone())
 }
 
-fn run_flags(flags: &[String]) -> Result<RunFlags, String> {
-    let mut parsed = RunFlags::default();
-    let mut index = 0;
-    while index < flags.len() {
-        let option = flags[index].as_str();
-        let value = flags
-            .get(index + 1)
-            .ok_or_else(|| format!("{option} requires a value"))?;
-        match option {
-            "--config" => {
-                if parsed.config.replace(value.clone()).is_some() {
-                    return Err("--config was specified more than once".into());
-                }
-            }
-            "--upstream" => parsed.runtime.set_upstream(value.clone())?,
-            "--secret-fd" => {
-                let fd = value
-                    .parse()
-                    .map_err(|_| "--secret-fd requires a numeric descriptor".to_string())?;
-                parsed.runtime.set_secret_fd(fd)?;
-            }
-            _ => return Err(format!("unknown option: {option}")),
+fn project_command(args: &[String]) -> Result<(), String> {
+    let store = MacKeychainProjectStore::new();
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let name = one_name(&args[1..], "add")?;
+            secret::process_preflight()?;
+            let project = prompt_project(name, None)?;
+            store.create(&project)?;
+            println!(
+                "Added project {} with {} route(s).",
+                project.name,
+                project.routes.len()
+            );
+            Ok(())
         }
-        index += 2;
+        Some("list") if args.len() == 1 => {
+            for name in store.list()? {
+                println!("{name}");
+            }
+            Ok(())
+        }
+        Some("show") => {
+            let name = one_name(&args[1..], "show")?;
+            show_project(&store.get(&name)?);
+            Ok(())
+        }
+        Some("edit") => {
+            let name = one_name(&args[1..], "edit")?;
+            let existing = store.get(&name)?;
+            let project = prompt_project(name, Some(&existing))?;
+            store.replace(&project)?;
+            println!(
+                "Updated project {} with {} route(s).",
+                project.name,
+                project.routes.len()
+            );
+            Ok(())
+        }
+        Some("delete") => {
+            let name = one_name(&args[1..], "delete")?;
+            store.delete(&name)?;
+            println!("Deleted project {name}.");
+            Ok(())
+        }
+        _ => Err(usage()),
     }
-    Ok(parsed)
 }
 
-fn config_flags(flags: &[String]) -> Result<Option<String>, String> {
-    match flags {
-        [] => Ok(None),
-        [option, path] if option == "--config" => Ok(Some(path.clone())),
-        [option, ..] if option != "--config" => Err(format!("unknown option: {option}")),
-        _ => Err("usage: --config towel.yaml".into()),
+fn prompt(label: &str) -> Result<String, String> {
+    eprint!("{label}: ");
+    io::stderr().flush().map_err(|error| error.to_string())?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| format!("reading input: {error}"))?;
+    Ok(value.trim().to_string())
+}
+
+fn prompt_default(label: &str, default: Option<&str>) -> Result<String, String> {
+    let shown = default
+        .map(|value| format!(" [{value}]"))
+        .unwrap_or_default();
+    let value = prompt(&format!("{label}{shown}"))?;
+    Ok(if value.is_empty() {
+        default.unwrap_or_default().to_string()
+    } else {
+        value
+    })
+}
+
+fn prompt_project(name: String, existing: Option<&Project>) -> Result<Project, String> {
+    eprintln!("Enter routes. Leave the route name blank when finished.");
+    let mut routes = Vec::new();
+    let mut position = 0;
+    loop {
+        let old = existing.and_then(|project| project.routes.get(position));
+        let route_name = prompt_default("Route name", old.map(|route| route.name.as_str()))?;
+        if route_name.is_empty() {
+            break;
+        }
+        validate_identifier(&route_name, "route name")?;
+        let matching = existing
+            .and_then(|project| project.routes.iter().find(|route| route.name == route_name));
+        let base_url = prompt_default(
+            "Exact HTTPS base URL",
+            matching.map(|route| route.base_url.as_str()),
+        )?;
+        let api_key_env = prompt_default(
+            "Application API-key environment variable",
+            matching.map(|route| route.api_key_env.as_str()),
+        )?;
+        let base_url_env = prompt_default(
+            "Application base-URL environment variable",
+            matching.map(|route| route.base_url_env.as_str()),
+        )?;
+        let key_label = if matching.is_some() {
+            "Static Bearer API key (leave blank to keep existing): "
+        } else {
+            "Static Bearer API key: "
+        };
+        let entered = rpassword::prompt_password(key_label)
+            .map_err(|error| format!("reading API key from terminal: {error}"))?;
+        let api_key = if entered.is_empty() {
+            matching
+                .map(|route| route.api_key.clone())
+                .ok_or("API key must not be empty")?
+        } else {
+            entered
+        };
+        routes.push(ProjectRoute {
+            name: route_name,
+            base_url,
+            api_key,
+            api_key_env,
+            base_url_env,
+        });
+        position += 1;
     }
+    Project::new(name, routes)
 }
 
-fn load_config(path: Option<&str>) -> Result<Config, String> {
-    path.map(Config::load)
-        .transpose()
-        .map(|config| config.unwrap_or_default())
-}
-
-fn run_invocation(args: &[String]) -> Result<(Config, RunFlags, &str, &[String]), String> {
-    let split = args
-        .iter()
-        .position(|arg| arg == "--")
-        .ok_or("missing `-- <command>`")?;
-    let flags = run_flags(&args[..split])?;
-    let config = load_config(flags.config.as_deref())?;
-    let command = args.get(split + 1).ok_or("missing command")?;
-    Ok((config, flags, command, &args[split + 2..]))
-}
-
-fn demo_invocation(args: &[String]) -> Result<(Config, &str, &[String]), String> {
-    let split = args
-        .iter()
-        .position(|arg| arg == "--")
-        .ok_or("missing `-- <command>`")?;
-    let config_path = config_flags(&args[..split])?;
-    let config = load_config(config_path.as_deref())?;
-    let command = args.get(split + 1).ok_or("missing command")?;
-    Ok((config, command, &args[split + 2..]))
+fn show_project(project: &Project) {
+    print!("{}", project.description());
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
-    let (config, flags, command, command_args) = run_invocation(args)?;
-    eprintln!("twl: requesting the project application credential");
-    let resolved = flags.runtime.resolve(|| {
-        rpassword::prompt_password(format!("{CHILD_SECRET_ENV}: "))
-            .map_err(|error| format!("reading from terminal: {error}"))
-    })?;
-    if resolved.used_environment_secret {
-        eprintln!(
-            "twl: warning: {PARENT_SECRET_ENV} is a weaker input because parent environments can leak through shell history, logs, or process metadata; prefer --secret-fd FD"
-        );
-    }
-    run_prepared(
-        config,
-        prepare_session(resolved.material)?,
-        command,
-        command_args,
-    )
+    let (name, command, command_args) = run_invocation(args)?;
+    let store = MacKeychainProjectStore::new();
+    let project = store.get(name)?;
+    let route_count = project.routes.len();
+    let prepared = prepare_project(project)?;
+    eprintln!("twl: authorized project {name} with {route_count} route(s) for this session");
+    run_prepared(prepared, command, command_args, None)
+}
+
+fn run_invocation(args: &[String]) -> Result<(&str, &str, &[String]), String> {
+    let split = args
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or("missing `-- <command>`")?;
+    let name = match &args[..split] {
+        [option, name] if option == "--project" => name.as_str(),
+        [option, ..] if option != "--project" => return Err(format!("unknown option: {option}")),
+        _ => return Err("usage: twl run --project <name> -- <command> [args...]".into()),
+    };
+    validate_identifier(name, "project name")?;
+    let command = args.get(split + 1).ok_or("missing command")?;
+    Ok((name, command, &args[split + 2..]))
 }
 
 fn demo(args: &[String]) -> Result<i32, String> {
@@ -127,32 +204,42 @@ fn demo(args: &[String]) -> Result<i32, String> {
     let upstream = spawn_demo_upstream()?;
     let prepared = prepare_demo(&upstream)?;
     eprintln!("twl: demo mode uses a generated canary; no real credential is read");
-    run_prepared(config, prepared, command, command_args)
+    run_prepared(
+        prepared,
+        command,
+        command_args,
+        config.budget.map(|budget| budget.max_requests),
+    )
+}
+
+fn demo_invocation(args: &[String]) -> Result<(Config, &str, &[String]), String> {
+    let split = args
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or("missing `-- <command>`")?;
+    let config = match &args[..split] {
+        [] => Config::default(),
+        [option, path] if option == "--config" => Config::load(path)?,
+        [option, ..] => return Err(format!("unknown option: {option}")),
+    };
+    let command = args.get(split + 1).ok_or("missing command")?;
+    Ok((config, command, &args[split + 2..]))
 }
 
 fn run_prepared(
-    config: Config,
     prepared: Prepared,
     command: &str,
     command_args: &[String],
+    budget: Option<u64>,
 ) -> Result<i32, String> {
-    let budget = config.budget.map(|budget| budget.max_requests);
     let (handle, overrides) = prepared.start(budget).map_err(|error| error.to_string())?;
-
-    eprintln!(
-        "twl: application proxy on 127.0.0.1:{}{}",
-        handle.port,
-        budget
-            .map(|max| format!(", request budget {max}"))
-            .unwrap_or_default()
-    );
+    eprintln!("twl: project broker listening on loopback");
     let status = child_command(command, command_args, &overrides)
         .status()
         .map_err(|error| format!("{command}: {error}"))?;
-
     if handle.seen.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         eprintln!(
-            "twl: no authorized request reached the proxy; verify that the application uses {CHILD_BASE_URL_ENV}"
+            "twl: no authorized request reached the broker; verify the application base-URL environment variables"
         );
     }
     Ok(status.code().unwrap_or(1))
@@ -161,10 +248,10 @@ fn run_prepared(
 fn doctor() {
     println!("Towel diagnostic");
     match secret::process_preflight() {
-        Ok(()) => println!("  protected project sessions: available"),
-        Err(error) => println!("  protected project sessions: unavailable ({error})"),
+        Ok(()) => println!("  protected macOS project sessions: available"),
+        Err(error) => println!("  protected macOS project sessions: unavailable ({error})"),
     }
-    println!("  canary-only demo:           available");
+    println!("  canary-only demo:                 available");
 }
 
 fn spawn_demo_upstream() -> Result<String, String> {

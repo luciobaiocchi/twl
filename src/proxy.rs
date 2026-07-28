@@ -14,6 +14,7 @@ const FORWARD_HEADERS: &[&str] = &["content-type", "accept"];
 
 /// The only destination and credential authorized for a session.
 pub struct Route {
+    pub name: String,
     pub upstream: String,
     pub key: String,
 }
@@ -54,7 +55,12 @@ fn equal_constant_time(left: &str, right: &str) -> bool {
 
 /// Resolve an origin-form request beneath the unguessable session prefix.
 /// The destination is always derived from the trusted parent-owned route.
-pub fn resolve(url: &str, token: &str, method: &str, route: &Route) -> Result<String, Denied> {
+pub fn resolve<'a>(
+    url: &str,
+    token: &str,
+    method: &str,
+    routes: &'a [Route],
+) -> Result<(String, &'a Route), Denied> {
     if !url.starts_with('/') || url.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
         return Err((400, "request target is not valid origin-form"));
     }
@@ -66,7 +72,7 @@ pub fn resolve(url: &str, token: &str, method: &str, route: &Route) -> Result<St
         return Err((400, "encoded or non-normalized path"));
     }
 
-    let mut segments = path.splitn(3, '/');
+    let mut segments = path.splitn(4, '/');
     if segments.next() != Some("") {
         return Err((400, "non-normalized path"));
     }
@@ -76,6 +82,11 @@ pub fn resolve(url: &str, token: &str, method: &str, route: &Route) -> Result<St
     {
         return Err((404, "not found"));
     }
+    let route_name = segments.next().ok_or((404, "not found"))?;
+    let route = routes
+        .iter()
+        .find(|route| equal_constant_time(&route.name, route_name))
+        .ok_or((404, "not found"))?;
     let application_path = segments
         .next()
         .ok_or((400, "application path is missing"))?;
@@ -100,7 +111,7 @@ pub fn resolve(url: &str, token: &str, method: &str, route: &Route) -> Result<St
         target.push('?');
         target.push_str(query);
     }
-    Ok(target)
+    Ok((target, route))
 }
 
 struct InFlight(Arc<AtomicUsize>);
@@ -111,7 +122,7 @@ impl Drop for InFlight {
     }
 }
 
-pub fn spawn(route: Route, max_requests: Option<u64>) -> std::io::Result<Handle> {
+pub fn spawn(routes: Vec<Route>, max_requests: Option<u64>) -> std::io::Result<Handle> {
     let server = Arc::new(
         tiny_http::Server::http("127.0.0.1:0")
             .map_err(|error| std::io::Error::other(error.to_string()))?,
@@ -119,7 +130,7 @@ pub fn spawn(route: Route, max_requests: Option<u64>) -> std::io::Result<Handle>
     let port = server.server_addr().to_ip().expect("socket ip").port();
     let token = Arc::new(random_token());
     let public_token = token.to_string();
-    let route = Arc::new(route);
+    let routes = Arc::new(routes);
     let seen = Arc::new(AtomicU64::new(0));
     let active = Arc::new(AtomicUsize::new(0));
     let agent = Arc::new(
@@ -140,13 +151,13 @@ pub fn spawn(route: Route, max_requests: Option<u64>) -> std::io::Result<Handle>
                 continue;
             }
             let guard = InFlight(active.clone());
-            let route = route.clone();
+            let routes = routes.clone();
             let token = token.clone();
             let agent = agent.clone();
             let accepted = accepted.clone();
             std::thread::spawn(move || {
                 let _guard = guard;
-                serve(request, &token, &route, &agent, &accepted, max_requests);
+                serve(request, &token, &routes, &agent, &accepted, max_requests);
             });
         }
     });
@@ -189,15 +200,15 @@ fn read_limited(reader: impl Read) -> Result<Vec<u8>, ()> {
 fn serve(
     mut request: tiny_http::Request,
     token: &str,
-    route: &Route,
+    routes: &[Route],
     agent: &ureq::Agent,
     accepted: &AtomicU64,
     max_requests: Option<u64>,
 ) {
     let url = request.url().to_string();
     let method = request.method().as_str().to_string();
-    let target = match resolve(&url, token, &method, route) {
-        Ok(target) => target,
+    let (target, route) = match resolve(&url, token, &method, routes) {
+        Ok(resolved) => resolved,
         Err((code, message)) => {
             respond_error(request, code, message);
             return;
@@ -234,7 +245,7 @@ fn serve(
         return;
     }
 
-    match forward(route, &target, &method, &headers, body, agent) {
+    match forward(route, routes, &target, &method, &headers, body, agent) {
         Ok((code, content_type, data)) => {
             let header = tiny_http::Header::from_bytes("content-type", content_type).unwrap();
             let _ = request.respond(
@@ -249,6 +260,7 @@ fn serve(
 
 fn forward(
     route: &Route,
+    routes: &[Route],
     target: &str,
     method: &str,
     headers: &[(String, String)],
@@ -276,7 +288,10 @@ fn forward(
     let content_type = canonical_content_type(response.header("content-type"));
     let data = read_limited(response.into_reader())
         .map_err(|_| (502, "upstream response is too large or unreadable"))?;
-    if contains_secret(&data, &route.key) {
+    if routes
+        .iter()
+        .any(|candidate| contains_secret(&data, &candidate.key))
+    {
         return Err((502, "upstream response contained the credential"));
     }
     Ok((status, content_type, data))
