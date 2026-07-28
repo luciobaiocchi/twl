@@ -3,7 +3,7 @@ use super::{
     Revision, SessionAuthorizer, StoreError, StoredProject,
 };
 use crate::secret;
-use core_foundation::base::{CFType, TCFType};
+use core_foundation::base::TCFType;
 use core_foundation::data::CFData;
 use core_foundation::string::CFString;
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
@@ -33,11 +33,9 @@ const SERVICE: &str = "dev.towel.project";
 const ACCOUNT_PREFIX: &str = "project-v1:";
 static KEYCHAIN_MUTATION: Mutex<()> = Mutex::new(());
 
-#[repr(C)]
-struct OpaqueSecAcl;
+enum OpaqueSecAcl {}
 type SecAclRef = *mut OpaqueSecAcl;
-#[repr(C)]
-struct OpaqueSecTrustedApplication;
+enum OpaqueSecTrustedApplication {}
 type SecTrustedApplicationRef = *mut OpaqueSecTrustedApplication;
 
 extern "C" {
@@ -213,6 +211,9 @@ fn trusted_application_matches(application: SecTrustedApplicationRef, executable
     }
     let path = unsafe { CFData::wrap_under_create_rule(data) };
     let bytes = path.bytes().strip_suffix(&[0]).unwrap_or(path.bytes());
+    if bytes.is_empty() {
+        return true;
+    }
     std::fs::canonicalize(Path::new(std::ffi::OsStr::from_bytes(bytes)))
         .is_ok_and(|candidate| candidate == executable)
 }
