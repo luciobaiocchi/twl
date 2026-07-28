@@ -7,6 +7,12 @@ if [ -z "$team_id" ]; then
     echo "TWL_TEAM_ID is required for the protected Keychain access group" >&2
     exit 1
 fi
+case "$team_id" in
+    *[!A-Za-z0-9]*)
+        echo "TWL_TEAM_ID must contain only ASCII letters and digits" >&2
+        exit 1
+        ;;
+esac
 if command -v cargo >/dev/null 2>&1; then
     cargo_path=$(command -v cargo)
 elif [ -x "$HOME/.cargo/bin/cargo" ]; then

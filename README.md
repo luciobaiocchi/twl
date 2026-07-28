@@ -18,9 +18,9 @@ twl run --project my-app -- codex
 
 ## Projects and routes
 
-A project is the unit of authorization. One versioned macOS Keychain record
-contains all of its trusted destinations and credentials. A project has one or
-more named routes; every route contains:
+A project is the unit of authorization. One versioned, application-scoped
+macOS Data Protection Keychain record contains all of its trusted destinations
+and credentials. A project has one or more named routes; every route contains:
 
 - an exact HTTPS base URL, optionally including a base path;
 - one static Bearer API key;
@@ -87,17 +87,20 @@ generated canary demo.
 ## Protected macOS build
 
 Real Keychain sessions require a signed binary with hardened runtime, library
-validation, runtime enforcement, and debugging disabled. An ordinary
-`cargo build` binary intentionally fails closed.
+validation, runtime enforcement, debugging disabled, and Towel's
+code-signing-scoped Keychain access group. At startup Towel verifies its Team
+ID, application identifier, and access-group entitlements. An ordinary `cargo
+build` binary intentionally fails closed.
 
 ```bash
 scripts/build-macos.sh
 ```
 
 Set `TWL_CODESIGN_IDENTITY` to a stable signing identity and `TWL_TEAM_ID` to
-its Apple Team ID for a real deployment;
-the script uses ad-hoc signing when it is unset. `twl doctor` reports whether
-the current binary can open protected project sessions.
+its Apple Team ID for a real deployment. The script uses ad-hoc signing when
+the identity is unset; that mode is for local build checks, not real credential
+deployment. `twl doctor` reports whether the current binary satisfies the
+hardened-runtime checks.
 
 ## Build and test
 

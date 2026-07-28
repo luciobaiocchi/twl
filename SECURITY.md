@@ -39,5 +39,8 @@ only. It is not:
 
 One LocalAuthentication approval opens the complete project session. The child
 receives only per-route fake keys and loopback URLs; each real credential and
-exact HTTPS destination remain together in one trusted Keychain record. See the
-README for the complete operating assumptions and known limitations.
+exact HTTPS destination remain together in one application-scoped Data
+Protection Keychain record. macOS limits records to Towel's signed Keychain
+access group, and Towel verifies the effective signing entitlements before
+opening the repository. See the README for the complete operating assumptions
+and known limitations.

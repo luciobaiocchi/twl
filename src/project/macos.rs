@@ -378,7 +378,10 @@ fn effective_access_group() -> Result<String, StoreError> {
     let result = (|| {
         let team = entitlement_string(task, TEAM_IDENTIFIER)?;
         let application = entitlement_string(task, APPLICATION_IDENTIFIER)?;
-        if team.is_empty() || !application.starts_with(&format!("{team}.")) {
+        if team.is_empty()
+            || !team.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !application.starts_with(&format!("{team}."))
+        {
             return Err(StoreError::UntrustedStore);
         }
         let expected = format!("{team}.{ACCESS_GROUP_SUFFIX}");
