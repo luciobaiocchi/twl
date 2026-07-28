@@ -10,14 +10,14 @@ use std::sync::Mutex;
 pub struct Revision(Vec<u8>);
 
 impl Revision {
-    #[allow(dead_code)]
-    pub(crate) fn from_payload(payload: Vec<u8>) -> Self {
-        Self(payload)
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn matches(&self, payload: &[u8]) -> bool {
-        self.0 == payload
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -236,7 +236,7 @@ where
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MemoryRepository {
-    records: Mutex<HashMap<String, Vec<u8>>>,
+    records: Mutex<HashMap<String, (Vec<u8>, Revision)>>,
 }
 
 #[cfg(test)]
@@ -249,15 +249,12 @@ impl ProjectRepository for MemoryRepository {
 
     fn get(&self, name: &str) -> Result<StoredProject, StoreError> {
         let records = self.records.lock().unwrap();
-        let payload = records.get(name).ok_or(StoreError::NotFound)?.clone();
+        let (payload, revision) = records.get(name).ok_or(StoreError::NotFound)?.clone();
         let project = Project::decode(&payload).map_err(|_| StoreError::MalformedRecord)?;
         if project.name() != name {
             return Err(StoreError::MalformedRecord);
         }
-        Ok(StoredProject {
-            project,
-            revision: Revision::from_payload(payload),
-        })
+        Ok(StoredProject { project, revision })
     }
 
     fn create(&self, project: &Project) -> Result<(), StoreError> {
@@ -266,18 +263,24 @@ impl ProjectRepository for MemoryRepository {
         if records.contains_key(project.name()) {
             return Err(StoreError::AlreadyExists);
         }
-        records.insert(project.name().into(), project.encode()?);
+        records.insert(
+            project.name().into(),
+            (project.encode()?, random_revision()),
+        );
         Ok(())
     }
 
     fn replace(&self, expected: &Revision, project: &Project) -> Result<(), StoreError> {
         project.validate()?;
         let mut records = self.records.lock().unwrap();
-        let current = records.get(project.name()).ok_or(StoreError::NotFound)?;
-        if !expected.matches(current) {
+        let (_, current_revision) = records.get(project.name()).ok_or(StoreError::NotFound)?;
+        if expected != current_revision {
             return Err(StoreError::Conflict);
         }
-        records.insert(project.name().into(), project.encode()?);
+        records.insert(
+            project.name().into(),
+            (project.encode()?, random_revision()),
+        );
         Ok(())
     }
 
@@ -289,6 +292,14 @@ impl ProjectRepository for MemoryRepository {
             .map(|_| ())
             .ok_or(StoreError::NotFound)
     }
+}
+
+#[cfg(test)]
+fn random_revision() -> Revision {
+    use rand::RngCore;
+    let mut bytes = vec![0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    Revision::from_bytes(bytes)
 }
 
 #[cfg(test)]
@@ -322,6 +333,22 @@ pub(crate) fn exercise_repository(repository: &dyn ProjectRepository) {
         repository.replace(&stale, &project("one", "stale-key")),
         Err(StoreError::Conflict)
     );
+
+    let stored = repository.get("one").unwrap();
+    let revision = stored.revision().clone();
+    let outcomes = std::thread::scope(|scope| {
+        let first = scope.spawn(|| repository.replace(&revision, &project("one", "worker-one")));
+        let second = scope.spawn(|| repository.replace(&revision, &project("one", "worker-two")));
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| **result == Err(StoreError::Conflict))
+            .count(),
+        1
+    );
     assert_eq!(
         repository.replace(&stale, &project("missing", "missing-key")),
         Err(StoreError::NotFound)
@@ -354,11 +381,10 @@ mod tests {
     #[test]
     fn malformed_memory_records_fail_generically() {
         let repository = MemoryRepository::default();
-        repository
-            .records
-            .lock()
-            .unwrap()
-            .insert("app".into(), b"secret-bearing-malformed-data".to_vec());
+        repository.records.lock().unwrap().insert(
+            "app".into(),
+            (b"secret-bearing-malformed-data".to_vec(), random_revision()),
+        );
         assert_eq!(
             repository.get("app").unwrap_err(),
             StoreError::MalformedRecord

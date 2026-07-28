@@ -94,7 +94,8 @@ validation, runtime enforcement, and debugging disabled. An ordinary
 scripts/build-macos.sh
 ```
 
-Set `TWL_CODESIGN_IDENTITY` to a stable signing identity for a real deployment;
+Set `TWL_CODESIGN_IDENTITY` to a stable signing identity and `TWL_TEAM_ID` to
+its Apple Team ID for a real deployment;
 the script uses ad-hoc signing when it is unset. `twl doctor` reports whether
 the current binary can open protected project sessions.
 
