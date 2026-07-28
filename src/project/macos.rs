@@ -7,6 +7,7 @@ use core_foundation::base::TCFType;
 use core_foundation::string::CFString;
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
 use core_foundation_sys::base::{CFEqual, CFRelease, CFTypeRef};
+use core_foundation_sys::data::CFDataRef;
 use core_foundation_sys::string::CFStringRef;
 use security_framework::base::Error;
 use security_framework::item::{ItemClass, ItemSearchOptions, Limit, Reference, SearchResult};
@@ -52,6 +53,10 @@ extern "C" {
     fn SecTrustedApplicationCreateFromPath(
         path: *const libc::c_char,
         application: *mut SecTrustedApplicationRef,
+    ) -> i32;
+    fn SecTrustedApplicationCopyData(
+        application: SecTrustedApplicationRef,
+        data: *mut CFDataRef,
     ) -> i32;
 }
 
@@ -194,10 +199,38 @@ fn acl_allows_only_application(
         && (0..count).all(|index| {
             let application =
                 unsafe { CFArrayGetValueAtIndex(applications, index) as SecTrustedApplicationRef };
-            unsafe { CFEqual(application.cast(), trusted_application.cast()) != 0 }
+            trusted_application_matches(application, trusted_application)
         });
     unsafe { CFRelease(applications.cast()) };
     trusted
+}
+
+fn trusted_application_matches(
+    candidate: SecTrustedApplicationRef,
+    expected: SecTrustedApplicationRef,
+) -> bool {
+    let mut candidate_data = ptr::null();
+    let mut expected_data = ptr::null();
+    if candidate.is_null()
+        || unsafe { SecTrustedApplicationCopyData(candidate, &mut candidate_data) } != errSecSuccess
+        || unsafe { SecTrustedApplicationCopyData(expected, &mut expected_data) } != errSecSuccess
+        || candidate_data.is_null()
+        || expected_data.is_null()
+    {
+        if !candidate_data.is_null() {
+            unsafe { CFRelease(candidate_data.cast()) };
+        }
+        if !expected_data.is_null() {
+            unsafe { CFRelease(expected_data.cast()) };
+        }
+        return false;
+    }
+    let equal = unsafe { CFEqual(candidate_data.cast(), expected_data.cast()) != 0 };
+    unsafe {
+        CFRelease(candidate_data.cast());
+        CFRelease(expected_data.cast());
+    }
+    equal
 }
 
 /// Repository pinned to one explicitly selected Keychain.
