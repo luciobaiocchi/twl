@@ -278,7 +278,7 @@ mod mac_store {
                 .keychains(std::slice::from_ref(&self.keychain))
                 .class(ItemClass::generic_password())
                 .service(SERVICE)
-                .load_data(true)
+                .load_attributes(true)
                 .limit(Limit::All)
                 .search()
             {
@@ -288,14 +288,22 @@ mod mac_store {
             };
             let mut names = Vec::with_capacity(results.len());
             for result in results {
-                let SearchResult::Data(payload) = result else {
+                let SearchResult::Dict(_) = result else {
                     return Err("malformed Keychain project record".into());
                 };
-                let project = Project::decode(&payload)?;
-                if names.iter().any(|name| name == &project.name) {
+                let attributes = result
+                    .simplify_dict()
+                    .ok_or("malformed Keychain project record")?;
+                let name = attributes
+                    .get("acct")
+                    .and_then(|account| account.strip_prefix("project-v1:"))
+                    .ok_or("malformed Keychain project record")?;
+                validate_identifier(name, "project name")
+                    .map_err(|_| "malformed Keychain project record".to_string())?;
+                if names.iter().any(|existing| existing == name) {
                     return Err("duplicate Keychain project records".into());
                 }
-                names.push(project.name);
+                names.push(name.to_string());
             }
             names.sort();
             Ok(names)
