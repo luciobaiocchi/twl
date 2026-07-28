@@ -149,6 +149,8 @@ fn verify_access_acls(access: SecAccessRef, executable: &Path) -> bool {
     }
     let mut found_decrypt = false;
     let count = unsafe { CFArrayGetCount(acls) };
+    #[cfg(test)]
+    eprintln!("ACL diagnostic: {count} ACL entries");
     for index in 0..count {
         let acl = unsafe { CFArrayGetValueAtIndex(acls, index) as SecAclRef };
         let mut authorizations = ptr::null();
@@ -163,6 +165,8 @@ fn verify_access_acls(access: SecAccessRef, executable: &Path) -> bool {
             authorizations,
             unsafe { kSecACLAuthorizationDecrypt }.cast(),
         );
+        #[cfg(test)]
+        eprintln!("ACL diagnostic: decrypt={decrypt}");
         unsafe { CFRelease(authorizations.cast()) };
         if decrypt {
             found_decrypt = true;
@@ -191,6 +195,8 @@ fn acl_allows_only_executable(acl: SecAclRef, executable: &Path) -> bool {
         return false;
     }
     let count = unsafe { CFArrayGetCount(applications) };
+    #[cfg(test)]
+    eprintln!("ACL diagnostic: {count} trusted applications");
     let trusted = count > 0
         && (0..count).all(|index| {
             let application =
@@ -211,6 +217,8 @@ fn trusted_application_matches(application: SecTrustedApplicationRef, executable
     }
     let path = unsafe { CFData::wrap_under_create_rule(data) };
     let bytes = path.bytes().strip_suffix(&[0]).unwrap_or(path.bytes());
+    #[cfg(test)]
+    eprintln!("ACL diagnostic: application bytes={bytes:?}");
     if bytes.is_empty() {
         return true;
     }
