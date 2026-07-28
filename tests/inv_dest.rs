@@ -8,14 +8,15 @@ const KEY: &str = "project-canary-real-key-0123456789";
 
 fn route(upstream: &str) -> Route {
     Route {
+        name: "application".into(),
         upstream: upstream.to_string(),
         key: KEY.to_string(),
     }
 }
 
 fn test_proxy(upstream: &str, budget: Option<u64>) -> (proxy::Handle, String) {
-    let handle = proxy::spawn(route(upstream), budget).unwrap();
-    let prefix = format!("/{}", handle.token);
+    let handle = proxy::spawn(vec![route(upstream)], budget).unwrap();
+    let prefix = format!("/{}/application", handle.token);
     (handle, prefix)
 }
 
@@ -34,6 +35,62 @@ fn real_key_reaches_only_the_fixed_upstream() {
     assert_eq!(
         seen[0].header("authorization"),
         Some(&*format!("Bearer {KEY}"))
+    );
+}
+
+#[test]
+fn multiple_routes_bind_each_credential_to_its_own_upstream() {
+    let (billing_upstream, billing_log) = upstream();
+    let (search_upstream, search_log) = upstream();
+    let handle = proxy::spawn(
+        vec![
+            Route {
+                name: "billing".into(),
+                upstream: format!("{billing_upstream}/billing-base"),
+                key: "billing-real-key".into(),
+            },
+            Route {
+                name: "search".into(),
+                upstream: format!("{search_upstream}/search-base"),
+                key: "search-real-key".into(),
+            },
+        ],
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        call(
+            handle.port,
+            "GET",
+            &format!("/{}/billing/invoices", handle.token),
+            &[],
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            handle.port,
+            "POST",
+            &format!("/{}/search/query", handle.token),
+            &[],
+        )
+        .0,
+        200
+    );
+
+    let billing = billing_log.lock().unwrap();
+    let search = search_log.lock().unwrap();
+    assert_eq!(billing[0].url, "/billing-base/invoices");
+    assert_eq!(
+        billing[0].header("authorization"),
+        Some("Bearer billing-real-key")
+    );
+    assert_eq!(search[0].url, "/search-base/query");
+    assert_eq!(
+        search[0].header("authorization"),
+        Some("Bearer search-real-key")
     );
 }
 
@@ -143,18 +200,18 @@ fn malformed_targets_never_reach_upstream() {
 
 #[test]
 fn no_path_can_change_the_destination_host() {
-    let route = route("https://service.example/api");
+    let routes = [route("https://service.example/api")];
     let token = "TESTTOKEN";
     for hostile in [
         "http://evil.example/v1",
         "//evil.example/v1",
-        "/TESTTOKEN//evil.example/v1",
-        "/TESTTOKEN/v1/@evil.example",
-        "/TESTTOKEN/v1/models#@evil.example",
+        "/TESTTOKEN/application//evil.example/v1",
+        "/TESTTOKEN/application/v1/@evil.example",
+        "/TESTTOKEN/application/v1/models#@evil.example",
     ] {
-        match resolve(hostile, token, "GET", &route) {
+        match resolve(hostile, token, "GET", &routes) {
             Err(_) => {}
-            Ok(target) => assert!(target.starts_with("https://service.example/api/")),
+            Ok((target, _)) => assert!(target.starts_with("https://service.example/api/")),
         }
     }
 }

@@ -18,7 +18,7 @@ fn doctor_reports_the_platform_security_mode() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("protected project sessions"));
+    assert!(stdout.contains("protected macOS project sessions"));
     assert!(stdout.contains("canary-only demo"));
 }
 
@@ -33,25 +33,22 @@ fn persistent_secret_commands_are_not_part_of_the_cli() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("usage:"));
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn environment_secret_prints_the_weaker_input_warning() {
+fn run_requires_a_named_project_and_rejects_legacy_inputs() {
     let output = Command::new(env!("CARGO_BIN_EXE_twl"))
-        .env("TWL_APPLICATION_API_KEY", "disposable-test-key")
         .args([
             "run",
             "--upstream",
-            "http://127.0.0.1:1",
+            "https://service.example",
             "--",
             "/usr/bin/true",
         ])
         .output()
         .unwrap();
 
-    assert!(output.status.success());
+    assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("weaker input"));
-    assert!(stderr.contains("prefer --secret-fd FD"));
+    assert!(stderr.contains("unknown option: --upstream"));
 }
 
 #[cfg(target_os = "macos")]
@@ -60,13 +57,7 @@ fn ordinary_cargo_binary_fails_closed_for_real_credentials() {
     let output = Command::new(env!("CARGO_BIN_EXE_twl"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("TWL_APPLICATION_API_KEY", "disposable-test-key")
-        .args([
-            "run",
-            "--upstream",
-            "http://127.0.0.1:1",
-            "--",
-            "/usr/bin/true",
-        ])
+        .args(["run", "--project", "test-project", "--", "/usr/bin/true"])
         .output()
         .unwrap();
     assert!(!output.status.success());

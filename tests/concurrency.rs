@@ -10,15 +10,16 @@ fn concurrent_budget_is_reserved_before_forwarding() {
 
     let (upstream, log) = upstream();
     let handle = proxy::spawn(
-        Route {
+        vec![Route {
+            name: "application".into(),
             upstream,
             key: "project-canary".into(),
-        },
+        }],
         Some(BUDGET),
     )
     .unwrap();
     let port = handle.port;
-    let path = format!("/{}/v1/models", handle.token);
+    let path = format!("/{}/application/v1/models", handle.token);
 
     let workers: Vec<_> = (0..CLIENTS)
         .map(|_| {
