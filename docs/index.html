@@ -7,15 +7,16 @@
       name="description"
       content="Towel keeps project API keys out of coding-agent processes while letting local applications use them through a constrained broker."
     />
-    <meta name="theme-color" content="#10100f" />
+    <meta name="theme-color" content="#f52f9a" />
     <meta property="og:title" content="Towel — project credentials for agent-run apps" />
     <meta
       property="og:description"
       content="Let the agent run the app. Keep the real project key in a separate process."
     />
     <meta property="og:type" content="website" />
+    <meta property="og:image" content="twl_logo.svg" />
     <title>Towel — keep project keys out of agent processes</title>
-    <link rel="icon" href="mark.svg" type="image/svg+xml" />
+    <link rel="icon" href="twl_logo.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -23,7 +24,7 @@
 
     <header class="site-header">
       <a class="brand" href="#top" aria-label="Towel home">
-        <img src="mark.svg" width="38" height="38" alt="" />
+        <img src="twl_logo.svg" width="38" height="38" alt="" />
         <span>Towel</span>
         <code>twl</code>
       </a>
@@ -53,13 +54,20 @@
           <p class="small-print">Apache-2.0 · macOS Keychain · no TLS interception</p>
         </div>
 
-        <div class="terminal-wrap" aria-label="Example Towel terminal session">
-          <div class="terminal-bar">
-            <div class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></div>
-            <span>project — twl</span>
-            <strong>DON'T PANIC</strong>
+        <div class="hero-stage">
+          <div class="logo-card">
+            <span class="pixel-label">PROJECT CREDENTIAL ARMOR</span>
+            <img src="twl_logo.svg" alt="A bright pink pixel-art towel on a rail" />
+            <span class="pixel-sticker" aria-hidden="true">SAFE<br />BY<br />DESIGN</span>
           </div>
-          <pre><code><span class="prompt">$</span> twl project add my-app
+
+          <div class="terminal-wrap" aria-label="Example Towel terminal session">
+            <div class="terminal-bar">
+              <div class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+              <span>project — twl</span>
+              <strong>DON'T PANIC</strong>
+            </div>
+            <pre><code><span class="prompt">$</span> twl project add my-app
 <span class="muted"># interactively add one or more HTTPS Bearer routes</span>
 
 <span class="prompt">$</span> twl run --project my-app -- codex
@@ -71,8 +79,16 @@
 
 <span class="prompt">$</span> python app.py
 <span class="safe">✓ authenticated through the fixed upstream</span></code></pre>
+          </div>
         </div>
       </section>
+
+      <div class="signal-strip" aria-label="Towel properties">
+        <span>KEYCHAIN LOCKED</span><i></i>
+        <span>LOOPBACK ONLY</span><i></i>
+        <span>FIXED DESTINATION</span><i></i>
+        <span>REAL KEYS STAY HIDDEN</span>
+      </div>
 
       <section class="flow-section" id="how-it-works">
         <div class="section-heading">
@@ -179,7 +195,7 @@
       </section>
 
       <section class="lore">
-        <img src="mark.svg" width="76" height="76" alt="Geometric folded towel logo" />
+        <img src="twl_logo.svg" width="86" height="86" alt="Pink pixel-art towel logo" />
         <div>
           <span>A small literary nod</span>
           <h2>Why a towel?</h2>
@@ -207,7 +223,7 @@
 
     <footer>
       <a class="brand" href="#top">
-        <img src="mark.svg" width="30" height="30" alt="" />
+        <img src="twl_logo.svg" width="30" height="30" alt="" />
         <span>Towel</span>
       </a>
       <p>Experimental security software. Use narrow, disposable credentials.</p>
