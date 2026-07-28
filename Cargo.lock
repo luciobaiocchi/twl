@@ -532,6 +532,8 @@ dependencies = [
  "base64",
  "block2",
  "core-foundation",
+ "core-foundation-sys",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-local-authentication",
