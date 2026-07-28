@@ -1225,6 +1225,16 @@ footer .legal {
   .button.secondary {
     color: var(--ink);
   }
+
+  .contribute-links a {
+    background: #fff1fb;
+    color: #351046;
+  }
+
+  .contribute-links a:hover {
+    background: var(--cyan);
+    color: #351046;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
