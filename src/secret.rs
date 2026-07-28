@@ -1,5 +1,12 @@
 use rand::distributions::Alphanumeric;
 use rand::Rng;
+#[cfg(any(target_os = "macos", test))]
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+#[cfg(any(target_os = "macos", test))]
+use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+type AuthenticationContext = objc2::rc::Retained<objc2_local_authentication::LAContext>;
 
 fn random_tail(length: usize) -> String {
     rand::thread_rng()
@@ -17,6 +24,79 @@ pub fn mock() -> String {
 /// A recognizable fake credential used only by `twl demo`.
 pub fn demo() -> String {
     format!("twl-demo-canary-{}", random_tail(24))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn wait_for_authorization(
+    receiver: Receiver<Result<(), String>>,
+    timeout: Duration,
+    invalidate: impl FnOnce(),
+) -> Result<(), String> {
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => {
+            invalidate();
+            Err(format!(
+                "local authentication timed out after {} seconds",
+                timeout.as_secs()
+            ))
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("local authentication ended without a result".into())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn authentication_context() -> Result<AuthenticationContext, String> {
+    use objc2_local_authentication::{LAContext, LAPolicy};
+
+    process_preflight()?;
+    let context = unsafe { LAContext::new() };
+    unsafe { context.setTouchIDAuthenticationAllowableReuseDuration(0.0) };
+    unsafe { context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }
+        .map_err(|error| format!("local authentication is unavailable: {error}"))?;
+    Ok(context)
+}
+
+#[cfg(target_os = "macos")]
+pub fn authorize(reason: &str) -> Result<(), String> {
+    use block2::RcBlock;
+    use objc2::runtime::Bool;
+    use objc2_foundation::{NSError, NSString};
+    use objc2_local_authentication::LAPolicy;
+
+    let context = authentication_context()?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let reply = RcBlock::new(move |success: Bool, error: *mut NSError| {
+        let result = if success.as_bool() {
+            Ok(())
+        } else if let Some(error) = unsafe { error.as_ref() } {
+            Err(format!(
+                "local authentication failed: {}",
+                error.localizedDescription()
+            ))
+        } else {
+            Err("local authentication failed".into())
+        };
+        let _ = sender.send(result);
+    });
+    let reason = NSString::from_str(reason);
+    unsafe {
+        context.evaluatePolicy_localizedReason_reply(
+            LAPolicy::DeviceOwnerAuthentication,
+            &reason,
+            &reply,
+        );
+    }
+    wait_for_authorization(receiver, Duration::from_secs(120), || unsafe {
+        context.invalidate()
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn authorize(_reason: &str) -> Result<(), String> {
+    Err("project credentials are currently available only on macOS".into())
 }
 
 #[cfg(target_os = "macos")]
@@ -69,18 +149,40 @@ pub fn process_preflight() -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 pub fn process_preflight() -> Result<(), String> {
-    let result = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "disabling same-user process inspection: {}",
-            std::io::Error::last_os_error()
-        ))
-    }
+    Err("real project credentials are currently available only on macOS".into())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn process_preflight() -> Result<(), String> {
-    Err("runtime credentials currently require macOS or Linux process hardening".into())
+    Err("real project credentials are currently available only on macOS".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn authorization_cancellation_is_returned() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Err("local authentication failed: canceled".into()))
+            .unwrap();
+        let error = wait_for_authorization(receiver, Duration::from_secs(1), || {}).unwrap_err();
+        assert!(error.contains("canceled"));
+    }
+
+    #[test]
+    fn authorization_timeout_invalidates_context() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let invalidated = Arc::new(AtomicBool::new(false));
+        let marker = invalidated.clone();
+        let error = wait_for_authorization(receiver, Duration::from_millis(1), move || {
+            marker.store(true, Ordering::SeqCst);
+        })
+        .unwrap_err();
+        assert!(error.contains("timed out"));
+        assert!(invalidated.load(Ordering::SeqCst));
+    }
 }

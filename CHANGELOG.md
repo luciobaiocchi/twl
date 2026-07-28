@@ -7,11 +7,11 @@ All notable changes to Towel will be documented here. The project uses
 
 ### Added
 
-- Parent-only project credential handling through hidden input, a dedicated
-  file descriptor, or a warned environment fallback.
-- Session-local fake `APP_API_KEY` and `APP_BASE_URL` values.
-- Fixed-destination Bearer proxy with request budgets and reflection checks.
-- macOS hardened-runtime and Linux process-inspection defenses.
+- macOS Keychain-backed named projects with multiple destination-bound Bearer
+  routes and one LocalAuthentication approval per project session.
+- Per-route fake API keys and route-specific loopback broker URLs.
+- Fixed-destination Bearer proxy with reflection and request-security checks.
+- macOS hardened-runtime and library-validation enforcement.
 - Dependency-free Python application and upstream compatibility example.
 
 ### Changed

@@ -2,8 +2,6 @@ use serde::Deserialize;
 
 pub const CHILD_SECRET_ENV: &str = "APP_API_KEY";
 pub const CHILD_BASE_URL_ENV: &str = "APP_BASE_URL";
-pub const PARENT_SECRET_ENV: &str = "TWL_APPLICATION_API_KEY";
-pub const PARENT_UPSTREAM_ENV: &str = "TWL_APPLICATION_UPSTREAM";
 pub const ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
 
 #[derive(Default, Deserialize, Debug)]

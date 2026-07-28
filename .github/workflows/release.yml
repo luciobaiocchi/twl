@@ -130,6 +130,7 @@ jobs:
       - name: Sign, notarize, and package
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
@@ -139,9 +140,13 @@ jobs:
           name="twl-${{ needs.verify-version.outputs.version }}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/twl" README.md LICENSE NOTICE "dist/$name/"
+          entitlements="$RUNNER_TEMP/twl.entitlements"
+          sed "s/__TEAM_ID__/$APPLE_TEAM_ID/g" config/macos.entitlements >"$entitlements"
           codesign --force --options runtime --timestamp \
+            --entitlements "$entitlements" \
             --sign "$APPLE_SIGNING_IDENTITY" "dist/$name/twl"
           codesign --verify --strict --verbose=2 "dist/$name/twl"
+          codesign -d --entitlements - "dist/$name/twl"
           "dist/$name/twl" doctor
           ditto -c -k --keepParent "dist/$name" "dist/$name.zip"
           python3 - <<'PY'

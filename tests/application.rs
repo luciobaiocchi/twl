@@ -4,7 +4,8 @@ mod common;
 
 use common::upstream;
 use std::process::Command;
-use twl::{child_command, prepare_session, SessionMaterial};
+use twl::proxy::{self, Route};
+use twl::{child_command, secret};
 
 const REAL_KEY: &str = "third-party-real-test-key";
 
@@ -31,12 +32,25 @@ fn python_app_uses_the_service_without_receiving_the_real_key() {
     }
 
     let (upstream, log) = upstream();
-    let prepared = prepare_session(SessionMaterial {
-        key: REAL_KEY.to_string(),
-        upstream,
-    })
+    let handle = proxy::spawn(
+        vec![Route {
+            name: "application".into(),
+            upstream,
+            key: REAL_KEY.into(),
+        }],
+        None,
+    )
     .unwrap();
-    let (handle, overrides) = prepared.start(None).unwrap();
+    let overrides = vec![
+        ("APP_API_KEY".into(), secret::mock()),
+        (
+            "APP_BASE_URL".into(),
+            format!(
+                "http://127.0.0.1:{}/{}/application",
+                handle.port, handle.token
+            ),
+        ),
+    ];
     let app = format!(
         "{}/examples/application_client.py",
         env!("CARGO_MANIFEST_DIR")

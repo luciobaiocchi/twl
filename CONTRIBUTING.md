@@ -24,20 +24,22 @@ cargo test --all-targets --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
-The Python example uses only the standard library. On macOS, use
-`scripts/build-macos.sh` before manually testing a real credential; ordinary
-Cargo binaries intentionally fail closed.
+The Python example uses only the standard library. On macOS, set
+`TWL_TEAM_ID=<team-id>` and use `scripts/build-macos.sh` before manually
+testing a real credential; ordinary Cargo binaries intentionally fail closed.
 
 ## Security invariants
 
 Changes must preserve these properties:
 
-- Real credentials never appear in child arguments, environment variables,
-  workspace configuration, logs, or error messages.
-- A credential is bound to the upstream selected by the trusted parent.
+- Real credentials and destinations never appear in child arguments,
+  environment variables, workspace configuration, files, logs, inherited
+  descriptors, or error messages.
+- Every credential is bound to the exact upstream stored in its trusted
+  Keychain project record.
 - Client authentication, host, and forwarding headers cannot override policy.
 - Redirects never carry credentials to another destination.
-- Secret descriptors are consumed and closed before the child starts.
+- One native authorization opens one complete project session.
 - Invalid requests fail before consuming the session request budget.
 
 Add a regression test for every security-relevant behavior change. Use only

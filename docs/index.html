@@ -7,15 +7,16 @@
       name="description"
       content="Towel keeps project API keys out of coding-agent processes while letting local applications use them through a constrained broker."
     />
-    <meta name="theme-color" content="#10100f" />
+    <meta name="theme-color" content="#f52f9a" />
     <meta property="og:title" content="Towel — project credentials for agent-run apps" />
     <meta
       property="og:description"
       content="Let the agent run the app. Keep the real project key in a separate process."
     />
     <meta property="og:type" content="website" />
+    <meta property="og:image" content="twl_logo.svg" />
     <title>Towel — keep project keys out of agent processes</title>
-    <link rel="icon" href="mark.svg" type="image/svg+xml" />
+    <link rel="icon" href="twl_logo.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -23,7 +24,7 @@
 
     <header class="site-header">
       <a class="brand" href="#top" aria-label="Towel home">
-        <img src="mark.svg" width="38" height="38" alt="" />
+        <img src="twl_logo.svg" width="38" height="38" alt="" />
         <span>Towel</span>
         <code>twl</code>
       </a>
@@ -38,32 +39,39 @@
     <main id="main">
       <section class="hero" id="top">
         <div class="hero-copy">
-          <div class="eyebrow"><span></span> Experimental · macOS + Linux</div>
+          <div class="eyebrow"><span></span> Experimental · real credentials on macOS</div>
           <h1>Let the agent run the app.<br /><em>Keep the key out of sight.</em></h1>
           <p class="hero-lead">
             Towel is a small credential broker for projects operated by coding
-            agents. The child gets a fake key and a loopback URL. The real key
-            stays in the parent and reaches one fixed service.
+            agents. One named project holds multiple Keychain-backed routes.
+            The child gets fake keys and loopback URLs; real keys stay in the
+            trusted parent and reach only their fixed services.
           </p>
           <div class="hero-actions">
             <a class="button primary" href="https://github.com/luciobaiocchi/twl">View the source</a>
             <a class="button secondary" href="#try-it">Run the canary demo</a>
           </div>
-          <p class="small-print">Apache-2.0 · no persistent secret store · no TLS interception</p>
+          <p class="small-print">Apache-2.0 · macOS Keychain · no TLS interception</p>
         </div>
 
-        <div class="terminal-wrap" aria-label="Example Towel terminal session">
-          <div class="terminal-bar">
-            <div class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></div>
-            <span>project — twl</span>
-            <strong>DON'T PANIC</strong>
+        <div class="hero-stage">
+          <div class="logo-card">
+            <span class="pixel-label">PROJECT CREDENTIAL ARMOR</span>
+            <img src="twl_logo.svg" alt="A bright pink pixel-art towel on a rail" />
+            <span class="pixel-sticker" aria-hidden="true">SAFE<br />BY<br />DESIGN</span>
           </div>
-          <pre><code><span class="prompt">$</span> twl run \
-    --upstream https://service.example \
-    -- codex
 
-<span class="muted">twl: requesting the project application credential</span>
-APP_API_KEY: <span class="cursor"> </span>
+          <div class="terminal-wrap" aria-label="Example Towel terminal session">
+            <div class="terminal-bar">
+              <div class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+              <span>project — twl</span>
+              <strong>DON'T PANIC</strong>
+            </div>
+            <pre><code><span class="prompt">$</span> twl project add my-app
+<span class="muted"># interactively add one or more HTTPS Bearer routes</span>
+
+<span class="prompt">$</span> twl run --project my-app -- codex
+<span class="muted"># approve the complete session with Touch ID when available</span>
 
 <span class="muted"># Inside the agent process</span>
 <span class="prompt">$</span> printenv APP_API_KEY
@@ -71,14 +79,22 @@ APP_API_KEY: <span class="cursor"> </span>
 
 <span class="prompt">$</span> python app.py
 <span class="safe">✓ authenticated through the fixed upstream</span></code></pre>
+          </div>
         </div>
       </section>
+
+      <div class="signal-strip" aria-label="Towel properties">
+        <span>KEYCHAIN LOCKED</span><i></i>
+        <span>LOOPBACK ONLY</span><i></i>
+        <span>FIXED DESTINATION</span><i></i>
+        <span>REAL KEYS STAY HIDDEN</span>
+      </div>
 
       <section class="flow-section" id="how-it-works">
         <div class="section-heading">
           <span>01 / Architecture</span>
           <h2>One small process boundary</h2>
-          <p>No provider catalog and no secret database. Just a per-session binding between one credential and one destination.</p>
+          <p>No provider catalog or portable vault. One application-scoped Data Protection Keychain record binds every project route to its credential and exact destination.</p>
         </div>
 
         <div class="flow" aria-label="Request flow">
@@ -86,8 +102,8 @@ APP_API_KEY: <span class="cursor"> </span>
             <div class="flow-icon key-icon" aria-hidden="true"></div>
             <small>Trusted parent</small>
             <h3>Towel</h3>
-            <p>Reads the real key before launching the agent.</p>
-            <code>real key · fixed URL</code>
+            <p>Opens one authorized project record before launching the agent.</p>
+            <code>real keys · fixed URLs</code>
           </article>
           <div class="flow-arrow" aria-hidden="true"><span>fake env</span>→</div>
           <article class="flow-card agent">
@@ -112,7 +128,7 @@ APP_API_KEY: <span class="cursor"> </span>
         <article>
           <span class="feature-number">A</span>
           <h3>Zero real key in the child</h3>
-          <p>Parent-only inputs and secret descriptors are removed before the agent starts.</p>
+          <p>Keychain values and destinations are never supplied through child environment variables, arguments, files, or descriptors.</p>
         </article>
         <article>
           <span class="feature-number">B</span>
@@ -122,7 +138,7 @@ APP_API_KEY: <span class="cursor"> </span>
         <article>
           <span class="feature-number">C</span>
           <h3>Small enough to inspect</h3>
-          <p>A focused Rust binary with canary tests, request budgets, and explicit limitations.</p>
+          <p>A focused Rust binary with route-binding regressions, a demo-only request budget, and explicit limitations.</p>
         </article>
       </section>
 
@@ -135,10 +151,10 @@ APP_API_KEY: <span class="cursor"> </span>
           <div class="boundary-column protects">
             <h3><span>✓</span> Towel protects</h3>
             <ul>
-              <li>The real project key from the child environment</li>
-              <li>The parent-selected destination from workspace edits</li>
+              <li>Real project keys and destinations from the child environment</li>
+              <li>Keychain-selected destinations from workspace edits</li>
               <li>Authentication from hostile client headers</li>
-              <li>Accidental plaintext and base64 key reflection</li>
+              <li>Direct plaintext and common-Base64 key reflection</li>
             </ul>
           </div>
           <div class="boundary-column limits">
@@ -147,7 +163,7 @@ APP_API_KEY: <span class="cursor"> </span>
               <li>A sandbox or general-purpose secret manager</li>
               <li>Protection for the agent's own model login</li>
               <li>A guard against actions performed through the broker</li>
-              <li>A boundary against container root or <code>CAP_SYS_PTRACE</code></li>
+              <li>Protection from an authorized upstream that transforms or exposes a key</li>
             </ul>
           </div>
         </div>
@@ -161,7 +177,9 @@ APP_API_KEY: <span class="cursor"> </span>
           </div>
           <p>
             The demo creates a canary credential and a local service, then runs
-            the same Python application contract used by a real session.
+            the same Python application contract used by a real session. This
+            canary demo works cross-platform; real project sessions require a
+            protected macOS binary and LocalAuthentication.
           </p>
           <div class="status-line"><i></i> Public packages are planned for the first alpha release.</div>
         </div>
@@ -177,7 +195,7 @@ APP_API_KEY: <span class="cursor"> </span>
       </section>
 
       <section class="lore">
-        <img src="mark.svg" width="76" height="76" alt="Geometric folded towel logo" />
+        <img src="twl_logo.svg" width="86" height="86" alt="Pink pixel-art towel logo" />
         <div>
           <span>A small literary nod</span>
           <h2>Why a towel?</h2>
@@ -205,7 +223,7 @@ APP_API_KEY: <span class="cursor"> </span>
 
     <footer>
       <a class="brand" href="#top">
-        <img src="mark.svg" width="30" height="30" alt="" />
+        <img src="twl_logo.svg" width="30" height="30" alt="" />
         <span>Towel</span>
       </a>
       <p>Experimental security software. Use narrow, disposable credentials.</p>
