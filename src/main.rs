@@ -1,7 +1,9 @@
 use std::io::{self, Write};
 use std::process::exit;
 use twl::config::Config;
-use twl::project::{open_project_service, validate_identifier, Project, ProjectRoute};
+use twl::project::{
+    open_project_service, validate_identifier, MacProjectService, Project, ProjectRoute,
+};
 use twl::{child_command, prepare_demo, prepare_project, secret, Prepared};
 
 fn main() {
@@ -43,15 +45,15 @@ fn one_name(args: &[String], operation: &str) -> Result<String, String> {
     let [name] = args else {
         return Err(format!("usage: twl project {operation} <name>"));
     };
-    validate_identifier(name, "project name").map_err(|error| error.to_string())?;
+    validate_identifier(name).map_err(|error| error.to_string())?;
     Ok(name.clone())
 }
 
 fn project_command(args: &[String]) -> Result<(), String> {
-    let store = open_project_service().map_err(|error| error.to_string())?;
     match args.first().map(String::as_str) {
         Some("add") => {
             let name = one_name(&args[1..], "add")?;
+            let store = project_service()?;
             let project = prompt_project(name, None)?;
             store.create(&project).map_err(|error| error.to_string())?;
             println!(
@@ -62,6 +64,7 @@ fn project_command(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("list") if args.len() == 1 => {
+            let store = project_service()?;
             for name in store.list().map_err(|error| error.to_string())? {
                 println!("{name}");
             }
@@ -69,12 +72,14 @@ fn project_command(args: &[String]) -> Result<(), String> {
         }
         Some("show") => {
             let name = one_name(&args[1..], "show")?;
+            let store = project_service()?;
             let stored = store.get(&name).map_err(|error| error.to_string())?;
             show_project(stored.project());
             Ok(())
         }
         Some("edit") => {
             let name = one_name(&args[1..], "edit")?;
+            let store = project_service()?;
             let existing = store.get(&name).map_err(|error| error.to_string())?;
             let project = prompt_project(name, Some(existing.project()))?;
             store
@@ -89,12 +94,17 @@ fn project_command(args: &[String]) -> Result<(), String> {
         }
         Some("delete") => {
             let name = one_name(&args[1..], "delete")?;
+            let store = project_service()?;
             store.delete(&name).map_err(|error| error.to_string())?;
             println!("Deleted project {name}.");
             Ok(())
         }
         _ => Err(usage()),
     }
+}
+
+fn project_service() -> Result<MacProjectService, String> {
+    open_project_service().map_err(|error| error.to_string())
 }
 
 fn terminal_line(label: &str) -> Result<String, String> {
@@ -168,7 +178,7 @@ fn collect_project(
         if route_name.is_empty() {
             break;
         }
-        validate_identifier(&route_name, "route name").map_err(|error| error.to_string())?;
+        validate_identifier(&route_name).map_err(|error| error.to_string())?;
         routes.push(prompt_route_with_name(
             route_name,
             None,
@@ -185,7 +195,7 @@ fn prompt_route(
     read_password: &mut impl FnMut(&str) -> Result<String, String>,
 ) -> Result<ProjectRoute, String> {
     let route_name = ask(read_line, "Route name", existing.map(ProjectRoute::name))?;
-    validate_identifier(&route_name, "route name").map_err(|error| error.to_string())?;
+    validate_identifier(&route_name).map_err(|error| error.to_string())?;
     prompt_route_with_name(route_name, existing, read_line, read_password)
 }
 
@@ -253,7 +263,7 @@ fn run_invocation(args: &[String]) -> Result<(&str, &str, &[String]), String> {
         [option, ..] if option != "--project" => return Err(format!("unknown option: {option}")),
         _ => return Err("usage: twl run --project <name> -- <command> [args...]".into()),
     };
-    validate_identifier(name, "project name").map_err(|error| error.to_string())?;
+    validate_identifier(name).map_err(|error| error.to_string())?;
     let command = args.get(split + 1).ok_or("missing command")?;
     Ok((name, command, &args[split + 2..]))
 }

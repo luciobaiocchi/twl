@@ -34,6 +34,24 @@ fn persistent_secret_commands_are_not_part_of_the_cli() {
 }
 
 #[test]
+fn invalid_project_commands_fail_before_platform_checks() {
+    for args in [
+        vec!["project", "unknown"],
+        vec!["project", "show", "../not-an-identifier"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_twl"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("usage:") || stderr.contains("identifier"));
+        assert!(!stderr.contains("only on macOS"));
+        assert!(!stderr.contains("not protected for real credentials"));
+    }
+}
+
+#[test]
 fn run_requires_a_named_project_and_rejects_legacy_inputs() {
     let output = Command::new(env!("CARGO_BIN_EXE_twl"))
         .args([

@@ -10,12 +10,12 @@ use std::sync::Mutex;
 pub struct Revision(Vec<u8>);
 
 impl Revision {
-    #[cfg(any(target_os = "macos", test))]
+    #[allow(dead_code)]
     pub(crate) fn from_payload(payload: Vec<u8>) -> Self {
         Self(payload)
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[allow(dead_code)]
     pub(crate) fn matches(&self, payload: &[u8]) -> bool {
         self.0 == payload
     }
@@ -35,7 +35,7 @@ pub struct StoredProject {
 }
 
 impl StoredProject {
-    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
     pub(crate) fn new(project: Project, revision: Revision) -> Self {
         Self { project, revision }
     }
@@ -60,6 +60,8 @@ pub enum StoreError {
     AlreadyExists,
     Conflict,
     MalformedRecord,
+    UntrustedStore,
+    UntrustedItem,
     UnsupportedPlatform,
     InvalidProject(ModelError),
     Platform(String),
@@ -71,7 +73,11 @@ impl fmt::Display for StoreError {
             Self::NotFound => formatter.write_str("project not found"),
             Self::AlreadyExists => formatter.write_str("project already exists"),
             Self::Conflict => formatter.write_str("project changed while it was being edited"),
-            Self::MalformedRecord => formatter.write_str("malformed Keychain project record"),
+            Self::MalformedRecord => formatter.write_str("malformed stored project record"),
+            Self::UntrustedStore => formatter.write_str("trusted project store is unavailable"),
+            Self::UntrustedItem => {
+                formatter.write_str("project record has untrusted access control")
+            }
             Self::UnsupportedPlatform => {
                 formatter.write_str("project credentials are currently available only on macOS")
             }
@@ -112,7 +118,7 @@ pub enum Action<'a> {
 pub struct AuthorizationError(String);
 
 impl AuthorizationError {
-    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
     pub(crate) fn platform(message: String) -> Self {
         Self(message)
     }
@@ -173,6 +179,9 @@ where
     }
 
     pub fn get(&self, name: &str) -> Result<StoredProject, ProjectServiceError> {
+        super::validate_identifier(name)
+            .map_err(StoreError::from)
+            .map_err(ProjectServiceError::Store)?;
         self.authorizer
             .authorize(Action::Read(name))
             .map_err(ProjectServiceError::Authorization)?;
@@ -182,6 +191,10 @@ where
     }
 
     pub fn create(&self, project: &Project) -> Result<(), ProjectServiceError> {
+        project
+            .validate()
+            .map_err(StoreError::from)
+            .map_err(ProjectServiceError::Store)?;
         self.authorizer
             .authorize(Action::Create(project.name()))
             .map_err(ProjectServiceError::Authorization)?;
@@ -195,6 +208,10 @@ where
         expected: &Revision,
         project: &Project,
     ) -> Result<(), ProjectServiceError> {
+        project
+            .validate()
+            .map_err(StoreError::from)
+            .map_err(ProjectServiceError::Store)?;
         self.authorizer
             .authorize(Action::Replace(project.name()))
             .map_err(ProjectServiceError::Authorization)?;
@@ -204,6 +221,9 @@ where
     }
 
     pub fn delete(&self, name: &str) -> Result<(), ProjectServiceError> {
+        super::validate_identifier(name)
+            .map_err(StoreError::from)
+            .map_err(ProjectServiceError::Store)?;
         self.authorizer
             .authorize(Action::Delete(name))
             .map_err(ProjectServiceError::Authorization)?;
@@ -324,6 +344,7 @@ pub(crate) fn exercise_repository(repository: &dyn ProjectRepository) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn memory_repository_conforms() {
@@ -342,5 +363,26 @@ mod tests {
             repository.get("app").unwrap_err(),
             StoreError::MalformedRecord
         );
+    }
+
+    struct RecordingAuthorizer<'a>(&'a AtomicBool);
+
+    impl SessionAuthorizer for RecordingAuthorizer<'_> {
+        fn authorize(&self, _action: Action<'_>) -> Result<(), AuthorizationError> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn invalid_names_never_reach_the_authorizer() {
+        let called = AtomicBool::new(false);
+        let service =
+            ProjectService::new(RecordingAuthorizer(&called), MemoryRepository::default());
+        assert!(matches!(
+            service.get("bad\u{1b}name"),
+            Err(ProjectServiceError::Store(StoreError::InvalidProject(_)))
+        ));
+        assert!(!called.load(Ordering::SeqCst));
     }
 }

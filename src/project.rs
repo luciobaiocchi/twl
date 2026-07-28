@@ -43,7 +43,7 @@ impl fmt::Display for ModelError {
             Self::EmptyRoutes => "a project must contain at least one route",
             Self::DuplicateRoute => "duplicate route name",
             Self::DuplicateEnvironment => "duplicate environment variable name",
-            Self::MalformedPayload => "malformed Keychain project payload",
+            Self::MalformedPayload => "malformed stored project payload",
             Self::Serialization => "serializing project failed",
         })
     }
@@ -52,7 +52,7 @@ impl fmt::Display for ModelError {
 impl std::error::Error for ModelError {}
 
 /// A validated, versioned collection of destination-bound credentials.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
     version: u32,
@@ -61,7 +61,7 @@ pub struct Project {
 }
 
 /// A validated route containing a real secret; `Debug` always redacts the key.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectRoute {
     name: String,
@@ -71,7 +71,7 @@ pub struct ProjectRoute {
     base_url_env: String,
 }
 
-pub fn validate_identifier(value: &str, _kind: &str) -> Result<(), ModelError> {
+pub fn validate_identifier(value: &str) -> Result<(), ModelError> {
     if value.is_empty()
         || value.len() > 64
         || !value
@@ -165,7 +165,7 @@ impl Project {
         if self.version != FORMAT_VERSION {
             return Err(ModelError::UnsupportedVersion);
         }
-        validate_identifier(&self.name, "project name")?;
+        validate_identifier(&self.name)?;
         if self.routes.is_empty() {
             return Err(ModelError::EmptyRoutes);
         }
@@ -193,11 +193,49 @@ impl Project {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
-        let decoded = std::str::from_utf8(bytes)
-            .ok()
-            .and_then(|raw| serde_yaml_ng::from_str::<Self>(raw).ok())
-            .filter(|project| project.validate().is_ok());
-        decoded.ok_or(ModelError::MalformedPayload)
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireProject {
+            version: u32,
+            name: String,
+            routes: Vec<WireRoute>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireRoute {
+            name: String,
+            base_url: String,
+            api_key: String,
+            api_key_env: String,
+            base_url_env: String,
+        }
+
+        let raw = std::str::from_utf8(bytes).map_err(|_| ModelError::MalformedPayload)?;
+        let wire: WireProject =
+            serde_yaml_ng::from_str(raw).map_err(|_| ModelError::MalformedPayload)?;
+        if wire.version != FORMAT_VERSION {
+            return Err(ModelError::MalformedPayload);
+        }
+        let routes = wire
+            .routes
+            .into_iter()
+            .map(|route| {
+                let original_url = route.base_url.clone();
+                let route = ProjectRoute::new(
+                    route.name,
+                    route.base_url,
+                    route.api_key,
+                    route.api_key_env,
+                    route.base_url_env,
+                )?;
+                if route.base_url() != original_url {
+                    return Err(ModelError::InvalidBaseUrl);
+                }
+                Ok(route)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ModelError::MalformedPayload)?;
+        Project::new(wire.name, routes).map_err(|_| ModelError::MalformedPayload)
     }
 
     pub fn description(&self) -> String {
@@ -255,7 +293,7 @@ impl ProjectRoute {
     }
 
     fn validate(&self) -> Result<(), ModelError> {
-        validate_identifier(&self.name, "route name")?;
+        validate_identifier(&self.name)?;
         if canonical_base_url(&self.base_url)? != self.base_url {
             return Err(ModelError::InvalidBaseUrl);
         }
@@ -345,10 +383,10 @@ mod tests {
     #[test]
     fn names_are_identifiers_not_paths() {
         for invalid in ["", ".", "../app", "/tmp/app", "two words", "_hidden"] {
-            assert!(validate_identifier(invalid, "project name").is_err());
+            assert!(validate_identifier(invalid).is_err());
         }
         for valid in ["app", "my-app", "app2", "2-app"] {
-            assert!(validate_identifier(valid, "project name").is_ok());
+            assert!(validate_identifier(valid).is_ok());
         }
     }
 
@@ -449,6 +487,7 @@ mod tests {
             b"not: [valid".as_slice(),
             b"version: 99\nname: app\nroutes: []\n".as_slice(),
             b"version: 1\nname: ../app\nroutes: []\n".as_slice(),
+            b"version: 1\nname: \"bad\\e[31m\"\nroutes: []\n".as_slice(),
         ] {
             assert_eq!(Project::decode(payload), Err(ModelError::MalformedPayload));
         }
