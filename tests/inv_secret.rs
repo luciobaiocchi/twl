@@ -9,20 +9,22 @@ fn project() -> Project {
     Project::new(
         "my-app".into(),
         vec![
-            ProjectRoute {
-                name: "billing".into(),
-                base_url: "https://billing.example.test/v1".into(),
-                api_key: BILLING_KEY.into(),
-                api_key_env: "BILLING_API_KEY".into(),
-                base_url_env: "BILLING_BASE_URL".into(),
-            },
-            ProjectRoute {
-                name: "search".into(),
-                base_url: "https://search.example.test/api".into(),
-                api_key: SEARCH_KEY.into(),
-                api_key_env: "SEARCH_API_KEY".into(),
-                base_url_env: "SEARCH_BASE_URL".into(),
-            },
+            ProjectRoute::new(
+                "billing".into(),
+                "https://billing.example.test/v1".into(),
+                BILLING_KEY.into(),
+                "BILLING_API_KEY".into(),
+                "BILLING_BASE_URL".into(),
+            )
+            .unwrap(),
+            ProjectRoute::new(
+                "search".into(),
+                "https://search.example.test/api".into(),
+                SEARCH_KEY.into(),
+                "SEARCH_API_KEY".into(),
+                "SEARCH_BASE_URL".into(),
+            )
+            .unwrap(),
         ],
     )
     .unwrap()

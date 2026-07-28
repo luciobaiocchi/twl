@@ -1,9 +1,7 @@
 use std::io::{self, Write};
 use std::process::exit;
 use twl::config::Config;
-use twl::project::{
-    validate_identifier, MacKeychainProjectStore, Project, ProjectRoute, ProjectStore,
-};
+use twl::project::{open_project_service, validate_identifier, Project, ProjectRoute};
 use twl::{child_command, prepare_demo, prepare_project, secret, Prepared};
 
 fn main() {
@@ -45,51 +43,53 @@ fn one_name(args: &[String], operation: &str) -> Result<String, String> {
     let [name] = args else {
         return Err(format!("usage: twl project {operation} <name>"));
     };
-    validate_identifier(name, "project name")?;
+    validate_identifier(name, "project name").map_err(|error| error.to_string())?;
     Ok(name.clone())
 }
 
 fn project_command(args: &[String]) -> Result<(), String> {
-    let store = MacKeychainProjectStore::new();
+    let store = open_project_service().map_err(|error| error.to_string())?;
     match args.first().map(String::as_str) {
         Some("add") => {
             let name = one_name(&args[1..], "add")?;
-            secret::process_preflight()?;
             let project = prompt_project(name, None)?;
-            store.create(&project)?;
+            store.create(&project).map_err(|error| error.to_string())?;
             println!(
                 "Added project {} with {} route(s).",
-                project.name,
-                project.routes.len()
+                project.name(),
+                project.routes().len()
             );
             Ok(())
         }
         Some("list") if args.len() == 1 => {
-            for name in store.list()? {
+            for name in store.list().map_err(|error| error.to_string())? {
                 println!("{name}");
             }
             Ok(())
         }
         Some("show") => {
             let name = one_name(&args[1..], "show")?;
-            show_project(&store.get(&name)?);
+            let stored = store.get(&name).map_err(|error| error.to_string())?;
+            show_project(stored.project());
             Ok(())
         }
         Some("edit") => {
             let name = one_name(&args[1..], "edit")?;
-            let existing = store.get(&name)?;
-            let project = prompt_project(name, Some(&existing))?;
-            store.replace(&project)?;
+            let existing = store.get(&name).map_err(|error| error.to_string())?;
+            let project = prompt_project(name, Some(existing.project()))?;
+            store
+                .replace(existing.revision(), &project)
+                .map_err(|error| error.to_string())?;
             println!(
                 "Updated project {} with {} route(s).",
-                project.name,
-                project.routes.len()
+                project.name(),
+                project.routes().len()
             );
             Ok(())
         }
         Some("delete") => {
             let name = one_name(&args[1..], "delete")?;
-            store.delete(&name)?;
+            store.delete(&name).map_err(|error| error.to_string())?;
             println!("Deleted project {name}.");
             Ok(())
         }
@@ -139,12 +139,12 @@ fn collect_project(
     eprintln!("Enter routes. Leave the route name blank when finished.");
     let mut routes = Vec::new();
     if let Some(project) = existing {
-        for (position, old) in project.routes.iter().enumerate() {
+        for (position, old) in project.routes().iter().enumerate() {
             let action = ask(
                 &mut read_line,
                 &format!(
                     "Route {}: [k]eep, [e]dit/rename, [d]elete, or [f]inish",
-                    old.name
+                    old.name()
                 ),
                 Some("k"),
             )?;
@@ -155,8 +155,8 @@ fn collect_project(
                     routes.push(prompt_route(Some(old), &mut read_line, &mut read_password)?)
                 }
                 "f" | "finish" | "done" => {
-                    routes.extend(project.routes[position..].iter().cloned());
-                    return Project::new(name, routes);
+                    routes.extend(project.routes()[position..].iter().cloned());
+                    return Project::new(name, routes).map_err(|error| error.to_string());
                 }
                 _ => return Err("route action must be keep, edit, delete, or finish".into()),
             }
@@ -168,7 +168,7 @@ fn collect_project(
         if route_name.is_empty() {
             break;
         }
-        validate_identifier(&route_name, "route name")?;
+        validate_identifier(&route_name, "route name").map_err(|error| error.to_string())?;
         routes.push(prompt_route_with_name(
             route_name,
             None,
@@ -176,7 +176,7 @@ fn collect_project(
             &mut read_password,
         )?);
     }
-    Project::new(name, routes)
+    Project::new(name, routes).map_err(|error| error.to_string())
 }
 
 fn prompt_route(
@@ -184,12 +184,8 @@ fn prompt_route(
     read_line: &mut impl FnMut(&str) -> Result<String, String>,
     read_password: &mut impl FnMut(&str) -> Result<String, String>,
 ) -> Result<ProjectRoute, String> {
-    let route_name = ask(
-        read_line,
-        "Route name",
-        existing.map(|route| route.name.as_str()),
-    )?;
-    validate_identifier(&route_name, "route name")?;
+    let route_name = ask(read_line, "Route name", existing.map(ProjectRoute::name))?;
+    validate_identifier(&route_name, "route name").map_err(|error| error.to_string())?;
     prompt_route_with_name(route_name, existing, read_line, read_password)
 }
 
@@ -202,17 +198,17 @@ fn prompt_route_with_name(
     let base_url = ask(
         read_line,
         "Exact HTTPS base URL",
-        existing.map(|route| route.base_url.as_str()),
+        existing.map(ProjectRoute::base_url),
     )?;
     let api_key_env = ask(
         read_line,
         "Application API-key environment variable",
-        existing.map(|route| route.api_key_env.as_str()),
+        existing.map(ProjectRoute::api_key_env),
     )?;
     let base_url_env = ask(
         read_line,
         "Application base-URL environment variable",
-        existing.map(|route| route.base_url_env.as_str()),
+        existing.map(ProjectRoute::base_url_env),
     )?;
     let key_label = if existing.is_some() {
         "Static Bearer API key (leave blank to keep existing): "
@@ -222,18 +218,15 @@ fn prompt_route_with_name(
     let entered = read_password(key_label)?;
     let api_key = if entered.is_empty() {
         existing
-            .map(|route| route.api_key.clone())
+            .cloned()
+            .map(ProjectRoute::into_parts)
+            .map(|(_, _, key, _, _)| key)
             .ok_or("API key must not be empty")?
     } else {
         entered
     };
-    Ok(ProjectRoute {
-        name: route_name,
-        base_url,
-        api_key,
-        api_key_env,
-        base_url_env,
-    })
+    ProjectRoute::new(route_name, base_url, api_key, api_key_env, base_url_env)
+        .map_err(|error| error.to_string())
 }
 
 fn show_project(project: &Project) {
@@ -242,10 +235,10 @@ fn show_project(project: &Project) {
 
 fn run(args: &[String]) -> Result<i32, String> {
     let (name, command, command_args) = run_invocation(args)?;
-    let store = MacKeychainProjectStore::new();
-    let project = store.get(name)?;
-    let route_count = project.routes.len();
-    let prepared = prepare_project(project)?;
+    let store = open_project_service().map_err(|error| error.to_string())?;
+    let stored = store.get(name).map_err(|error| error.to_string())?;
+    let route_count = stored.project().routes().len();
+    let prepared = prepare_project(stored.into_parts().0)?;
     eprintln!("twl: authorized project {name} with {route_count} route(s) for this session");
     run_prepared(prepared, command, command_args, None)
 }
@@ -260,7 +253,7 @@ fn run_invocation(args: &[String]) -> Result<(&str, &str, &[String]), String> {
         [option, ..] if option != "--project" => return Err(format!("unknown option: {option}")),
         _ => return Err("usage: twl run --project <name> -- <command> [args...]".into()),
     };
-    validate_identifier(name, "project name")?;
+    validate_identifier(name, "project name").map_err(|error| error.to_string())?;
     let command = args.get(split + 1).ok_or("missing command")?;
     Ok((name, command, &args[split + 2..]))
 }
@@ -369,13 +362,14 @@ mod tests {
     use std::collections::VecDeque;
 
     fn route(name: &str, key: &str, prefix: &str) -> ProjectRoute {
-        ProjectRoute {
-            name: name.into(),
-            base_url: format!("https://{name}.example.test/v1"),
-            api_key: key.into(),
-            api_key_env: format!("{prefix}_KEY"),
-            base_url_env: format!("{prefix}_URL"),
-        }
+        ProjectRoute::new(
+            name.into(),
+            format!("https://{name}.example.test/v1"),
+            key.into(),
+            format!("{prefix}_KEY"),
+            format!("{prefix}_URL"),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -402,9 +396,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(edited.routes.len(), 1);
-        assert_eq!(edited.routes[0].name, "renamed");
-        assert_eq!(edited.routes[0].api_key, "search-key");
+        assert_eq!(edited.routes().len(), 1);
+        assert_eq!(edited.routes()[0].name(), "renamed");
+        assert_eq!(edited.routes()[0].clone().into_parts().2, "search-key");
         assert!(!edited.description().contains("search-key"));
     }
 

@@ -27,20 +27,21 @@ struct RouteEnvironment {
 }
 
 pub fn prepare_project(project: Project) -> Result<Prepared, String> {
-    project.validate()?;
-    let mut routes = Vec::with_capacity(project.routes.len());
-    let mut environment = Vec::with_capacity(project.routes.len());
-    for route in project.routes {
-        let upstream = validate_upstream(&route.base_url)?;
+    project.validate().map_err(|error| error.to_string())?;
+    let project_routes = project.into_routes();
+    let mut routes = Vec::with_capacity(project_routes.len());
+    let mut environment = Vec::with_capacity(project_routes.len());
+    for route in project_routes {
+        let (name, base_url, key, api_key_env, base_url_env) = route.into_parts();
         routes.push(proxy::Route {
-            name: route.name.clone(),
-            upstream,
-            key: route.api_key,
+            name: name.clone(),
+            upstream: base_url,
+            key,
         });
         environment.push(RouteEnvironment {
-            route: route.name,
-            api_key_env: route.api_key_env,
-            base_url_env: route.base_url_env,
+            route: name,
+            api_key_env,
+            base_url_env,
             fake_key: secret::mock(),
         });
     }
