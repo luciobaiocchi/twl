@@ -4,7 +4,7 @@ use super::{
 };
 use crate::secret;
 use core_foundation::array::CFArray;
-use core_foundation::base::{CFType, TCFType, ToVoid};
+use core_foundation::base::{CFType, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::data::CFData;
 use core_foundation::dictionary::{CFDictionary, CFMutableDictionary};
@@ -15,14 +15,11 @@ use core_foundation_sys::error::CFErrorRef;
 use core_foundation_sys::string::CFStringRef;
 use rand::RngCore;
 use security_framework::base::Error;
-use security_framework_sys::access_control::{
-    kSecAttrAccessible, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-};
 use security_framework_sys::base::{errSecDuplicateItem, errSecItemNotFound, errSecSuccess};
 use security_framework_sys::item::{
     kSecAttrAccessGroup, kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecClass,
     kSecClassGenericPassword, kSecMatchLimit, kSecMatchLimitAll, kSecReturnAttributes,
-    kSecReturnData, kSecUseDataProtectionKeychain, kSecValueData,
+    kSecReturnData, kSecValueData,
 };
 use security_framework_sys::keychain_item::{
     SecItemAdd, SecItemCopyMatching, SecItemDelete, SecItemUpdate,
@@ -42,7 +39,10 @@ const REVISION_BYTES: usize = 32;
 type SecTaskRef = *const c_void;
 
 extern "C" {
+    static kSecAttrAccessible: CFStringRef;
+    static kSecAttrAccessibleWhenUnlockedThisDeviceOnly: CFStringRef;
     static kSecAttrGeneric: CFStringRef;
+    static kSecUseDataProtectionKeychain: CFStringRef;
     fn SecTaskCreateFromSelf(allocator: *const c_void) -> SecTaskRef;
     fn SecTaskCopyValueForEntitlement(
         task: SecTaskRef,
@@ -66,7 +66,7 @@ fn random_revision() -> Revision {
 }
 
 fn add_pair(dict: &mut CFMutableDictionary, key: CFTypeRef, value: CFTypeRef) {
-    dict.add(&key.to_void(), &value.to_void());
+    dict.add(&key, &value);
 }
 
 fn base_query(access_group: &str) -> CFMutableDictionary {
@@ -169,7 +169,10 @@ impl MacKeychainRepository {
         if status != errSecSuccess {
             return Err(platform("reading protected project", status));
         }
-        if result.is_null() || unsafe { CFGetTypeID(result) } != CFDictionary::type_id() {
+        if result.is_null()
+            || unsafe { CFGetTypeID(result) }
+                != CFDictionary::<*const c_void, *const c_void>::type_id()
+        {
             if !result.is_null() {
                 unsafe { CFRelease(result) };
             }
@@ -228,9 +231,9 @@ impl ProjectRepository for MacKeychainRepository {
         let results: CFArray<CFType> =
             unsafe { CFArray::wrap_under_create_rule(result as CFArrayRef) };
         let mut seen = HashSet::new();
-        let mut names = Vec::with_capacity(results.len());
+        let mut names = Vec::with_capacity(results.len() as usize);
         for value in results.iter() {
-            if value.type_of() != CFDictionary::type_id() {
+            if value.type_of() != CFDictionary::<*const c_void, *const c_void>::type_id() {
                 return Err(StoreError::MalformedRecord);
             }
             // SAFETY: the array owns this value and its checked runtime type is CFDictionary.
