@@ -7,7 +7,7 @@ use core_foundation::base::TCFType;
 use core_foundation::data::CFData;
 use core_foundation::string::CFString;
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
-use core_foundation_sys::base::{CFEqual, CFRelease, CFTypeRef};
+use core_foundation_sys::base::CFRelease;
 use core_foundation_sys::data::CFDataRef;
 use core_foundation_sys::string::CFStringRef;
 use security_framework::base::Error;
@@ -39,13 +39,12 @@ enum OpaqueSecTrustedApplication {}
 type SecTrustedApplicationRef = *mut OpaqueSecTrustedApplication;
 
 extern "C" {
-    static kSecACLAuthorizationDecrypt: CFStringRef;
     fn SecKeychainItemCopyAccess(
         item: security_framework_sys::base::SecKeychainItemRef,
         access: *mut SecAccessRef,
     ) -> i32;
     fn SecAccessCopyACLList(access: SecAccessRef, acls: *mut CFArrayRef) -> i32;
-    fn SecACLCopyAuthorizations(acl: SecAclRef) -> CFArrayRef;
+    fn SecACLGetAuthorizations(acl: SecAclRef, tags: *mut i32, tag_count: *mut u32) -> i32;
     fn SecACLCopyContents(
         acl: SecAclRef,
         applications: *mut CFArrayRef,
@@ -153,22 +152,21 @@ fn verify_access_acls(access: SecAccessRef, executable: &Path) -> bool {
     eprintln!("ACL diagnostic: {count} ACL entries");
     for index in 0..count {
         let acl = unsafe { CFArrayGetValueAtIndex(acls, index) as SecAclRef };
-        let authorizations = if acl.is_null() {
-            ptr::null()
-        } else {
-            unsafe { SecACLCopyAuthorizations(acl) }
-        };
-        if authorizations.is_null() {
+        let mut tags = [0_i32; 32];
+        let mut tag_count = tags.len() as u32;
+        if acl.is_null()
+            || unsafe { SecACLGetAuthorizations(acl, tags.as_mut_ptr(), &mut tag_count) }
+                != errSecSuccess
+            || tag_count as usize > tags.len()
+        {
             unsafe { CFRelease(acls.cast()) };
             return false;
         }
-        let decrypt = array_contains(
-            authorizations,
-            unsafe { kSecACLAuthorizationDecrypt }.cast(),
-        );
+        let decrypt = tags[..tag_count as usize]
+            .iter()
+            .any(|tag| matches!(*tag, 1 | 24));
         #[cfg(test)]
         eprintln!("ACL diagnostic: decrypt={decrypt}");
-        unsafe { CFRelease(authorizations.cast()) };
         if decrypt {
             found_decrypt = true;
             if !acl_allows_only_executable(acl, executable) {
@@ -179,12 +177,6 @@ fn verify_access_acls(access: SecAccessRef, executable: &Path) -> bool {
     }
     unsafe { CFRelease(acls.cast()) };
     found_decrypt
-}
-
-fn array_contains(array: CFArrayRef, expected: CFTypeRef) -> bool {
-    let count = unsafe { CFArrayGetCount(array) };
-    (0..count)
-        .any(|index| unsafe { CFEqual(CFArrayGetValueAtIndex(array, index).cast(), expected) != 0 })
 }
 
 fn acl_allows_only_executable(acl: SecAclRef, executable: &Path) -> bool {
