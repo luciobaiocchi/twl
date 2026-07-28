@@ -32,6 +32,8 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString"] }
 objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "block2", "LAContext"] }
 security-framework = "3"
+security-framework-sys = "2"
+core-foundation = "0.10"
 
 [profile.release]
 opt-level = "z"

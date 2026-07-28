@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 const FORMAT_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
     version: u32,
@@ -12,7 +12,7 @@ pub struct Project {
     pub routes: Vec<ProjectRoute>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectRoute {
     pub name: String,
@@ -47,11 +47,48 @@ fn validate_env_name(value: &str, field: &str) -> Result<(), String> {
     {
         return Err(format!("{field} must be a valid environment variable name"));
     }
+    if value == "PATH"
+        || value == "DBUS_SESSION_BUS_ADDRESS"
+        || value.starts_with("TWL_")
+        || value.starts_with("DYLD_")
+        || matches!(value, "LD_PRELOAD" | "LD_LIBRARY_PATH")
+    {
+        return Err(format!(
+            "{field} is reserved by Towel or the process runtime"
+        ));
+    }
     Ok(())
 }
 
+impl std::fmt::Debug for Project {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Project")
+            .field("version", &self.version)
+            .field("name", &self.name)
+            .field("routes", &self.routes)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ProjectRoute {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProjectRoute")
+            .field("name", &self.name)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("api_key_env", &self.api_key_env)
+            .field("base_url_env", &self.base_url_env)
+            .finish()
+    }
+}
+
 impl Project {
-    pub fn new(name: String, routes: Vec<ProjectRoute>) -> Result<Self, String> {
+    pub fn new(name: String, mut routes: Vec<ProjectRoute>) -> Result<Self, String> {
+        for route in &mut routes {
+            route.canonicalize()?;
+        }
         let project = Self {
             version: FORMAT_VERSION,
             name,
@@ -120,17 +157,51 @@ impl Project {
 }
 
 impl ProjectRoute {
-    fn validate(&self) -> Result<(), String> {
-        validate_upstream(&self.base_url)?;
-        if url::Url::parse(&self.base_url).is_ok_and(|parsed| parsed.scheme() != "https") {
+    fn canonicalize(&mut self) -> Result<(), String> {
+        if self
+            .base_url
+            .bytes()
+            .any(|byte| byte < 0x20 || byte == 0x7f)
+        {
+            return Err(format!(
+                "route {} base URL contains control characters",
+                self.name
+            ));
+        }
+        let canonical = validate_upstream(&self.base_url)?;
+        if url::Url::parse(&canonical).is_ok_and(|parsed| parsed.scheme() != "https") {
             return Err(format!("route {} base URL must use HTTPS", self.name));
         }
-        if self.api_key.is_empty() {
-            return Err(format!("route {} has an empty API key", self.name));
-        }
-        if self.api_key.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        self.base_url = canonical;
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self
+            .base_url
+            .bytes()
+            .any(|byte| byte < 0x20 || byte == 0x7f)
+        {
             return Err(format!(
-                "route {} API key contains control characters",
+                "route {} base URL contains control characters",
+                self.name
+            ));
+        }
+        let canonical = validate_upstream(&self.base_url)?;
+        if canonical != self.base_url {
+            return Err(format!("route {} base URL is not canonical", self.name));
+        }
+        if url::Url::parse(&canonical).is_ok_and(|parsed| parsed.scheme() != "https") {
+            return Err(format!("route {} base URL must use HTTPS", self.name));
+        }
+        let unpadded = self.api_key.trim_end_matches('=');
+        if unpadded.is_empty()
+            || !unpadded
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-._~+/".contains(&byte))
+        {
+            return Err(format!(
+                "route {} API key is not a valid Bearer value",
                 self.name
             ));
         }
@@ -172,13 +243,15 @@ impl Default for MacKeychainProjectStore {
 mod mac_store {
     use super::*;
     use crate::secret;
+    use core_foundation::base::TCFType;
     use security_framework::base::Error;
-    use security_framework::passwords::{
-        delete_generic_password, get_generic_password, set_generic_password,
-    };
+    use security_framework::item::{ItemClass, ItemSearchOptions, Limit, SearchResult};
+    use security_framework::os::macos::keychain::SecKeychain;
+    use security_framework::os::macos::keychain_item::SecKeychainItem;
+    use security_framework_sys::base::errSecSuccess;
+    use security_framework_sys::keychain_item::SecKeychainItemDelete;
 
     const SERVICE: &str = "dev.towel.project";
-    const INDEX_ACCOUNT: &str = "__project_index_v1";
     const ITEM_NOT_FOUND: i32 = -25300;
 
     fn account(name: &str) -> String {
@@ -189,114 +262,226 @@ mod mac_store {
         error.code() == ITEM_NOT_FOUND
     }
 
-    fn read_index() -> Result<Vec<String>, String> {
-        match get_generic_password(SERVICE, INDEX_ACCOUNT) {
-            Ok(bytes) => {
-                let raw = std::str::from_utf8(&bytes)
-                    .map_err(|_| "malformed Keychain project index".to_string())?;
-                let mut names = Vec::new();
-                for name in raw.lines() {
-                    validate_identifier(name, "project name")
-                        .map_err(|_| "malformed Keychain project index".to_string())?;
-                    if names.iter().any(|existing| existing == name) {
-                        return Err("malformed Keychain project index".into());
-                    }
-                    names.push(name.to_string());
+    struct ScopedKeychainStore {
+        keychain: SecKeychain,
+    }
+
+    impl ScopedKeychainStore {
+        fn default() -> Result<Self, String> {
+            SecKeychain::default()
+                .map(|keychain| Self { keychain })
+                .map_err(|error| format!("opening the default Keychain: {error}"))
+        }
+
+        fn list(&self) -> Result<Vec<String>, String> {
+            let results = match ItemSearchOptions::new()
+                .keychains(std::slice::from_ref(&self.keychain))
+                .class(ItemClass::generic_password())
+                .service(SERVICE)
+                .load_data(true)
+                .limit(Limit::All)
+                .search()
+            {
+                Ok(results) => results,
+                Err(error) if missing(&error) => return Ok(Vec::new()),
+                Err(error) => return Err(format!("listing Keychain projects: {error}")),
+            };
+            let mut names = Vec::with_capacity(results.len());
+            for result in results {
+                let SearchResult::Data(payload) = result else {
+                    return Err("malformed Keychain project record".into());
+                };
+                let project = Project::decode(&payload)?;
+                if names.iter().any(|name| name == &project.name) {
+                    return Err("duplicate Keychain project records".into());
                 }
-                names.sort();
-                Ok(names)
+                names.push(project.name);
             }
-            Err(error) if missing(&error) => Ok(Vec::new()),
-            Err(error) => Err(format!("reading Keychain project index: {error}")),
+            names.sort();
+            Ok(names)
         }
-    }
 
-    fn write_index(names: &[String]) -> Result<(), String> {
-        let mut sorted = names.to_vec();
-        sorted.sort();
-        let payload = sorted.join("\n");
-        set_generic_password(SERVICE, INDEX_ACCOUNT, payload.as_bytes())
-            .map_err(|error| format!("writing Keychain project index: {error}"))
-    }
+        fn find(&self, name: &str) -> Result<(Project, SecKeychainItem), String> {
+            let (bytes, item) = self
+                .keychain
+                .find_generic_password(SERVICE, &account(name))
+                .map_err(|error| {
+                    if missing(&error) {
+                        format!("project not found: {name}")
+                    } else {
+                        format!("reading project from Keychain: {error}")
+                    }
+                })?;
+            let project = Project::decode(bytes.as_ref())?;
+            if project.name != name {
+                return Err("malformed Keychain project payload".into());
+            }
+            Ok((project, item))
+        }
 
-    fn read_project(name: &str) -> Result<Project, String> {
-        let bytes = get_generic_password(SERVICE, &account(name)).map_err(|error| {
-            if missing(&error) {
-                format!("project not found: {name}")
+        fn get(&self, name: &str) -> Result<Project, String> {
+            self.find(name).map(|(project, _)| project)
+        }
+
+        fn create(&self, project: &Project) -> Result<(), String> {
+            self.keychain
+                .add_generic_password(SERVICE, &account(&project.name), &project.encode()?)
+                .map_err(|error| {
+                    if error.code() == -25299 {
+                        format!("project already exists: {}", project.name)
+                    } else {
+                        format!("writing project to Keychain: {error}")
+                    }
+                })
+        }
+
+        fn replace(&self, project: &Project) -> Result<(), String> {
+            let (_, mut item) = self.find(&project.name)?;
+            item.set_password(&project.encode()?)
+                .map_err(|error| format!("replacing project in Keychain: {error}"))
+        }
+
+        fn delete(&self, name: &str) -> Result<(), String> {
+            let (_, item) = self.find(name)?;
+            let status = unsafe { SecKeychainItemDelete(item.as_concrete_TypeRef()) };
+            if status == errSecSuccess {
+                Ok(())
             } else {
-                format!("reading project from Keychain: {error}")
+                Err(format!(
+                    "deleting project from Keychain: {}",
+                    Error::from_code(status)
+                ))
             }
-        })?;
-        let project = Project::decode(&bytes)?;
-        if project.name != name {
-            return Err("malformed Keychain project payload".into());
         }
-        Ok(project)
     }
 
     impl ProjectStore for MacKeychainProjectStore {
         fn list(&self) -> Result<Vec<String>, String> {
             secret::authorize("list Towel projects")?;
-            read_index()
+            ScopedKeychainStore::default()?.list()
         }
 
         fn get(&self, name: &str) -> Result<Project, String> {
             validate_identifier(name, "project name")?;
             secret::authorize(&format!("access Towel project {name}"))?;
-            read_project(name)
+            ScopedKeychainStore::default()?.get(name)
         }
 
         fn create(&self, project: &Project) -> Result<(), String> {
             project.validate()?;
             secret::authorize(&format!("store Towel project {}", project.name))?;
-            let mut names = read_index()?;
-            if names.iter().any(|name| name == &project.name) {
-                return Err(format!("project already exists: {}", project.name));
-            }
-            let account = account(&project.name);
-            match get_generic_password(SERVICE, &account) {
-                Ok(_) => return Err(format!("project already exists: {}", project.name)),
-                Err(error) if missing(&error) => {}
-                Err(error) => return Err(format!("checking Keychain project: {error}")),
-            }
-            set_generic_password(SERVICE, &account, &project.encode()?)
-                .map_err(|error| format!("writing project to Keychain: {error}"))?;
-            names.push(project.name.clone());
-            if let Err(error) = write_index(&names) {
-                let _ = delete_generic_password(SERVICE, &account);
-                return Err(error);
-            }
-            Ok(())
+            ScopedKeychainStore::default()?.create(project)
         }
 
         fn replace(&self, project: &Project) -> Result<(), String> {
             project.validate()?;
             secret::authorize(&format!("replace Towel project {}", project.name))?;
-            let names = read_index()?;
-            if !names.iter().any(|name| name == &project.name) {
-                return Err(format!("project not found: {}", project.name));
-            }
-            // SecItemUpdate replaces the record data atomically when the item exists.
-            set_generic_password(SERVICE, &account(&project.name), &project.encode()?)
-                .map_err(|error| format!("replacing project in Keychain: {error}"))
+            ScopedKeychainStore::default()?.replace(project)
         }
 
         fn delete(&self, name: &str) -> Result<(), String> {
             validate_identifier(name, "project name")?;
             secret::authorize(&format!("delete Towel project {name}"))?;
-            let project = read_project(name)?;
-            let mut names = read_index()?;
-            if !names.iter().any(|existing| existing == name) {
-                return Err(format!("project not found: {name}"));
-            }
-            delete_generic_password(SERVICE, &account(name))
-                .map_err(|error| format!("deleting project from Keychain: {error}"))?;
-            names.retain(|existing| existing != name);
-            if let Err(error) = write_index(&names) {
-                let _ = set_generic_password(SERVICE, &account(name), &project.encode()?);
-                return Err(error);
-            }
-            Ok(())
+            ScopedKeychainStore::default()?.delete(name)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use security_framework::os::macos::keychain::CreateOptions;
+        use std::path::PathBuf;
+
+        fn project(name: &str, key: &str) -> Project {
+            Project::new(
+                name.into(),
+                vec![ProjectRoute {
+                    name: "api".into(),
+                    base_url: "https://api.example.test/v1".into(),
+                    api_key: key.into(),
+                    api_key_env: "APP_API_KEY".into(),
+                    base_url_env: "APP_BASE_URL".into(),
+                }],
+            )
+            .unwrap()
+        }
+
+        fn test_store(label: &str) -> (PathBuf, ScopedKeychainStore) {
+            let path = std::env::temp_dir().join(format!(
+                "twl-{label}-{}-{}.keychain",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let keychain = CreateOptions::new()
+                .password("test-password")
+                .create(&path)
+                .unwrap();
+            (path, ScopedKeychainStore { keychain })
+        }
+
+        #[test]
+        fn operations_never_touch_matching_items_in_another_keychain() {
+            let (primary_path, primary) = test_store("primary");
+            let (other_path, other) = test_store("other");
+            let original = b"attacker-controlled";
+            other
+                .keychain
+                .add_generic_password(SERVICE, &account("app"), original)
+                .unwrap();
+
+            primary.create(&project("app", "first-key")).unwrap();
+            primary.replace(&project("app", "second-key")).unwrap();
+            primary.delete("app").unwrap();
+
+            let (other_value, _) = other
+                .keychain
+                .find_generic_password(SERVICE, &account("app"))
+                .unwrap();
+            assert_eq!(other_value.as_ref(), original);
+            drop((primary, other));
+            let _ = std::fs::remove_file(primary_path);
+            let _ = std::fs::remove_file(other_path);
+        }
+
+        #[test]
+        fn authoritative_records_survive_concurrent_creates_and_remain_manageable() {
+            let (path, store) = test_store("concurrent");
+            let keychain = store.keychain.clone();
+            let first = std::thread::spawn(move || {
+                ScopedKeychainStore { keychain }.create(&project("one", "first-key"))
+            });
+            let keychain = store.keychain.clone();
+            let second = std::thread::spawn(move || {
+                ScopedKeychainStore { keychain }.create(&project("two", "second-key"))
+            });
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+
+            assert_eq!(store.list().unwrap(), ["one", "two"]);
+            store.replace(&project("one", "replacement-key")).unwrap();
+            store.delete("one").unwrap();
+            store.delete("two").unwrap();
+            assert!(store.list().unwrap().is_empty());
+            drop(store);
+            let _ = std::fs::remove_file(path);
+        }
+
+        #[test]
+        fn create_is_add_only_and_replace_never_creates() {
+            let (path, store) = test_store("semantics");
+            let candidate = project("app", "first-key");
+            store.create(&candidate).unwrap();
+            assert!(store
+                .create(&candidate)
+                .unwrap_err()
+                .contains("already exists"));
+            assert!(store
+                .replace(&project("missing", "second-key"))
+                .unwrap_err()
+                .contains("not found"));
+            store.delete("app").unwrap();
+            drop(store);
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -411,6 +596,58 @@ mod tests {
         let error = Project::new("app".into(), vec![candidate]).unwrap_err();
         assert!(!error.contains(secret));
         assert!(!error.contains("do-not-print"));
+
+        for invalid in ["   ", "café", "has space", "token:colon", "key\tvalue"] {
+            let mut candidate = route("api", "API_KEY", "API_URL");
+            candidate.api_key = invalid.into();
+            let error = Project::new("app".into(), vec![candidate]).unwrap_err();
+            assert!(!error.contains(invalid));
+        }
+    }
+
+    #[test]
+    fn destinations_are_canonicalized_once_and_controls_are_rejected() {
+        let mut candidate = route("api", "API_KEY", "API_URL");
+        candidate.base_url = "HTTPS://EXAMPLE.TEST:443/safe/%2e%2e/admin".into();
+        let project = Project::new("app".into(), vec![candidate]).unwrap();
+        assert_eq!(project.routes[0].base_url, "https://example.test/admin");
+        assert!(project.description().contains("https://example.test/admin"));
+        assert!(project
+            .encode()
+            .unwrap()
+            .windows(26)
+            .any(|part| part == b"https://example.test/admin"));
+
+        let mut candidate = route("api", "API_KEY", "API_URL");
+        candidate.base_url = "https://éxample.test/路径".into();
+        let project = Project::new("app".into(), vec![candidate]).unwrap();
+        assert!(project.routes[0].base_url.contains("xn--"));
+        assert!(project.routes[0].base_url.contains("%E8%B7%AF%E5%BE%84"));
+
+        for control in ['\n', '\t', '\u{1b}'] {
+            let mut candidate = route("api", "API_KEY", "API_URL");
+            candidate.base_url = format!("https://example.test/{control}hidden");
+            assert!(Project::new("app".into(), vec![candidate]).is_err());
+        }
+
+        let noncanonical = b"version: 1\nname: app\nroutes:\n- name: api\n  base_url: HTTPS://EXAMPLE.TEST:443/path\n  api_key: valid-key\n  api_key_env: API_KEY\n  base_url_env: API_URL\n";
+        assert_eq!(
+            Project::decode(noncanonical).unwrap_err(),
+            "malformed Keychain project payload"
+        );
+    }
+
+    #[test]
+    fn execution_sensitive_environment_names_are_rejected() {
+        for name in [
+            "PATH",
+            "TWL_APPLICATION_API_KEY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+        ] {
+            assert!(Project::new("app".into(), vec![route("api", name, "API_URL")]).is_err());
+        }
     }
 
     #[test]
@@ -435,5 +672,6 @@ mod tests {
         assert!(shown.contains("API_KEY"));
         assert!(!shown.contains("secret-api"));
         assert!(!shown.to_ascii_lowercase().contains("fingerprint"));
+        assert!(!format!("{project:?}").contains("secret-api"));
     }
 }

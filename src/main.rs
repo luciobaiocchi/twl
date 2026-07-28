@@ -97,7 +97,7 @@ fn project_command(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn prompt(label: &str) -> Result<String, String> {
+fn terminal_line(label: &str) -> Result<String, String> {
     eprint!("{label}: ");
     io::stderr().flush().map_err(|error| error.to_string())?;
     let mut value = String::new();
@@ -107,11 +107,15 @@ fn prompt(label: &str) -> Result<String, String> {
     Ok(value.trim().to_string())
 }
 
-fn prompt_default(label: &str, default: Option<&str>) -> Result<String, String> {
+fn ask(
+    read_line: &mut impl FnMut(&str) -> Result<String, String>,
+    label: &str,
+    default: Option<&str>,
+) -> Result<String, String> {
     let shown = default
         .map(|value| format!(" [{value}]"))
         .unwrap_or_default();
-    let value = prompt(&format!("{label}{shown}"))?;
+    let value = read_line(&format!("{label}{shown}"))?;
     Ok(if value.is_empty() {
         default.unwrap_or_default().to_string()
     } else {
@@ -120,54 +124,116 @@ fn prompt_default(label: &str, default: Option<&str>) -> Result<String, String> 
 }
 
 fn prompt_project(name: String, existing: Option<&Project>) -> Result<Project, String> {
+    collect_project(name, existing, terminal_line, |label| {
+        rpassword::prompt_password(label)
+            .map_err(|error| format!("reading API key from terminal: {error}"))
+    })
+}
+
+fn collect_project(
+    name: String,
+    existing: Option<&Project>,
+    mut read_line: impl FnMut(&str) -> Result<String, String>,
+    mut read_password: impl FnMut(&str) -> Result<String, String>,
+) -> Result<Project, String> {
     eprintln!("Enter routes. Leave the route name blank when finished.");
     let mut routes = Vec::new();
-    let mut position = 0;
+    if let Some(project) = existing {
+        for (position, old) in project.routes.iter().enumerate() {
+            let action = ask(
+                &mut read_line,
+                &format!(
+                    "Route {}: [k]eep, [e]dit/rename, [d]elete, or [f]inish",
+                    old.name
+                ),
+                Some("k"),
+            )?;
+            match action.to_ascii_lowercase().as_str() {
+                "k" | "keep" => routes.push(old.clone()),
+                "d" | "delete" => {}
+                "e" | "edit" => {
+                    routes.push(prompt_route(Some(old), &mut read_line, &mut read_password)?)
+                }
+                "f" | "finish" | "done" => {
+                    routes.extend(project.routes[position..].iter().cloned());
+                    return Project::new(name, routes);
+                }
+                _ => return Err("route action must be keep, edit, delete, or finish".into()),
+            }
+        }
+    }
+
     loop {
-        let old = existing.and_then(|project| project.routes.get(position));
-        let route_name = prompt_default("Route name", old.map(|route| route.name.as_str()))?;
+        let route_name = ask(&mut read_line, "New route name", None)?;
         if route_name.is_empty() {
             break;
         }
         validate_identifier(&route_name, "route name")?;
-        let matching = existing
-            .and_then(|project| project.routes.iter().find(|route| route.name == route_name));
-        let base_url = prompt_default(
-            "Exact HTTPS base URL",
-            matching.map(|route| route.base_url.as_str()),
-        )?;
-        let api_key_env = prompt_default(
-            "Application API-key environment variable",
-            matching.map(|route| route.api_key_env.as_str()),
-        )?;
-        let base_url_env = prompt_default(
-            "Application base-URL environment variable",
-            matching.map(|route| route.base_url_env.as_str()),
-        )?;
-        let key_label = if matching.is_some() {
-            "Static Bearer API key (leave blank to keep existing): "
-        } else {
-            "Static Bearer API key: "
-        };
-        let entered = rpassword::prompt_password(key_label)
-            .map_err(|error| format!("reading API key from terminal: {error}"))?;
-        let api_key = if entered.is_empty() {
-            matching
-                .map(|route| route.api_key.clone())
-                .ok_or("API key must not be empty")?
-        } else {
-            entered
-        };
-        routes.push(ProjectRoute {
-            name: route_name,
-            base_url,
-            api_key,
-            api_key_env,
-            base_url_env,
-        });
-        position += 1;
+        routes.push(prompt_route_with_name(
+            route_name,
+            None,
+            &mut read_line,
+            &mut read_password,
+        )?);
     }
     Project::new(name, routes)
+}
+
+fn prompt_route(
+    existing: Option<&ProjectRoute>,
+    read_line: &mut impl FnMut(&str) -> Result<String, String>,
+    read_password: &mut impl FnMut(&str) -> Result<String, String>,
+) -> Result<ProjectRoute, String> {
+    let route_name = ask(
+        read_line,
+        "Route name",
+        existing.map(|route| route.name.as_str()),
+    )?;
+    validate_identifier(&route_name, "route name")?;
+    prompt_route_with_name(route_name, existing, read_line, read_password)
+}
+
+fn prompt_route_with_name(
+    route_name: String,
+    existing: Option<&ProjectRoute>,
+    read_line: &mut impl FnMut(&str) -> Result<String, String>,
+    read_password: &mut impl FnMut(&str) -> Result<String, String>,
+) -> Result<ProjectRoute, String> {
+    let base_url = ask(
+        read_line,
+        "Exact HTTPS base URL",
+        existing.map(|route| route.base_url.as_str()),
+    )?;
+    let api_key_env = ask(
+        read_line,
+        "Application API-key environment variable",
+        existing.map(|route| route.api_key_env.as_str()),
+    )?;
+    let base_url_env = ask(
+        read_line,
+        "Application base-URL environment variable",
+        existing.map(|route| route.base_url_env.as_str()),
+    )?;
+    let key_label = if existing.is_some() {
+        "Static Bearer API key (leave blank to keep existing): "
+    } else {
+        "Static Bearer API key: "
+    };
+    let entered = read_password(key_label)?;
+    let api_key = if entered.is_empty() {
+        existing
+            .map(|route| route.api_key.clone())
+            .ok_or("API key must not be empty")?
+    } else {
+        entered
+    };
+    Ok(ProjectRoute {
+        name: route_name,
+        base_url,
+        api_key,
+        api_key_env,
+        base_url_env,
+    })
 }
 
 fn show_project(project: &Project) {
@@ -295,4 +361,70 @@ fn serve_demo_upstream(request: tiny_http::Request) {
             .with_status_code(200)
             .with_header(header),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    fn route(name: &str, key: &str, prefix: &str) -> ProjectRoute {
+        ProjectRoute {
+            name: name.into(),
+            base_url: format!("https://{name}.example.test/v1"),
+            api_key: key.into(),
+            api_key_env: format!("{prefix}_KEY"),
+            base_url_env: format!("{prefix}_URL"),
+        }
+    }
+
+    #[test]
+    fn edit_can_delete_and_rename_routes_while_retaining_the_key() {
+        let existing = Project::new(
+            "app".into(),
+            vec![
+                route("billing", "billing-key", "BILLING"),
+                route("search", "search-key", "SEARCH"),
+            ],
+        )
+        .unwrap();
+        let mut lines: VecDeque<String> = ["d", "e", "renamed", "", "", "", ""]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut passwords: VecDeque<String> = [""].into_iter().map(str::to_string).collect();
+
+        let edited = collect_project(
+            "app".into(),
+            Some(&existing),
+            |_| Ok(lines.pop_front().unwrap()),
+            |_| Ok(passwords.pop_front().unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(edited.routes.len(), 1);
+        assert_eq!(edited.routes[0].name, "renamed");
+        assert_eq!(edited.routes[0].api_key, "search-key");
+        assert!(!edited.description().contains("search-key"));
+    }
+
+    #[test]
+    fn finish_keeps_the_current_and_remaining_routes() {
+        let existing = Project::new(
+            "app".into(),
+            vec![
+                route("billing", "billing-key", "BILLING"),
+                route("search", "search-key", "SEARCH"),
+            ],
+        )
+        .unwrap();
+        let edited = collect_project(
+            "app".into(),
+            Some(&existing),
+            |_| Ok("finish".into()),
+            |_| Err("password prompt must not run".into()),
+        )
+        .unwrap();
+        assert_eq!(edited, existing);
+    }
 }
