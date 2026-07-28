@@ -1136,6 +1136,97 @@ footer .legal {
   }
 }
 
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --ink: #fff1fb;
+    --ink-soft: #edcbea;
+    --paper: #16081d;
+    --white: #281130;
+    --pink-dark: #ff76bd;
+    --pink-soft: #581740;
+    --cyan-dark: #61eaf5;
+    --cyan-soft: #103f4a;
+    --purple: #b966ca;
+    --purple-dark: #0d0312;
+    --muted: #c6a7c7;
+  }
+
+  body {
+    background-image:
+      linear-gradient(rgba(255, 197, 229, 0.045) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 197, 229, 0.045) 1px, transparent 1px),
+      radial-gradient(circle at 84% 6%, rgba(245, 50, 154, 0.18), transparent 25rem),
+      radial-gradient(circle at 6% 42%, rgba(9, 196, 220, 0.13), transparent 28rem);
+  }
+
+  .site-header {
+    border-bottom-color: var(--purple);
+    background: rgba(22, 8, 29, 0.94);
+    box-shadow: 0 4px 0 rgba(245, 50, 154, 0.28);
+  }
+
+  .brand img,
+  .nav-github,
+  .eyebrow,
+  .button,
+  .logo-card,
+  .terminal-wrap,
+  .signal-strip,
+  .flow-section,
+  .boundary,
+  .try,
+  .flow-card,
+  .flow-icon,
+  .features article,
+  .feature-number,
+  .boundary-column,
+  .boundary-column h3 span,
+  .code-card,
+  .lore,
+  .lore img,
+  .contribute,
+  .contribute-links a,
+  footer {
+    border-color: var(--purple);
+  }
+
+  .hero-lead,
+  .small-print,
+  .section-heading p,
+  .try-copy > p,
+  .status-line,
+  footer,
+  footer .legal {
+    color: var(--muted);
+  }
+
+  .lore,
+  .lore h2,
+  .signal-strip,
+  .code-title,
+  .pixel-label,
+  .pixel-sticker {
+    color: #351046;
+  }
+
+  .lore p {
+    color: #662873;
+  }
+
+  .contribute,
+  .contribute h2,
+  .contribute-links a,
+  .nav-github,
+  .button.primary {
+    color: #351046;
+  }
+
+  .button.secondary {
+    color: var(--ink);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   html {
     scroll-behavior: auto;
