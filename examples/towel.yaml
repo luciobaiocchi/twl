@@ -1,4 +1,4 @@
-# Project configuration is intentionally low-authority. The credential and
-# upstream are supplied directly to the trusted twl parent at startup.
+# This optional request budget applies only to `twl demo`. Real named-project
+# sessions are configured interactively and stored in the macOS Keychain.
 budget:
   max_requests: 5

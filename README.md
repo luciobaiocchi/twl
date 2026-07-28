@@ -65,8 +65,8 @@ injects only that route's key as `Authorization: Bearer`.
 
 Authorization is per session, not per request. During the session the agent can
 exercise all API authority granted by the project's credentials through the
-broker, including consuming quota or mutating data allowed by those keys. It
-cannot extract a reusable credential through Towel's child contract. Use
+broker, including consuming quota or mutating data allowed by those keys.
+Towel does not directly place a reusable credential in the child contract. Use
 narrowly scoped, development-only keys and end the child process to end the
 session.
 
@@ -77,8 +77,9 @@ accepts ordinary `GET`, `POST`, `PUT`, `PATCH`, and `DELETE` requests. It
 ignores client authentication, `Host`, proxy, and forwarding headers; never
 follows redirects; rejects malformed paths; disables ambient proxy settings;
 caps request and response bodies at 16 MiB; limits concurrency to 16 requests;
-and blocks plaintext or common-base64 credential reflection. Responses remain
-buffered, so streaming is not supported.
+and blocks direct plaintext or common-Base64 credential reflection. It does not
+protect against an authorized upstream that transforms, reflects, or otherwise
+exposes a credential. Responses remain buffered, so streaming is not supported.
 
 Upstreams must use HTTPS. Loopback HTTP exists only for automated tests and the
 generated canary demo.

@@ -33,6 +33,8 @@ only. It is not:
 - protection for the agent's own model-provider login;
 - protection against a malicious upstream, which necessarily receives the
   credential;
+- protection against an authorized upstream that transforms, reflects, or
+  otherwise exposes a credential;
 - a restriction on use of API authority already granted for the session.
 
 One LocalAuthentication approval opens the complete project session. The child
