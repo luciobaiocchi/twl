@@ -173,10 +173,20 @@ fn acl_allows_only_application(
     trusted_application: SecTrustedApplicationRef,
 ) -> bool {
     let mut applications = ptr::null();
-    if unsafe { SecACLCopyContents(acl, &mut applications, ptr::null_mut(), ptr::null_mut()) }
-        != errSecSuccess
-        || applications.is_null()
-    {
+    let mut description = ptr::null();
+    let mut prompt_selector = 0_u16;
+    let status = unsafe {
+        SecACLCopyContents(
+            acl,
+            &mut applications,
+            &mut description,
+            (&mut prompt_selector as *mut u16).cast(),
+        )
+    };
+    if !description.is_null() {
+        unsafe { CFRelease(description.cast()) };
+    }
+    if status != errSecSuccess || applications.is_null() {
         return false;
     }
     let count = unsafe { CFArrayGetCount(applications) };
