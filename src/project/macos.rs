@@ -4,11 +4,9 @@ use super::{
 };
 use crate::secret;
 use core_foundation::base::TCFType;
-use core_foundation::data::CFData;
 use core_foundation::string::CFString;
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
-use core_foundation_sys::base::{CFRelease, CFTypeRef};
-use core_foundation_sys::data::CFDataRef;
+use core_foundation_sys::base::{CFEqual, CFRelease, CFTypeRef};
 use core_foundation_sys::string::CFStringRef;
 use security_framework::base::Error;
 use security_framework::item::{ItemClass, ItemSearchOptions, Limit, Reference, SearchResult};
@@ -20,7 +18,7 @@ use security_framework_sys::base::{
 use security_framework_sys::item::kSecAttrAccount;
 use security_framework_sys::keychain_item::SecKeychainItemDelete;
 use std::collections::HashSet;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -51,9 +49,9 @@ extern "C" {
         description: *mut CFStringRef,
         prompt_selector: *mut std::ffi::c_void,
     ) -> i32;
-    fn SecTrustedApplicationCopyData(
-        application: SecTrustedApplicationRef,
-        data: *mut CFDataRef,
+    fn SecTrustedApplicationCreateFromPath(
+        path: *const libc::c_char,
+        application: *mut SecTrustedApplicationRef,
     ) -> i32;
 }
 
@@ -130,7 +128,18 @@ fn verify_item_acl(item: &SecKeychainItem, executable: &Path) -> Result<(), Stor
     {
         return Err(StoreError::UntrustedItem);
     }
-    let trusted = verify_access_acls(access, executable);
+    let executable =
+        CString::new(executable.as_os_str().as_bytes()).map_err(|_| StoreError::UntrustedItem)?;
+    let mut trusted_application = ptr::null_mut();
+    if unsafe { SecTrustedApplicationCreateFromPath(executable.as_ptr(), &mut trusted_application) }
+        != errSecSuccess
+        || trusted_application.is_null()
+    {
+        unsafe { CFRelease(access.cast()) };
+        return Err(StoreError::UntrustedItem);
+    }
+    let trusted = verify_access_acls(access, trusted_application);
+    unsafe { CFRelease(trusted_application.cast()) };
     // SAFETY: access was returned at +1 by SecKeychainItemCopyAccess.
     unsafe { CFRelease(access.cast()) };
     if trusted {
@@ -140,7 +149,7 @@ fn verify_item_acl(item: &SecKeychainItem, executable: &Path) -> Result<(), Stor
     }
 }
 
-fn verify_access_acls(access: SecAccessRef, executable: &Path) -> bool {
+fn verify_access_acls(access: SecAccessRef, trusted_application: SecTrustedApplicationRef) -> bool {
     // SAFETY: access and the static authorization key are live; the Copy call
     // returns an owned array released below.
     let acls = unsafe { SecAccessCopyMatchingACLList(access, kSecACLAuthorizationDecrypt.cast()) };
@@ -148,11 +157,9 @@ fn verify_access_acls(access: SecAccessRef, executable: &Path) -> bool {
         return false;
     }
     let count = unsafe { CFArrayGetCount(acls) };
-    #[cfg(test)]
-    eprintln!("ACL diagnostic: {count} ACL entries");
     for index in 0..count {
         let acl = unsafe { CFArrayGetValueAtIndex(acls, index) as SecAclRef };
-        if acl.is_null() || !acl_allows_only_executable(acl, executable) {
+        if acl.is_null() || !acl_allows_only_application(acl, trusted_application) {
             unsafe { CFRelease(acls.cast()) };
             return false;
         }
@@ -161,7 +168,10 @@ fn verify_access_acls(access: SecAccessRef, executable: &Path) -> bool {
     count > 0
 }
 
-fn acl_allows_only_executable(acl: SecAclRef, executable: &Path) -> bool {
+fn acl_allows_only_application(
+    acl: SecAclRef,
+    trusted_application: SecTrustedApplicationRef,
+) -> bool {
     let mut applications = ptr::null();
     if unsafe { SecACLCopyContents(acl, &mut applications, ptr::null_mut(), ptr::null_mut()) }
         != errSecSuccess
@@ -170,35 +180,14 @@ fn acl_allows_only_executable(acl: SecAclRef, executable: &Path) -> bool {
         return false;
     }
     let count = unsafe { CFArrayGetCount(applications) };
-    #[cfg(test)]
-    eprintln!("ACL diagnostic: {count} trusted applications");
     let trusted = count > 0
         && (0..count).all(|index| {
             let application =
                 unsafe { CFArrayGetValueAtIndex(applications, index) as SecTrustedApplicationRef };
-            trusted_application_matches(application, executable)
+            unsafe { CFEqual(application.cast(), trusted_application.cast()) != 0 }
         });
     unsafe { CFRelease(applications.cast()) };
     trusted
-}
-
-fn trusted_application_matches(application: SecTrustedApplicationRef, executable: &Path) -> bool {
-    let mut data = ptr::null();
-    if application.is_null()
-        || unsafe { SecTrustedApplicationCopyData(application, &mut data) } != errSecSuccess
-        || data.is_null()
-    {
-        return false;
-    }
-    let path = unsafe { CFData::wrap_under_create_rule(data) };
-    let bytes = path.bytes().strip_suffix(&[0]).unwrap_or(path.bytes());
-    #[cfg(test)]
-    eprintln!("ACL diagnostic: application bytes={bytes:?}");
-    if bytes.is_empty() {
-        return true;
-    }
-    std::fs::canonicalize(Path::new(std::ffi::OsStr::from_bytes(bytes)))
-        .is_ok_and(|candidate| candidate == executable)
 }
 
 /// Repository pinned to one explicitly selected Keychain.
