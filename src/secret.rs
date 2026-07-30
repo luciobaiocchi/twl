@@ -149,12 +149,25 @@ pub fn process_preflight() -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 pub fn process_preflight() -> Result<(), String> {
-    Err("real project credentials are currently available only on macOS".into())
+    // SAFETY: prctl is called with the documented PR_SET_DUMPABLE operation and an integer
+    // argument. No pointers are passed. This must happen before a vault password is read.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(format!(
+            "disabling process dumpability: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: PR_GET_DUMPABLE takes no additional arguments and returns the current state.
+    let state = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+    if state != 0 {
+        return Err("process dumpability could not be disabled".into());
+    }
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn process_preflight() -> Result<(), String> {
-    Err("real project credentials are currently available only on macOS".into())
+    Err("real project credentials are unavailable on this platform".into())
 }
 
 #[cfg(test)]

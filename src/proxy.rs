@@ -7,12 +7,14 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const MAX_BODY: u64 = 16 << 20;
 const MAX_IN_FLIGHT: usize = 16;
 const FORWARD_HEADERS: &[&str] = &["content-type", "accept"];
 
 /// The only destination and credential authorized for a session.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Route {
     pub name: String,
     pub upstream: String,
@@ -29,6 +31,7 @@ pub struct Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
+        self.token.zeroize();
         self.server.unblock();
     }
 }

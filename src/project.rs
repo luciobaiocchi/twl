@@ -2,11 +2,15 @@ use crate::config::validate_upstream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 mod repository;
 
 #[cfg(target_os = "macos")]
 mod macos;
+
+#[cfg(target_os = "linux")]
+mod linux;
 
 pub use repository::{
     Action, AuthorizationError, ProjectRepository, ProjectService, ProjectServiceError, Revision,
@@ -15,6 +19,17 @@ pub use repository::{
 
 #[cfg(target_os = "macos")]
 pub use macos::{open_project_service, MacProjectService};
+
+#[cfg(target_os = "macos")]
+pub type PlatformProjectService = MacProjectService;
+
+#[cfg(target_os = "linux")]
+pub use linux::{
+    linux_project_child_command, open_project_service, LinuxAgeVaultRepository, LinuxProjectService,
+};
+
+#[cfg(target_os = "linux")]
+pub type PlatformProjectService = LinuxProjectService;
 
 const FORMAT_VERSION: u32 = 1;
 
@@ -52,7 +67,7 @@ impl fmt::Display for ModelError {
 impl std::error::Error for ModelError {}
 
 /// A validated, versioned collection of destination-bound credentials.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
     version: u32,
@@ -61,7 +76,7 @@ pub struct Project {
 }
 
 /// A validated route containing a real secret; `Debug` always redacts the key.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectRoute {
     name: String,
@@ -157,8 +172,8 @@ impl Project {
         &self.routes
     }
 
-    pub fn into_routes(self) -> Vec<ProjectRoute> {
-        self.routes
+    pub fn into_routes(mut self) -> Vec<ProjectRoute> {
+        std::mem::take(&mut self.routes)
     }
 
     pub fn validate(&self) -> Result<(), ModelError> {
@@ -193,14 +208,14 @@ impl Project {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
         #[serde(deny_unknown_fields)]
         struct WireProject {
             version: u32,
             name: String,
             routes: Vec<WireRoute>,
         }
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
         #[serde(deny_unknown_fields)]
         struct WireRoute {
             name: String,
@@ -211,31 +226,31 @@ impl Project {
         }
 
         let raw = std::str::from_utf8(bytes).map_err(|_| ModelError::MalformedPayload)?;
-        let wire: WireProject =
+        let mut wire: WireProject =
             serde_yaml_ng::from_str(raw).map_err(|_| ModelError::MalformedPayload)?;
         if wire.version != FORMAT_VERSION {
             return Err(ModelError::MalformedPayload);
         }
-        let routes = wire
-            .routes
+        let routes = std::mem::take(&mut wire.routes)
             .into_iter()
-            .map(|route| {
-                let original_url = route.base_url.clone();
+            .map(|mut route| {
+                let original_url = Zeroizing::new(route.base_url.clone());
                 let route = ProjectRoute::new(
-                    route.name,
-                    route.base_url,
-                    route.api_key,
-                    route.api_key_env,
-                    route.base_url_env,
+                    std::mem::take(&mut route.name),
+                    std::mem::take(&mut route.base_url),
+                    std::mem::take(&mut route.api_key),
+                    std::mem::take(&mut route.api_key_env),
+                    std::mem::take(&mut route.base_url_env),
                 )?;
-                if route.base_url() != original_url {
+                if route.base_url() != original_url.as_str() {
                     return Err(ModelError::InvalidBaseUrl);
                 }
                 Ok(route)
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ModelError::MalformedPayload)?;
-        Project::new(wire.name, routes).map_err(|_| ModelError::MalformedPayload)
+        Project::new(std::mem::take(&mut wire.name), routes)
+            .map_err(|_| ModelError::MalformedPayload)
     }
 
     pub fn description(&self) -> String {
@@ -282,13 +297,13 @@ impl ProjectRoute {
         &self.base_url_env
     }
 
-    pub fn into_parts(self) -> (String, String, String, String, String) {
+    pub fn into_parts(mut self) -> (String, String, String, String, String) {
         (
-            self.name,
-            self.base_url,
-            self.api_key,
-            self.api_key_env,
-            self.base_url_env,
+            std::mem::take(&mut self.name),
+            std::mem::take(&mut self.base_url),
+            std::mem::take(&mut self.api_key),
+            std::mem::take(&mut self.api_key_env),
+            std::mem::take(&mut self.base_url_env),
         )
     }
 
@@ -314,17 +329,17 @@ impl ProjectRoute {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub struct UnsupportedAuthorizer;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl SessionAuthorizer for UnsupportedAuthorizer {
     fn authorize(&self, _action: Action<'_>) -> Result<(), AuthorizationError> {
         unreachable!()
     }
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub struct UnsupportedRepository;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl ProjectRepository for UnsupportedRepository {
     fn list(&self) -> Result<Vec<String>, StoreError> {
         Err(StoreError::UnsupportedPlatform)
@@ -342,10 +357,10 @@ impl ProjectRepository for UnsupportedRepository {
         Err(StoreError::UnsupportedPlatform)
     }
 }
-#[cfg(not(target_os = "macos"))]
-pub type MacProjectService = ProjectService<UnsupportedAuthorizer, UnsupportedRepository>;
-#[cfg(not(target_os = "macos"))]
-pub fn open_project_service() -> Result<MacProjectService, StoreError> {
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub type PlatformProjectService = ProjectService<UnsupportedAuthorizer, UnsupportedRepository>;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn open_project_service() -> Result<PlatformProjectService, StoreError> {
     Err(StoreError::UnsupportedPlatform)
 }
 

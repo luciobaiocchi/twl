@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::process::exit;
 use twl::config::Config;
 use twl::project::{
-    open_project_service, validate_identifier, MacProjectService, Project, ProjectRoute,
+    open_project_service, validate_identifier, PlatformProjectService, Project, ProjectRoute,
 };
 use twl::{child_command, prepare_demo, prepare_project, secret, Prepared};
 
@@ -103,7 +103,7 @@ fn project_command(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn project_service() -> Result<MacProjectService, String> {
+fn project_service() -> Result<PlatformProjectService, String> {
     open_project_service().map_err(|error| error.to_string())
 }
 
@@ -248,9 +248,13 @@ fn run(args: &[String]) -> Result<i32, String> {
     let store = open_project_service().map_err(|error| error.to_string())?;
     let stored = store.get(name).map_err(|error| error.to_string())?;
     let route_count = stored.project().routes().len();
-    let prepared = prepare_project(stored.into_parts().0)?;
+    let project = stored.into_parts().0;
+    // On Linux this closes the vault directory descriptor and zeroizes the session password
+    // before the selected credentials move into the broker.
+    drop(store);
+    let prepared = prepare_project(project)?;
     eprintln!("twl: authorized project {name} with {route_count} route(s) for this session");
-    run_prepared(prepared, command, command_args, None)
+    run_prepared(prepared, command, command_args, None, true)
 }
 
 fn run_invocation(args: &[String]) -> Result<(&str, &str, &[String]), String> {
@@ -278,6 +282,7 @@ fn demo(args: &[String]) -> Result<i32, String> {
         command,
         command_args,
         config.budget.map(|budget| budget.max_requests),
+        false,
     )
 }
 
@@ -300,10 +305,31 @@ fn run_prepared(
     command: &str,
     command_args: &[String],
     budget: Option<u64>,
+    mask_vault: bool,
 ) -> Result<i32, String> {
     let (handle, overrides) = prepared.start(budget).map_err(|error| error.to_string())?;
     eprintln!("twl: project broker listening on loopback");
-    let status = child_command(command, command_args, &overrides)
+    #[cfg(target_os = "linux")]
+    let mut child = if mask_vault {
+        let (child, vault_masked) =
+            twl::project::linux_project_child_command(command, command_args, &overrides)?;
+        if vault_masked {
+            eprintln!("twl: encrypted vault directory masked with Bubblewrap");
+        } else {
+            eprintln!(
+                "twl: Bubblewrap unavailable; encrypted vault is enabled but filesystem masking is disabled"
+            );
+        }
+        child
+    } else {
+        child_command(command, command_args, &overrides)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut child = {
+        let _ = mask_vault;
+        child_command(command, command_args, &overrides)
+    };
+    let status = child
         .status()
         .map_err(|error| format!("{command}: {error}"))?;
     if handle.seen.load(std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -316,10 +342,18 @@ fn run_prepared(
 
 fn doctor() {
     println!("Towel diagnostic");
+    #[cfg(target_os = "macos")]
     match secret::process_preflight() {
         Ok(()) => println!("  protected macOS project sessions: available"),
         Err(error) => println!("  protected macOS project sessions: unavailable ({error})"),
     }
+    #[cfg(target_os = "linux")]
+    match secret::process_preflight() {
+        Ok(()) => println!("  encrypted Linux project sessions: available"),
+        Err(error) => println!("  encrypted Linux project sessions: unavailable ({error})"),
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    println!("  protected project sessions:       unavailable on this platform");
     println!("  canary-only demo:                 available");
 }
 

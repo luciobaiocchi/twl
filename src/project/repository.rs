@@ -4,9 +4,10 @@ use std::collections::HashMap;
 use std::fmt;
 #[cfg(test)]
 use std::sync::Mutex;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Opaque, secret-bearing record revision used to reject stale replacement.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct Revision(Vec<u8>);
 
 impl Revision {
@@ -60,6 +61,7 @@ pub enum StoreError {
     AlreadyExists,
     Conflict,
     MalformedRecord,
+    VaultUnlockFailed,
     UntrustedStore,
     UntrustedItem,
     UnsupportedPlatform,
@@ -74,12 +76,14 @@ impl fmt::Display for StoreError {
             Self::AlreadyExists => formatter.write_str("project already exists"),
             Self::Conflict => formatter.write_str("project changed while it was being edited"),
             Self::MalformedRecord => formatter.write_str("malformed stored project record"),
+            Self::VaultUnlockFailed => formatter
+                .write_str("could not unlock the project vault: wrong password or damaged vault"),
             Self::UntrustedStore => formatter.write_str("trusted project store is unavailable"),
             Self::UntrustedItem => {
                 formatter.write_str("project record has untrusted access control")
             }
             Self::UnsupportedPlatform => {
-                formatter.write_str("project credentials are currently available only on macOS")
+                formatter.write_str("project credentials are unavailable on this platform")
             }
             Self::InvalidProject(error) => error.fmt(formatter),
             Self::Platform(message) => formatter.write_str(message),

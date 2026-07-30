@@ -18,7 +18,10 @@ fn doctor_reports_the_platform_security_mode() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    #[cfg(target_os = "macos")]
     assert!(stdout.contains("protected macOS project sessions"));
+    #[cfg(target_os = "linux")]
+    assert!(stdout.contains("encrypted Linux project sessions"));
     assert!(stdout.contains("canary-only demo"));
 }
 
