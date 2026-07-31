@@ -17,6 +17,37 @@ twl run --project my-app -- codex
 > Experimental security software: it has not been independently audited. Use
 > disposable or tightly scoped development credentials while evaluating it.
 
+## Why this exists
+
+You want to run a coding agent on your machine. It needs to call some API, so
+you do what everybody does: you put the key in the environment and launch it.
+
+Now look at what you just did. The key is in `environ`. It is in every child
+process the agent spawns. It is one `echo $API_KEY` away from the transcript,
+one `curl` away from anywhere on the internet, and it stays valid long after
+you close the terminal. You did not grant the agent *use* of your API. You
+handed over the credential, and a credential does not expire when your patience
+does.
+
+Here is the thing though: the agent never wanted the key. It wanted the
+*effect* of the key — a request that arrives at the API and is accepted. That
+is a much smaller thing to give away, and it turns out you can give it away
+without giving anything up.
+
+So Towel keeps the key and lends out the effect. It starts a small HTTP broker
+on loopback, hands the child a random fake key and a `127.0.0.1` URL, and
+substitutes the real credential on the way out — only on the way out, and only
+towards the one destination you registered it for. The agent's code does not
+change. It still reads an API-key variable and a base URL. Those values just
+stopped being worth stealing.
+
+I would rather be clear about the limits than oversell this. While the session
+is running, the agent can reach the API through the broker, so it can spend
+your quota and touch your data. Towel does not sandbox it and is not trying to.
+What it takes away is the credential itself: nothing the agent can read, log,
+print, or copy out is worth anything once the session ends. That is a narrower
+promise than "your agent is contained", and it is the one I can actually keep.
+
 ## Projects and routes
 
 A project is the unit of authorization. On macOS, one versioned Data Protection
@@ -139,6 +170,38 @@ its Apple Team ID for a real deployment. The script uses ad-hoc signing when
 the identity is unset; that mode is for local build checks, not real credential
 deployment. `twl doctor` reports whether the current binary satisfies the
 hardened-runtime checks.
+
+## Linux build
+
+Linux needs no signing. The vault protects itself with a password, so an
+ordinary release build is a real deployment:
+
+```bash
+scripts/build-linux.sh
+```
+
+The script builds against musl when that target is installed, so the result is
+a static binary that runs on any glibc or musl distribution, then checks that
+the binary really is static and runs `twl doctor` against it. Set
+`TWL_TARGET` to override the target triple.
+
+`bwrap` (bubblewrap) is an optional runtime dependency. When it is present
+Towel additionally masks the vault directory and gives the child a private PID
+namespace; when it is absent Towel says so and the encrypted vault is unchanged.
+Nothing else is required at runtime.
+
+## Verifying a release
+
+Release archives carry a build-provenance attestation. Check it before you
+trust a downloaded binary:
+
+```bash
+gh attestation verify twl-<version>-<target>.tar.gz --repo luciobaiocchi/twl
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+macOS archives are Developer ID signed and notarized, so `spctl` and Gatekeeper
+accept them directly.
 
 ## Build and test
 
