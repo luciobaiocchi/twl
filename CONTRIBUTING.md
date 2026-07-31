@@ -78,6 +78,8 @@ configuration that has to be verified on a real Developer ID build, so the
 macOS job only runs when the `MACOS_RELEASE` repository variable is set to
 `true`. Until then a tag produces a Linux-only prerelease and passes; nothing
 has to be worked around, and the run reports which platforms it chose.
+[docs/macos-release.md](docs/macos-release.md) is the setup path, starting with
+a local check that needs no credentials.
 
 The **Release** workflow can also be started by hand from the Actions tab, with
 two inputs:
