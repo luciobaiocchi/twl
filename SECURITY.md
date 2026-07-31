@@ -55,7 +55,14 @@ vault.
 
 Bubblewrap, when installed, is only an additional filesystem-masking and
 PID/`/proc` isolation layer. It deliberately does not isolate the network or
-the rest of the filesystem and does not block Docker access.
+the rest of the filesystem and does not block Docker access. Its absence does
+not weaken age encryption of the vault.
+
+The Linux build uses age with its already-empty default feature set. Age 0.11's
+localization dependencies are unconditional, so disabling default features
+does not remove that transitive graph. Those dependencies are locked and
+covered by the repository's RustSec check, but remain part of the trusted
+process's supply-chain surface.
 
 An agent that can use a privileged host Docker daemon, `sudo`, `ptrace`, or
 another route to full host control may attack the running broker or Towel

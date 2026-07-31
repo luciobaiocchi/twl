@@ -4,7 +4,7 @@ use twl::config::Config;
 use twl::project::{
     open_project_service, validate_identifier, PlatformProjectService, Project, ProjectRoute,
 };
-use twl::{child_command, prepare_demo, prepare_project, secret, Prepared};
+use twl::{child_command, prepare_demo, prepare_project, Prepared};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -314,10 +314,10 @@ fn run_prepared(
         let (child, vault_masked) =
             twl::project::linux_project_child_command(command, command_args, &overrides)?;
         if vault_masked {
-            eprintln!("twl: encrypted vault directory masked with Bubblewrap");
+            eprintln!("twl: launching child through the Bubblewrap vault-masking profile");
         } else {
             eprintln!(
-                "twl: Bubblewrap unavailable; encrypted vault is enabled but filesystem masking is disabled"
+                "twl: Bubblewrap profile not used; the age-encrypted vault remains password-protected"
             );
         }
         child
@@ -343,14 +343,22 @@ fn run_prepared(
 fn doctor() {
     println!("Towel diagnostic");
     #[cfg(target_os = "macos")]
-    match secret::process_preflight() {
-        Ok(()) => println!("  protected macOS project sessions: available"),
+    match open_project_service() {
+        Ok(_) => println!("  protected macOS project sessions: available"),
         Err(error) => println!("  protected macOS project sessions: unavailable ({error})"),
     }
     #[cfg(target_os = "linux")]
-    match secret::process_preflight() {
-        Ok(()) => println!("  encrypted Linux project sessions: available"),
+    match open_project_service() {
+        Ok(_) => println!("  encrypted Linux project sessions: available"),
         Err(error) => println!("  encrypted Linux project sessions: unavailable ({error})"),
+    }
+    #[cfg(target_os = "linux")]
+    match twl::secret::process_dumpable_state() {
+        Ok(true) => println!(
+            "  process dumps:                    enabled now; disabled before password entry"
+        ),
+        Ok(false) => println!("  process dumps:                    already disabled"),
+        Err(error) => println!("  process dumps:                    unavailable ({error})"),
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     println!("  protected project sessions:       unavailable on this platform");

@@ -264,7 +264,8 @@ impl ProjectRepository for MacKeychainRepository {
 
     fn create(&self, project: &Project) -> Result<(), StoreError> {
         project.validate()?;
-        let payload = CFData::from_buffer(&project.encode()?);
+        let encoded = project.encode()?;
+        let payload = CFData::from_buffer(&encoded);
         let revision = random_revision();
         let revision_data = CFData::from_buffer(revision.as_bytes());
         let mut attributes = query_for(&self.access_group, project.name());
@@ -307,7 +308,8 @@ impl ProjectRepository for MacKeychainRepository {
                 expected_data.as_CFTypeRef(),
             );
         }
-        let payload = CFData::from_buffer(&project.encode()?);
+        let encoded = project.encode()?;
+        let payload = CFData::from_buffer(&encoded);
         let revision = random_revision();
         let revision_data = CFData::from_buffer(revision.as_bytes());
         let mut update = CFMutableDictionary::new();

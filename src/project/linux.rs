@@ -163,10 +163,6 @@ impl VaultDirectory {
         self.lock(false)
     }
 
-    fn exclusive_lock(&self) -> Result<VaultLock, StoreError> {
-        self.lock(true)
-    }
-
     fn open_vault(&self) -> Result<Option<(File, std::fs::Metadata)>, StoreError> {
         let file = match self.openat(VAULT_FILE, libc::O_RDONLY, 0) {
             Ok(file) => file,
@@ -241,11 +237,22 @@ impl Drop for VaultLock {
     }
 }
 
+#[derive(Default)]
+struct PasswordState {
+    password: Option<SecretString>,
+    operation_lock: Option<PendingLock>,
+}
+
+struct PendingLock {
+    exclusive: bool,
+    lock: VaultLock,
+}
+
 #[derive(Clone, Default)]
-struct PasswordSession(Arc<Mutex<Option<SecretString>>>);
+struct PasswordSession(Arc<Mutex<PasswordState>>);
 
 impl PasswordSession {
-    fn lock(&self) -> Result<MutexGuard<'_, Option<SecretString>>, StoreError> {
+    fn lock(&self) -> Result<MutexGuard<'_, PasswordState>, StoreError> {
         self.0
             .lock()
             .map_err(|_| StoreError::Platform("vault password session is unavailable".into()))
@@ -253,16 +260,32 @@ impl PasswordSession {
 
     fn password(&self) -> Result<SecretString, StoreError> {
         self.lock()?
+            .password
             .as_ref()
             .cloned()
-            .ok_or_else(|| StoreError::Platform("vault password was not authorized".into()))
+            .ok_or(StoreError::VaultUnlockFailed)
+    }
+
+    fn operation_lock(
+        &self,
+        directory: &VaultDirectory,
+        exclusive: bool,
+    ) -> Result<VaultLock, StoreError> {
+        if let Some(pending) = self.lock()?.operation_lock.take() {
+            if pending.exclusive == exclusive {
+                return Ok(pending.lock);
+            }
+            return Err(StoreError::VaultUnlockFailed);
+        }
+        directory.lock(exclusive)
     }
 
     #[cfg(test)]
     fn with_password(password: &str) -> Self {
-        Self(Arc::new(Mutex::new(Some(SecretString::from(
-            password.to_owned(),
-        )))))
+        Self(Arc::new(Mutex::new(PasswordState {
+            password: Some(SecretString::from(password.to_owned())),
+            operation_lock: None,
+        })))
     }
 }
 
@@ -373,12 +396,17 @@ struct WireRecord {
 pub struct LinuxAgeVaultRepository {
     directory: Arc<VaultDirectory>,
     session: PasswordSession,
+    scrypt_work_factor_override: Option<u8>,
 }
 
 impl LinuxAgeVaultRepository {
     fn open(session: PasswordSession) -> Result<Self, StoreError> {
         let directory = Arc::new(VaultDirectory::open(vault_directory_path()?)?);
-        Ok(Self { directory, session })
+        Ok(Self {
+            directory,
+            session,
+            scrypt_work_factor_override: None,
+        })
     }
 
     #[cfg(test)]
@@ -386,6 +414,7 @@ impl LinuxAgeVaultRepository {
         Ok(Self {
             directory: Arc::new(VaultDirectory::open(path)?),
             session: PasswordSession::with_password(password),
+            scrypt_work_factor_override: Some(2),
         })
     }
 
@@ -433,15 +462,13 @@ impl LinuxAgeVaultRepository {
         let password = self.session.password()?;
         let mut ciphertext = Vec::new();
         {
-            #[cfg(not(test))]
-            let encryptor = age::Encryptor::with_user_passphrase(password);
-            #[cfg(test)]
-            let encryptor = {
-                let mut recipient = age::scrypt::Recipient::new(password);
-                recipient.set_work_factor(2);
+            let mut recipient = age::scrypt::Recipient::new(password);
+            if let Some(work_factor) = self.scrypt_work_factor_override {
+                recipient.set_work_factor(work_factor);
+            }
+            let encryptor =
                 age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
-                    .map_err(|error| platform("initializing project vault encryption", error))?
-            };
+                    .map_err(|error| platform("initializing project vault encryption", error))?;
             let mut writer = encryptor
                 .wrap_output(&mut ciphertext)
                 .map_err(|error| platform("initializing project vault output", error))?;
@@ -492,7 +519,7 @@ impl LinuxAgeVaultRepository {
 
 impl ProjectRepository for LinuxAgeVaultRepository {
     fn list(&self) -> Result<Vec<String>, StoreError> {
-        let _lock = self.directory.shared_lock()?;
+        let _lock = self.session.operation_lock(&self.directory, false)?;
         let Some(vault) = self.read_locked()? else {
             return Ok(Vec::new());
         };
@@ -507,7 +534,7 @@ impl ProjectRepository for LinuxAgeVaultRepository {
 
     fn get(&self, name: &str) -> Result<StoredProject, StoreError> {
         super::validate_identifier(name)?;
-        let _lock = self.directory.shared_lock()?;
+        let _lock = self.session.operation_lock(&self.directory, false)?;
         let vault = self.read_locked()?.ok_or(StoreError::NotFound)?;
         let index = vault.find(name).ok_or(StoreError::NotFound)?;
         Ok(StoredProject::new(
@@ -518,11 +545,11 @@ impl ProjectRepository for LinuxAgeVaultRepository {
 
     fn create(&self, project: &Project) -> Result<(), StoreError> {
         project.validate()?;
-        let payload = Zeroizing::new(project.encode()?);
+        let payload = project.encode()?;
         if payload.len() > MAX_PROJECT_BYTES {
             return Err(StoreError::MalformedRecord);
         }
-        let _lock = self.directory.exclusive_lock()?;
+        let _lock = self.session.operation_lock(&self.directory, true)?;
         let mut vault = self.read_locked()?.unwrap_or_default();
         if vault.find(project.name()).is_some() {
             return Err(StoreError::AlreadyExists);
@@ -540,11 +567,11 @@ impl ProjectRepository for LinuxAgeVaultRepository {
 
     fn replace(&self, expected: &Revision, project: &Project) -> Result<(), StoreError> {
         project.validate()?;
-        let payload = Zeroizing::new(project.encode()?);
+        let payload = project.encode()?;
         if payload.len() > MAX_PROJECT_BYTES {
             return Err(StoreError::MalformedRecord);
         }
-        let _lock = self.directory.exclusive_lock()?;
+        let _lock = self.session.operation_lock(&self.directory, true)?;
         let mut vault = self.read_locked()?.ok_or(StoreError::NotFound)?;
         let index = vault.find(project.name()).ok_or(StoreError::NotFound)?;
         if &vault.records[index].revision != expected {
@@ -560,7 +587,7 @@ impl ProjectRepository for LinuxAgeVaultRepository {
 
     fn delete(&self, name: &str) -> Result<(), StoreError> {
         super::validate_identifier(name)?;
-        let _lock = self.directory.exclusive_lock()?;
+        let _lock = self.session.operation_lock(&self.directory, true)?;
         let mut vault = self.read_locked()?.ok_or(StoreError::NotFound)?;
         let index = vault.find(name).ok_or(StoreError::NotFound)?;
         vault.records.remove(index);
@@ -578,45 +605,82 @@ pub struct LinuxVaultAuthorizer {
 
 impl SessionAuthorizer for LinuxVaultAuthorizer {
     fn authorize(&self, action: Action<'_>) -> Result<(), AuthorizationError> {
-        let mut session = self
+        if self
             .repository
             .session
             .lock()
-            .map_err(|error| AuthorizationError::platform(error.to_string()))?;
-        if session.is_some() {
+            .map_err(|error| AuthorizationError::platform(error.to_string()))?
+            .password
+            .is_some()
+        {
             return Ok(());
         }
 
-        let exists = self
-            .repository
-            .vault_exists()
-            .map_err(|error| AuthorizationError::platform(error.to_string()))?;
-        if !exists && !matches!(action, Action::Create(_)) {
-            return Ok(());
-        }
-
-        let password = (self.prompt)(if exists {
-            "Towel vault password: "
-        } else {
-            "Create Towel vault password: "
-        })
-        .map_err(AuthorizationError::platform)?;
-        if password.expose_secret().is_empty() {
-            return Err(AuthorizationError::platform(
-                "vault password must not be empty".into(),
-            ));
-        }
-        if !exists {
-            let confirmation = (self.prompt)("Confirm Towel vault password: ")
+        loop {
+            let exists = self
+                .repository
+                .vault_exists()
+                .map_err(|error| AuthorizationError::platform(error.to_string()))?;
+            let password = if !exists && !matches!(action, Action::Create(_)) {
+                None
+            } else {
+                crate::secret::process_preflight().map_err(AuthorizationError::platform)?;
+                let password = (self.prompt)(if exists {
+                    "Towel vault password: "
+                } else {
+                    "Create Towel vault password: "
+                })
                 .map_err(AuthorizationError::platform)?;
-            if password.expose_secret() != confirmation.expose_secret() {
-                return Err(AuthorizationError::platform(
-                    "vault passwords do not match".into(),
-                ));
+                if password.expose_secret().is_empty() {
+                    return Err(AuthorizationError::platform(
+                        "vault password must not be empty".into(),
+                    ));
+                }
+                if !exists {
+                    let confirmation = (self.prompt)("Confirm Towel vault password: ")
+                        .map_err(AuthorizationError::platform)?;
+                    if password.expose_secret() != confirmation.expose_secret() {
+                        return Err(AuthorizationError::platform(
+                            "vault passwords do not match".into(),
+                        ));
+                    }
+                }
+                Some(password)
+            };
+
+            let exclusive = matches!(
+                action,
+                Action::Create(_) | Action::Replace(_) | Action::Delete(_)
+            );
+            let operation_lock = self
+                .repository
+                .directory
+                .lock(exclusive)
+                .map_err(|error| AuthorizationError::platform(error.to_string()))?;
+            let still_exists = self
+                .repository
+                .directory
+                .open_vault()
+                .map_err(|error| AuthorizationError::platform(error.to_string()))?
+                .is_some();
+            if still_exists != exists {
+                continue;
             }
+
+            let mut session = self
+                .repository
+                .session
+                .lock()
+                .map_err(|error| AuthorizationError::platform(error.to_string()))?;
+            if session.password.is_none() {
+                session.password = password;
+                session.operation_lock = Some(PendingLock {
+                    exclusive,
+                    lock: operation_lock,
+                });
+            }
+            return Ok(());
         }
-        *session = Some(password);
-        Ok(())
     }
 }
 
@@ -641,7 +705,6 @@ impl ProjectRepository for Arc<LinuxAgeVaultRepository> {
 }
 
 pub fn open_project_service() -> Result<LinuxProjectService, StoreError> {
-    crate::secret::process_preflight().map_err(StoreError::Platform)?;
     let session = PasswordSession::default();
     let repository = Arc::new(LinuxAgeVaultRepository::open(session)?);
     let authorizer = LinuxVaultAuthorizer {
@@ -656,18 +719,22 @@ pub fn open_project_service() -> Result<LinuxProjectService, StoreError> {
 }
 
 fn find_bubblewrap() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|directory| directory.join("bwrap"))
+    ["/usr/bin/bwrap", "/usr/local/bin/bwrap"]
+        .into_iter()
+        .map(PathBuf::from)
         .find(|candidate| {
-            fs::metadata(candidate).is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            fs::symlink_metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file()
+                    && metadata.uid() == 0
+                    && metadata.permissions().mode() & 0o111 != 0
+                    && metadata.permissions().mode() & 0o022 == 0
             })
         })
 }
 
 /// Builds the Linux child command, adding only vault masking and PID/proc isolation when
-/// Bubblewrap is installed. Networking and the host filesystem otherwise remain shared.
+/// Bubblewrap has a trusted system installation. Networking and the host filesystem otherwise
+/// remain shared.
 pub fn linux_project_child_command(
     program: &str,
     args: &[String],
@@ -778,7 +845,7 @@ mod tests {
             Self(std::env::temp_dir().join(format!(
                 "twl-linux-test-{}-{}",
                 std::process::id(),
-                STANDARD_NO_PAD.encode(random)
+                URL_SAFE_NO_PAD.encode(random)
             )))
         }
     }
@@ -872,6 +939,23 @@ mod tests {
         assert_eq!(
             decoded.routes()[0].clone().into_parts().2,
             "credential-not-in-ciphertext"
+        );
+    }
+
+    #[test]
+    fn production_scrypt_configuration_round_trips() {
+        let directory = TestDirectory::new();
+        let mut repository = repository(&directory, "production-password");
+        repository.scrypt_work_factor_override = None;
+        repository
+            .create(&project("app", "production-path-key"))
+            .unwrap();
+        assert_eq!(
+            repository.get("app").unwrap().project().routes()[0]
+                .clone()
+                .into_parts()
+                .2,
+            "production-path-key"
         );
     }
 
@@ -996,6 +1080,7 @@ mod tests {
         let repository = Arc::new(LinuxAgeVaultRepository {
             directory: Arc::new(VaultDirectory::open(directory.0.clone()).unwrap()),
             session,
+            scrypt_work_factor_override: Some(2),
         });
         let prompts = Arc::new(AtomicUsize::new(0));
         let marker = prompts.clone();
@@ -1015,6 +1100,7 @@ mod tests {
         let existing = Arc::new(LinuxAgeVaultRepository {
             directory: repository.directory.clone(),
             session,
+            scrypt_work_factor_override: Some(2),
         });
         let prompts = Arc::new(AtomicUsize::new(0));
         let marker = prompts.clone();
@@ -1028,5 +1114,55 @@ mod tests {
         authorizer.authorize(Action::Read("app")).unwrap();
         authorizer.authorize(Action::Replace("app")).unwrap();
         assert_eq!(prompts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn authorizer_reprompts_if_vault_appears_before_operation_lock() {
+        let directory = TestDirectory::new();
+        let session = PasswordSession::default();
+        let target = Arc::new(LinuxAgeVaultRepository {
+            directory: Arc::new(VaultDirectory::open(directory.0.clone()).unwrap()),
+            session,
+            scrypt_work_factor_override: Some(2),
+        });
+        let competing = Arc::new(repository(&directory, "existing-password"));
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let marker = prompts.clone();
+        let authorizer = LinuxVaultAuthorizer {
+            repository: target.clone(),
+            prompt: Arc::new(move |label| {
+                let prompt = marker.fetch_add(1, Ordering::SeqCst);
+                if prompt == 0 {
+                    assert_eq!(label, "Create Towel vault password: ");
+                    competing
+                        .create(&project("existing", "existing-key"))
+                        .unwrap();
+                    return Ok(SecretString::from("new-password".to_owned()));
+                }
+                if prompt == 1 {
+                    assert_eq!(label, "Confirm Towel vault password: ");
+                    return Ok(SecretString::from("new-password".to_owned()));
+                }
+                assert_eq!(label, "Towel vault password: ");
+                Ok(SecretString::from("existing-password".to_owned()))
+            }),
+        };
+
+        authorizer.authorize(Action::Create("second")).unwrap();
+        target.create(&project("second", "second-key")).unwrap();
+
+        assert_eq!(prompts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            repository(&directory, "existing-password").list().unwrap(),
+            ["existing", "second"]
+        );
+    }
+
+    #[test]
+    fn missing_authorization_uses_generic_vault_error() {
+        assert!(matches!(
+            PasswordSession::default().password(),
+            Err(StoreError::VaultUnlockFailed)
+        ));
     }
 }

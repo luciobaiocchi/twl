@@ -12,10 +12,13 @@ fn run_rejects_env_files() {
 
 #[test]
 fn doctor_reports_the_platform_security_mode() {
+    let data_home = std::env::temp_dir().join(format!("twl-doctor-test-{}", std::process::id()));
     let output = Command::new(env!("CARGO_BIN_EXE_twl"))
+        .env("XDG_DATA_HOME", &data_home)
         .arg("doctor")
         .output()
         .unwrap();
+    let _ = std::fs::remove_dir_all(&data_home);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     #[cfg(target_os = "macos")]

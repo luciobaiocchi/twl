@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fmt;
 #[cfg(test)]
 use std::sync::Mutex;
+#[cfg(test)]
+use zeroize::Zeroizing;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Opaque, secret-bearing record revision used to reject stale replacement.
@@ -238,9 +240,12 @@ where
 }
 
 #[cfg(test)]
+type MemoryRecord = (Zeroizing<Vec<u8>>, Revision);
+
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MemoryRepository {
-    records: Mutex<HashMap<String, (Vec<u8>, Revision)>>,
+    records: Mutex<HashMap<String, MemoryRecord>>,
 }
 
 #[cfg(test)]
@@ -387,7 +392,10 @@ mod tests {
         let repository = MemoryRepository::default();
         repository.records.lock().unwrap().insert(
             "app".into(),
-            (b"secret-bearing-malformed-data".to_vec(), random_revision()),
+            (
+                Zeroizing::new(b"secret-bearing-malformed-data".to_vec()),
+                random_revision(),
+            ),
         );
         assert_eq!(
             repository.get("app").unwrap_err(),

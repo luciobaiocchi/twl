@@ -148,6 +148,19 @@ pub fn process_preflight() -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn process_dumpable_state() -> Result<bool, String> {
+    // SAFETY: PR_GET_DUMPABLE takes no additional arguments and returns the current state.
+    let state = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+    if state < 0 {
+        return Err(format!(
+            "reading process dumpability: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(state != 0)
+}
+
+#[cfg(target_os = "linux")]
 pub fn process_preflight() -> Result<(), String> {
     // SAFETY: prctl is called with the documented PR_SET_DUMPABLE operation and an integer
     // argument. No pointers are passed. This must happen before a vault password is read.
@@ -157,9 +170,7 @@ pub fn process_preflight() -> Result<(), String> {
             std::io::Error::last_os_error()
         ));
     }
-    // SAFETY: PR_GET_DUMPABLE takes no additional arguments and returns the current state.
-    let state = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
-    if state != 0 {
+    if process_dumpable_state()? {
         return Err("process dumpability could not be disabled".into());
     }
     Ok(())

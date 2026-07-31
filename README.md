@@ -71,8 +71,10 @@ dumpability. For `twl run`, it drops the password, decrypted vault, and open
 vault descriptors before starting the child. If `bwrap` is available, Towel
 also masks the vault directory and gives the child a separate PID namespace and
 private `/proc`. The rest of the host filesystem, Git, SSH/GPG, Docker socket,
-and network remain available. If `bwrap` is absent, Towel reports that masking
-is disabled and continues with the encrypted vault.
+and network remain available. Towel accepts only a root-owned, non-writable
+system installation at `/usr/bin/bwrap` or `/usr/local/bin/bwrap`; it does not
+trust an agent-controlled `PATH`. If that profile is not used, the age-encrypted
+vault remains protected by its password.
 
 Inside an existing container, the same CLI requires an interactive TTY, a
 persistent mount for the vault directory, and a shared network namespace

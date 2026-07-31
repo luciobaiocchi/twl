@@ -200,10 +200,11 @@ impl Project {
         Ok(())
     }
 
-    pub fn encode(&self) -> Result<Vec<u8>, ModelError> {
+    pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, ModelError> {
         self.validate()?;
         serde_yaml_ng::to_string(self)
             .map(String::into_bytes)
+            .map(Zeroizing::new)
             .map_err(|_| ModelError::Serialization)
     }
 
