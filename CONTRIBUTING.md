@@ -67,17 +67,23 @@ version in `Cargo.toml`.
 Before tagging, bump `version` in `Cargo.toml`, refresh `Cargo.lock`, and move
 the `Unreleased` changelog heading to the new version.
 
-A normal release builds every platform and publishes:
+Pushing the tag is the whole ceremony:
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
+macOS is opt-in. Signing and notarization need credentials and an entitlement
+configuration that has to be verified on a real Developer ID build, so the
+macOS job only runs when the `MACOS_RELEASE` repository variable is set to
+`true`. Until then a tag produces a Linux-only prerelease and passes; nothing
+has to be worked around, and the run reports which platforms it chose.
+
 The **Release** workflow can also be started by hand from the Actions tab, with
 two inputs:
 
-- `platforms` — `all`, or `linux-only` to skip signing and notarization and
-  ship a Linux prerelease on its own.
+- `platforms` — `all`, or `linux-only` to skip macOS for one run even when
+  `MACOS_RELEASE` is set.
 - `publish` — off by default. Leave it off for a dry run that builds, packages,
   and runs every artifact check without creating a release. Turn it on only
   when the run is started from an existing tag; a release cannot point at a
