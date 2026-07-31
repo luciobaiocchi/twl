@@ -86,6 +86,10 @@ pub(super) fn vault_directory_path() -> Result<PathBuf, StoreError> {
     Ok(home.join(".local/share/twl"))
 }
 
+/// Trusted directory descriptor used for all vault and lock I/O.
+///
+/// Entries are opened relative to this descriptor with symlink traversal disabled, then
+/// revalidated by ownership, type, link count, and mode on the resulting descriptor.
 pub(super) struct VaultDirectory {
     file: File,
 }
@@ -237,6 +241,10 @@ impl VaultDirectory {
     }
 }
 
+/// Advisory lock on a stable inode shared by all cooperating TWL processes.
+///
+/// Reads hold this lock shared and mutations hold it exclusively. It is separate from the vault
+/// inode because an atomic vault replacement changes that inode while the lock must remain stable.
 pub(super) struct VaultLock(File);
 
 impl Drop for VaultLock {
@@ -297,12 +305,14 @@ impl PasswordSession {
     }
 }
 
+/// Decoded in-memory representation of one encrypted vault entry.
 struct VaultRecord {
     name: String,
     revision: Revision,
     payload: Zeroizing<Vec<u8>>,
 }
 
+/// Decoded version of the complete plaintext stored inside the age envelope.
 #[derive(Default)]
 struct Vault {
     records: Vec<VaultRecord>,
@@ -388,6 +398,7 @@ impl Vault {
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
+/// Versioned plaintext wire envelope serialized as YAML inside the encrypted age file.
 struct WireVault {
     #[zeroize(skip)]
     version: u32,
@@ -396,6 +407,7 @@ struct WireVault {
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
+/// YAML wire entry containing a name plus unpadded base64 revision and project payload.
 struct WireRecord {
     #[zeroize(skip)]
     name: String,
@@ -421,6 +433,7 @@ impl LinuxAgeVaultRepository {
         })
     }
 
+    /// Reads and decrypts the vault while the caller keeps a shared or exclusive lock alive.
     fn read_locked(&self, _lock: &VaultLock) -> Result<Option<Vault>, StoreError> {
         let Some((mut file, metadata)) = self.directory.open_vault()? else {
             return Ok(None);
@@ -483,6 +496,7 @@ impl LinuxAgeVaultRepository {
         Ok(ciphertext)
     }
 
+    /// Encrypts and atomically replaces the vault while the caller holds an exclusive lock.
     fn write_locked(&self, _lock: &VaultLock, vault: &Vault) -> Result<(), StoreError> {
         // Revalidate a current target immediately before replacing it. The stable lock file
         // coordinates all cooperating TWL processes while the vault inode changes atomically.
@@ -595,7 +609,14 @@ mod tests {
     use crate::project::repository::exercise_repository;
     use crate::project::{Action, ProjectRoute, SessionAuthorizer};
     use std::os::unix::fs::symlink;
+    use std::process::{Command, Output, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    const LOCK_CHILD_DIRECTORY_ENV: &str = "TWL_TEST_LOCK_CHILD_DIRECTORY";
+    const LOCK_CHILD_NAME_ENV: &str = "TWL_TEST_LOCK_CHILD_NAME";
+    const LOCK_CHILD_READY_ENV: &str = "TWL_TEST_LOCK_CHILD_READY";
+    const LOCK_CHILD_START_ENV: &str = "TWL_TEST_LOCK_CHILD_START";
 
     struct TestDirectory(PathBuf);
 
@@ -634,6 +655,51 @@ mod tests {
             .unwrap()],
         )
         .unwrap()
+    }
+
+    fn wire_record(name: &str) -> WireRecord {
+        WireRecord {
+            name: name.to_owned(),
+            revision: STANDARD_NO_PAD.encode([7; Revision::BYTES]),
+            project: STANDARD_NO_PAD.encode(&*project(name, "key").encode().unwrap()),
+        }
+    }
+
+    fn wire_bytes(projects: Vec<WireRecord>) -> Vec<u8> {
+        serde_yaml_ng::to_string(&WireVault {
+            version: VAULT_VERSION,
+            projects,
+        })
+        .unwrap()
+        .into_bytes()
+    }
+
+    fn spawn_lock_child(
+        directory: &TestDirectory,
+        name: &str,
+        ready: &std::path::Path,
+        start: &std::path::Path,
+    ) -> std::process::Child {
+        Command::new(std::env::current_exe().unwrap())
+            .arg("separate_repository_process_lock_child")
+            .arg("--nocapture")
+            .env(LOCK_CHILD_DIRECTORY_ENV, &directory.0)
+            .env(LOCK_CHILD_NAME_ENV, name)
+            .env(LOCK_CHILD_READY_ENV, ready)
+            .env(LOCK_CHILD_START_ENV, start)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    fn assert_child_success(name: &str, output: Output) {
+        assert!(
+            output.status.success(),
+            "{name} child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -721,6 +787,118 @@ mod tests {
     }
 
     #[test]
+    fn malformed_vault_payloads_are_rejected() {
+        let mut invalid_identifier = wire_record("app");
+        invalid_identifier.name = "not valid".into();
+
+        let mut malformed_revision = wire_record("app");
+        malformed_revision.revision = "%".into();
+
+        let mut short_revision = wire_record("app");
+        short_revision.revision =
+            STANDARD_NO_PAD.encode(vec![0_u8; Revision::BYTES.saturating_sub(1)]);
+
+        let mut oversized_encoded_project = wire_record("app");
+        oversized_encoded_project.project = "A".repeat(MAX_ENCODED_PROJECT_BYTES + 1);
+
+        let oversized_payload = vec![0_u8; MAX_PROJECT_BYTES + 1];
+        let oversized_payload_encoding = STANDARD_NO_PAD.encode(&oversized_payload);
+        assert!(oversized_payload_encoding.len() <= MAX_ENCODED_PROJECT_BYTES);
+        let mut oversized_decoded_project = wire_record("app");
+        oversized_decoded_project.project = oversized_payload_encoding;
+
+        let mut malformed_project_base64 = wire_record("app");
+        malformed_project_base64.project = "%".into();
+
+        let mut malformed_project = wire_record("app");
+        malformed_project.project = STANDARD_NO_PAD.encode([0xff]);
+
+        let mut mismatched_name = wire_record("payload-name");
+        mismatched_name.name = "wire-name".into();
+
+        let too_many_projects = (0..=MAX_PROJECTS)
+            .map(|index| wire_record(&format!("project-{index}")))
+            .collect();
+
+        let cases = vec![
+            (
+                "unparseable yaml",
+                b"projects: [".to_vec(),
+                StoreError::MalformedRecord,
+            ),
+            (
+                "unknown wire field",
+                b"version: 1\nprojects: []\nextra: true\n".to_vec(),
+                StoreError::MalformedRecord,
+            ),
+            (
+                "wrong version",
+                serde_yaml_ng::to_string(&WireVault {
+                    version: VAULT_VERSION + 1,
+                    projects: Vec::new(),
+                })
+                .unwrap()
+                .into_bytes(),
+                StoreError::MalformedRecord,
+            ),
+            (
+                "too many projects",
+                wire_bytes(too_many_projects),
+                StoreError::MalformedRecord,
+            ),
+            (
+                "invalid identifier",
+                wire_bytes(vec![invalid_identifier]),
+                StoreError::MalformedRecord,
+            ),
+            (
+                "malformed revision base64",
+                wire_bytes(vec![malformed_revision]),
+                StoreError::MalformedRecord,
+            ),
+            (
+                "wrong revision length",
+                wire_bytes(vec![short_revision]),
+                StoreError::MalformedRecord,
+            ),
+            (
+                "oversized encoded project",
+                wire_bytes(vec![oversized_encoded_project]),
+                StoreError::OversizedRecord,
+            ),
+            (
+                "malformed project base64",
+                wire_bytes(vec![malformed_project_base64]),
+                StoreError::MalformedRecord,
+            ),
+            (
+                "oversized decoded project",
+                wire_bytes(vec![oversized_decoded_project]),
+                StoreError::OversizedRecord,
+            ),
+            (
+                "malformed project payload",
+                wire_bytes(vec![malformed_project]),
+                StoreError::MalformedRecord,
+            ),
+            (
+                "wire and project names differ",
+                wire_bytes(vec![mismatched_name]),
+                StoreError::MalformedRecord,
+            ),
+            (
+                "duplicate project name",
+                wire_bytes(vec![wire_record("duplicate"), wire_record("duplicate")]),
+                StoreError::MalformedRecord,
+            ),
+        ];
+
+        for (case, payload, expected) in cases {
+            assert_eq!(Vault::decode(&payload).err(), Some(expected), "{case}");
+        }
+    }
+
+    #[test]
     fn vault_symlinks_are_rejected() {
         let directory = TestDirectory::new();
         let repository = repository(&directory, "password");
@@ -776,17 +954,61 @@ mod tests {
     }
 
     #[test]
-    fn separate_repository_instances_share_the_lock() {
+    fn separate_repository_process_lock_child() {
+        let Some(directory) = std::env::var_os(LOCK_CHILD_DIRECTORY_ENV) else {
+            return;
+        };
+        let name = std::env::var(LOCK_CHILD_NAME_ENV).unwrap();
+        let ready = PathBuf::from(std::env::var_os(LOCK_CHILD_READY_ENV).unwrap());
+        let start = PathBuf::from(std::env::var_os(LOCK_CHILD_START_ENV).unwrap());
+        let repository =
+            LinuxAgeVaultRepository::open_for_test(PathBuf::from(directory), "password").unwrap();
+        fs::write(&ready, b"ready").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !start.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "parent did not release the lock-test children"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        repository
+            .create(&project(&name, &format!("{name}-key")))
+            .unwrap();
+    }
+
+    #[test]
+    fn separate_processes_share_the_lock() {
         let directory = TestDirectory::new();
-        let first = repository(&directory, "password");
-        let second = repository(&directory, "password");
-        std::thread::scope(|scope| {
-            let one = scope.spawn(|| first.create(&project("one", "one-key")));
-            let two = scope.spawn(|| second.create(&project("two", "two-key")));
-            one.join().unwrap().unwrap();
-            two.join().unwrap().unwrap();
-        });
-        assert_eq!(first.list().unwrap(), ["one", "two"]);
+        let parent = repository(&directory, "password");
+        let first_ready = directory.0.join(".first-ready");
+        let second_ready = directory.0.join(".second-ready");
+        let start = directory.0.join(".start");
+        let mut first = spawn_lock_child(&directory, "one", &first_ready, &start);
+        let mut second = spawn_lock_child(&directory, "two", &second_ready, &start);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !first_ready.exists() || !second_ready.exists() {
+            if Instant::now() >= deadline {
+                let _ = first.kill();
+                let _ = second.kill();
+                let first_output = first.wait_with_output().unwrap();
+                let second_output = second.wait_with_output().unwrap();
+                panic!(
+                    "lock-test children did not become ready\nfirst stderr:\n{}\nsecond stderr:\n{}",
+                    String::from_utf8_lossy(&first_output.stderr),
+                    String::from_utf8_lossy(&second_output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        fs::write(&start, b"start").unwrap();
+        assert_child_success("first", first.wait_with_output().unwrap());
+        assert_child_success("second", second.wait_with_output().unwrap());
+        assert_eq!(parent.list().unwrap(), ["one", "two"]);
     }
 
     #[test]
