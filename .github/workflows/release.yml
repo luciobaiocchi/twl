@@ -3,6 +3,19 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: Platforms to build
+        type: choice
+        options: [all, linux-only]
+        default: all
+      publish:
+        description: >-
+          Publish a prerelease. Requires running from a tag ref; leave off for
+          a dry run that builds and packages without publishing anything.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -29,8 +43,18 @@ jobs:
         run: |
           set -euo pipefail
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
-          test "v${version}" = "$GITHUB_REF_NAME"
+          # A tag ref is the release identity, so it must agree with Cargo.toml.
+          # A branch ref only ever reaches a dry run, which publishes nothing,
+          # so derive a name for the logs instead of failing the job.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            test "v${version}" = "$GITHUB_REF_NAME"
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v${version}"
+            echo "::notice::dry run from ${GITHUB_REF_NAME}; nothing will be published"
+          fi
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
 
       - name: Verify tagged source
         run: |
@@ -99,6 +123,9 @@ jobs:
   macos:
     name: macOS (${{ matrix.target }})
     needs: verify-version
+    # Signing and notarization need credentials and an entitlement setup that a
+    # Linux-only prerelease does not. Skipping the job leaves publish reachable.
+    if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'all'
     runs-on: ${{ matrix.runner }}
     environment: release
     strategy:
@@ -210,6 +237,17 @@ jobs:
   publish:
     name: Publish GitHub prerelease
     needs: [verify-version, linux, macos]
+    # macos is skipped for a linux-only run, which would skip this job too
+    # without always(). A dry run and a branch ref both stop before publishing:
+    # the release must be able to point at a real tag.
+    if: >-
+      always()
+      && needs.verify-version.result == 'success'
+      && needs.linux.result == 'success'
+      && needs.macos.result != 'failure'
+      && needs.macos.result != 'cancelled'
+      && github.ref_type == 'tag'
+      && (github.event_name != 'workflow_dispatch' || inputs.publish)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -223,9 +261,20 @@ jobs:
           merge-multiple: true
 
       - name: Generate checksums
+        shell: bash
         run: |
+          set -euo pipefail
           cd dist
-          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+          # A linux-only run produces no .zip, and an unmatched glob would
+          # otherwise reach sha256sum as a literal path and fail the job.
+          shopt -s nullglob
+          artifacts=(./*.tar.gz ./*.zip)
+          if [ "${#artifacts[@]}" -eq 0 ]; then
+            echo "::error::no release artifacts were downloaded"
+            exit 1
+          fi
+          sha256sum "${artifacts[@]}" > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Attest build artifacts
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -235,10 +284,22 @@ jobs:
       - name: Create prerelease
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify-version.outputs.tag }}
+          MACOS_RESULT: ${{ needs.macos.result }}
+        shell: bash
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          set -euo pipefail
+          notes=$RUNNER_TEMP/notes.md
+          if [ "$MACOS_RESULT" = "skipped" ]; then
+            printf '%s\n\n' \
+              "Linux only. This prerelease carries no macOS artifact." >"$notes"
+          else
+            : >"$notes"
+          fi
+          gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Towel $GITHUB_REF_NAME" \
+            --title "Towel $TAG" \
+            --notes-file "$notes" \
             --generate-notes \
             --prerelease \
             --verify-tag

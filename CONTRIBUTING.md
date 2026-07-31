@@ -58,6 +58,34 @@ disposable canaries in tests and documentation.
 - Update the README and changelog when behavior or the CLI changes.
 - Do not mix generated formatting changes with unrelated logic.
 
+## Cutting a release
+
+Releases are driven by the tag, not by merging. The tag is the release
+identity, so `verify-version` refuses to build when it disagrees with the
+version in `Cargo.toml`.
+
+Before tagging, bump `version` in `Cargo.toml`, refresh `Cargo.lock`, and move
+the `Unreleased` changelog heading to the new version.
+
+A normal release builds every platform and publishes:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The **Release** workflow can also be started by hand from the Actions tab, with
+two inputs:
+
+- `platforms` — `all`, or `linux-only` to skip signing and notarization and
+  ship a Linux prerelease on its own.
+- `publish` — off by default. Leave it off for a dry run that builds, packages,
+  and runs every artifact check without creating a release. Turn it on only
+  when the run is started from an existing tag; a release cannot point at a
+  branch.
+
+Use a dry run from a branch to exercise the packaging steps before spending a
+tag on them.
+
 Unless explicitly stated otherwise, contributions submitted for inclusion are
 licensed under the Apache License, Version 2.0, as described in Section 5 of
 the license.
