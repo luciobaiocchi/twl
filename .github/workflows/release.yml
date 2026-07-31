@@ -56,6 +56,15 @@ jobs:
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
 
+          # A silently missing platform is worse than a loud one.
+          if [ "$MACOS_RELEASE" = "true" ]; then
+            echo "::notice::$tag will build Linux and macOS"
+          else
+            echo "::notice::$tag will build Linux only; set the MACOS_RELEASE repository variable to \"true\" to include macOS"
+          fi
+        env:
+          MACOS_RELEASE: ${{ vars.MACOS_RELEASE }}
+
       - name: Verify tagged source
         run: |
           cargo +1.82.0 fmt --all -- --check
@@ -123,9 +132,14 @@ jobs:
   macos:
     name: macOS (${{ matrix.target }})
     needs: verify-version
-    # Signing and notarization need credentials and an entitlement setup that a
-    # Linux-only prerelease does not. Skipping the job leaves publish reachable.
-    if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'all'
+    # Opt-in. Signing and notarization need credentials and an entitlement
+    # configuration that has not been exercised on a Developer ID build yet, so
+    # a tag must be able to ship Linux on its own. Set the MACOS_RELEASE
+    # repository variable to "true" once that path is verified; until then this
+    # job never runs and publish still produces a Linux-only prerelease.
+    if: >-
+      vars.MACOS_RELEASE == 'true'
+      && (github.event_name != 'workflow_dispatch' || inputs.platforms == 'all')
     runs-on: ${{ matrix.runner }}
     environment: release
     strategy:
