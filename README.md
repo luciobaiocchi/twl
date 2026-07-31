@@ -1,8 +1,9 @@
 # Towel (`twl`)
 
 Towel keeps destination-bound application API keys out of coding-agent
-processes. The macOS-only v0.1 stores a set of routes under one named project,
-then opens that project for a child command after one native authorization.
+processes. It stores a set of routes under one named project, then opens that
+project for a child command after one macOS authorization or Linux vault
+password prompt.
 
 ```bash
 twl project add my-app
@@ -18,9 +19,10 @@ twl run --project my-app -- codex
 
 ## Projects and routes
 
-A project is the unit of authorization. One versioned, application-scoped
-macOS Data Protection Keychain record contains all of its trusted destinations
-and credentials. A project has one or more named routes; every route contains:
+A project is the unit of authorization. On macOS, one versioned Data Protection
+Keychain record contains the project. On Linux, one password-encrypted age
+vault contains every project and its revision. A project has one or more named
+routes; every route contains:
 
 - an exact HTTPS base URL, optionally including a base path;
 - one static Bearer API key;
@@ -42,15 +44,50 @@ route names, destinations, and environment variable names, but never secret
 values or secret-derived fingerprints. Project and route names are identifiers,
 not paths.
 
-Real project operations require macOS. Towel does not create a portable vault,
-password-encrypted file, Linux credential backend, daemon, or control plane.
+The commands and project format are the same on macOS and Linux. macOS uses the
+application-scoped Keychain backend. Linux uses `$XDG_DATA_HOME/twl/projects.age`,
+falling back to `~/.local/share/twl/projects.age`.
+
+## Linux encrypted vault
+
+The Linux backend uses the standard age passphrase format; Towel does not
+implement cryptography itself. The password is read directly from `/dev/tty`
+once per protected command or run session, and is confirmed when the first
+vault is created. It is never accepted through an argument or environment
+variable. Use a strong, unique password: it cannot be recovered, and a copied
+vault can be subjected to offline password guessing. Authenticated encryption
+detects modification, but cannot prevent deletion or rollback to an older
+valid vault; keep an appropriate backup.
+
+The vault directory is mode `0700`; vault and lock files are mode `0600`.
+Towel rejects symlinks, non-regular files, unexpected ownership, unsafe file
+modes, hard links, and oversized ciphertext or plaintext. Updates take an
+exclusive lock and use a same-directory temporary file, `fsync`, and atomic
+rename. Passwords, decoded vault records, and broker route credentials use
+zeroizing memory where their lifetimes end.
+
+Before reading a password or decrypting the vault, Towel disables Linux process
+dumpability. For `twl run`, it drops the password, decrypted vault, and open
+vault descriptors before starting the child. If `bwrap` is available, Towel
+also masks the vault directory and gives the child a separate PID namespace and
+private `/proc`. The rest of the host filesystem, Git, SSH/GPG, Docker socket,
+and network remain available. Towel accepts only a root-owned, non-writable
+system installation at `/usr/bin/bwrap` or `/usr/local/bin/bwrap`; it does not
+trust an agent-controlled `PATH`. If that profile is not used, the age-encrypted
+vault remains protected by its password.
+
+Inside an existing container, the same CLI requires an interactive TTY, a
+persistent mount for the vault directory, and a shared network namespace
+between Towel and its child so loopback broker URLs work. Towel does not create
+or manage that container.
 
 ## Session contract
 
-Starting `twl run --project NAME -- COMMAND` performs one macOS
-LocalAuthentication approval for the entire project session. Touch ID is used
-when available; macOS can fall back to the configured device-owner
-authentication. Authorization times out after 120 seconds.
+Starting `twl run --project NAME -- COMMAND` performs one authorization for the
+entire project session: LocalAuthentication on macOS or one vault-password
+prompt on Linux. Touch ID is used when available; macOS can fall back to the
+configured device-owner authentication. macOS authorization times out after
+120 seconds.
 
 The child receives, for every route, only:
 
@@ -58,7 +95,8 @@ The child receives, for every route, only:
 - a route-specific loopback broker URL in its base-URL variable.
 
 Real credentials and real upstream destinations are not placed in child
-environment variables, arguments, files, logs, or inherited file descriptors.
+environment variables, arguments, plaintext files, logs, or inherited file
+descriptors.
 They remain in the trusted Towel process and are bound together by the project
 record. The broker selects the upstream from the authenticated route path and
 injects only that route's key as `Authorization: Bearer`.
@@ -113,7 +151,7 @@ cargo +1.82.0 clippy --all-targets --all-features --locked -- -D warnings
 cargo +1.82.0 build --release --locked
 ```
 
-The canary-only demo does not read Keychain credentials and works on supported
+The canary-only demo does not read stored credentials and works on supported
 development hosts:
 
 ```bash
@@ -123,10 +161,10 @@ development hosts:
 
 ## Explicit non-goals
 
-This version does not provide a custom encrypted vault, Argon2/password-based
-storage, Linux credentials, Docker or Kubernetes integration, a daemon or
-control plane, provider-specific profiles, repository-controlled destinations,
-arbitrary authentication templates, transparent TLS interception, release
-packaging, or Homebrew distribution. The agent's own Codex/OpenHands/model
-login and ambient files, sockets, and unrelated secrets are outside Towel's
-boundary.
+This version does not provide Linux Secret Service integration, custom
+cryptography, Docker or OCI image management, a dedicated Linux user, network
+isolation, configurable sandbox policies, a daemon or control plane,
+provider-specific profiles, repository-controlled destinations, arbitrary
+authentication templates, or transparent TLS interception. The agent's own
+Codex/OpenHands/model login and ambient files, sockets, and unrelated secrets
+are outside Towel's boundary.

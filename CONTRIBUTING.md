@@ -27,6 +27,8 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 The Python example uses only the standard library. On macOS, set
 `TWL_TEAM_ID=<team-id>` and use `scripts/build-macos.sh` before manually
 testing a real credential; ordinary Cargo binaries intentionally fail closed.
+On Linux, use disposable vault credentials and set `XDG_DATA_HOME` to a
+dedicated test directory for manual backend testing.
 
 ## Security invariants
 
@@ -36,7 +38,10 @@ Changes must preserve these properties:
   environment variables, workspace configuration, files, logs, inherited
   descriptors, or error messages.
 - Every credential is bound to the exact upstream stored in its trusted
-  Keychain project record.
+  platform project repository.
+- Linux vault operations preserve age compatibility, strict ownership and file
+  modes, size limits, locking, atomic replacement, and zeroizing secret
+  lifetimes.
 - Client authentication, host, and forwarding headers cannot override policy.
 - Redirects never carry credentials to another destination.
 - One native authorization opens one complete project session.

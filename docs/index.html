@@ -39,11 +39,11 @@
     <main id="main">
       <section class="hero" id="top">
         <div class="hero-copy">
-          <div class="eyebrow"><span></span> Experimental · real credentials on macOS</div>
+          <div class="eyebrow"><span></span> Experimental · macOS + Linux</div>
           <h1>Let the agent run the app.<br /><em>Keep the key out of sight.</em></h1>
           <p class="hero-lead">
             Towel is a small credential broker for projects operated by coding
-            agents. One named project holds multiple Keychain-backed routes.
+            agents. One named project holds multiple protected routes.
             The child gets fake keys and loopback URLs; real keys stay in the
             trusted parent and reach only their fixed services.
           </p>
@@ -51,7 +51,7 @@
             <a class="button primary" href="https://github.com/luciobaiocchi/twl">View the source</a>
             <a class="button secondary" href="#try-it">Run the canary demo</a>
           </div>
-          <p class="small-print">Apache-2.0 · macOS Keychain · no TLS interception</p>
+          <p class="small-print">Apache-2.0 · Keychain or age vault · no TLS interception</p>
         </div>
 
         <div class="hero-stage">
@@ -71,7 +71,7 @@
 <span class="muted"># interactively add one or more HTTPS Bearer routes</span>
 
 <span class="prompt">$</span> twl run --project my-app -- codex
-<span class="muted"># approve the complete session with Touch ID when available</span>
+<span class="muted"># authorize once with Touch ID or the Linux vault password</span>
 
 <span class="muted"># Inside the agent process</span>
 <span class="prompt">$</span> printenv APP_API_KEY
@@ -84,7 +84,7 @@
       </section>
 
       <div class="signal-strip" aria-label="Towel properties">
-        <span>KEYCHAIN LOCKED</span><i></i>
+        <span>PROTECTED STORAGE</span><i></i>
         <span>LOOPBACK ONLY</span><i></i>
         <span>FIXED DESTINATION</span><i></i>
         <span>REAL KEYS STAY HIDDEN</span>
@@ -94,7 +94,7 @@
         <div class="section-heading">
           <span>01 / Architecture</span>
           <h2>One small process boundary</h2>
-          <p>No provider catalog or portable vault. One application-scoped Data Protection Keychain record binds every project route to its credential and exact destination.</p>
+          <p>No provider catalog or custom cryptography. A macOS Keychain record or Linux password-encrypted age vault binds every project route to its credential and exact destination.</p>
         </div>
 
         <div class="flow" aria-label="Request flow">
@@ -128,7 +128,7 @@
         <article>
           <span class="feature-number">A</span>
           <h3>Zero real key in the child</h3>
-          <p>Keychain values and destinations are never supplied through child environment variables, arguments, files, or descriptors.</p>
+          <p>Stored values and destinations are never supplied through child environment variables, arguments, plaintext files, or descriptors.</p>
         </article>
         <article>
           <span class="feature-number">B</span>
@@ -152,7 +152,7 @@
             <h3><span>✓</span> Towel protects</h3>
             <ul>
               <li>Real project keys and destinations from the child environment</li>
-              <li>Keychain-selected destinations from workspace edits</li>
+              <li>Trusted-store destinations from workspace edits</li>
               <li>Authentication from hostile client headers</li>
               <li>Direct plaintext and common-Base64 key reflection</li>
             </ul>
@@ -178,8 +178,8 @@
           <p>
             The demo creates a canary credential and a local service, then runs
             the same Python application contract used by a real session. This
-            canary demo works cross-platform; real project sessions require a
-            protected macOS binary and LocalAuthentication.
+            canary demo works cross-platform; real project sessions use a
+            protected macOS binary or the Linux password-encrypted age vault.
           </p>
           <div class="status-line"><i></i> Public packages are planned for the first alpha release.</div>
         </div>
