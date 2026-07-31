@@ -79,8 +79,14 @@ jobs:
           fi
           # Both runners are native, so the packaged binary can be exercised
           # directly. doctor opens the vault directory, which is the part most
-          # likely to break in a stripped release build.
-          "dist/$name/twl" doctor
+          # likely to break in a stripped release build. It reports failures on
+          # stdout and always exits 0 so that dev builds can run it, so assert
+          # on the line rather than the status.
+          "dist/$name/twl" doctor | tee "$RUNNER_TEMP/doctor.txt"
+          if ! grep -q "encrypted Linux project sessions: available" "$RUNNER_TEMP/doctor.txt"; then
+            echo "::error::$name cannot open the encrypted vault"
+            exit 1
+          fi
           tar -C dist -czf "dist/$name.tar.gz" "$name"
 
       - name: Upload artifact
@@ -167,7 +173,15 @@ jobs:
             --sign "$APPLE_SIGNING_IDENTITY" "dist/$name/twl"
           codesign --verify --strict --verbose=2 "dist/$name/twl"
           codesign -d --entitlements - "dist/$name/twl"
-          "dist/$name/twl" doctor
+          # doctor reports an unusable Keychain on stdout and still exits 0, so
+          # assert on the line. This is the only automated check that the signed
+          # entitlements and access group actually work; without it a binary
+          # that fails closed on every project command still ships.
+          "dist/$name/twl" doctor | tee "$RUNNER_TEMP/doctor.txt"
+          if ! grep -q "protected macOS project sessions: available" "$RUNNER_TEMP/doctor.txt"; then
+            echo "::error::$name cannot open the protected Keychain store"
+            exit 1
+          fi
           ditto -c -k --keepParent "dist/$name" "dist/$name.zip"
           python3 - <<'PY'
           import base64, os, pathlib
