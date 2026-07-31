@@ -25,8 +25,9 @@ experimental versions may require upgrading rather than receiving backports.
 
 Towel is designed to keep a named project's static Bearer credentials out of a
 coding agent's process while allowing applications launched by that agent to
-use a destination-bound local broker. Real credentials are currently macOS
-only. It is not:
+use a destination-bound local broker. macOS stores each project in the Data
+Protection Keychain. Linux stores all projects in a password-encrypted age
+vault. It is not:
 
 - a process, filesystem, or container sandbox;
 - a portable or general secret store;
@@ -37,10 +38,34 @@ only. It is not:
   otherwise exposes a credential;
 - a restriction on use of API authority already granted for the session.
 
-One LocalAuthentication approval opens the complete project session. The child
-receives only per-route fake keys and loopback URLs; each real credential and
-exact HTTPS destination remain together in one application-scoped Data
-Protection Keychain record. macOS limits records to Towel's signed Keychain
-access group, and Towel verifies the effective signing entitlements before
-opening the repository. See the README for the complete operating assumptions
-and known limitations.
+One platform authorization opens the complete project session. The child
+receives only per-route fake keys and loopback URLs. On macOS, each real
+credential and exact HTTPS destination remain together in one
+application-scoped Data Protection Keychain record. macOS limits records to
+Towel's signed Keychain access group, and Towel verifies the effective signing
+entitlements before opening the repository.
+
+On Linux, the age vault protects persistent credentials when an agent can read
+or copy the filesystem but does not know the vault password. Towel reads that
+password from `/dev/tty`, disables process dumpability before loading secrets,
+and drops the password and full decrypted vault before launching the child.
+Copying the ciphertext enables offline password guessing, and authenticated
+encryption detects modification but not deletion or rollback to an older valid
+vault.
+
+Bubblewrap, when installed, is only an additional filesystem-masking and
+PID/`/proc` isolation layer. It deliberately does not isolate the network or
+the rest of the filesystem and does not block Docker access. Its absence does
+not weaken age encryption of the vault.
+
+The Linux build uses age with its already-empty default feature set. Age 0.11's
+localization dependencies are unconditional, so disabling default features
+does not remove that transitive graph. Those dependencies are locked and
+covered by the repository's RustSec check, but remain part of the trusted
+process's supply-chain surface.
+
+An agent that can use a privileged host Docker daemon, `sudo`, `ptrace`, or
+another route to full host control may attack the running broker or Towel
+process. Host-level compromise, same-user denial of service, and destructive
+replacement of the encrypted vault are outside Towel's security boundary. See
+the README for the complete operating assumptions and known limitations.

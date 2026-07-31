@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::upstream;
+use common::authenticated_upstream;
 use std::process::Command;
 use twl::proxy::{self, Route};
 use twl::{child_command, secret};
@@ -31,7 +31,12 @@ fn python_app_uses_the_service_without_receiving_the_real_key() {
         return;
     }
 
-    let (upstream, log) = upstream();
+    let (upstream, log) = authenticated_upstream(REAL_KEY);
+    let fake_key = secret::mock();
+    let direct = ureq::get(&format!("{upstream}/v1/models"))
+        .set("authorization", &format!("Bearer {fake_key}"))
+        .call();
+    assert!(matches!(direct, Err(ureq::Error::Status(401, _))));
     let handle = proxy::spawn(
         vec![Route {
             name: "application".into(),
@@ -42,7 +47,7 @@ fn python_app_uses_the_service_without_receiving_the_real_key() {
     )
     .unwrap();
     let overrides = vec![
-        ("APP_API_KEY".into(), secret::mock()),
+        ("APP_API_KEY".into(), fake_key),
         (
             "APP_BASE_URL".into(),
             format!(
@@ -70,10 +75,10 @@ fn python_app_uses_the_service_without_receiving_the_real_key() {
     assert!(!stdout.contains(REAL_KEY));
 
     let seen = log.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].url, "/v1/models");
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1].url, "/v1/models");
     assert_eq!(
-        seen[0].header("authorization"),
+        seen[1].header("authorization"),
         Some(&*format!("Bearer {REAL_KEY}"))
     );
     drop(handle);

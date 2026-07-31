@@ -21,6 +21,14 @@ impl Seen {
 }
 
 pub fn upstream() -> (String, Log) {
+    upstream_with_expected_key(None)
+}
+
+pub fn authenticated_upstream(expected_key: &str) -> (String, Log) {
+    upstream_with_expected_key(Some(expected_key.to_owned()))
+}
+
+fn upstream_with_expected_key(expected_key: Option<String>) -> (String, Log) {
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let port = server.server_addr().to_ip().unwrap().port();
     let log: Log = Arc::new(Mutex::new(Vec::new()));
@@ -29,13 +37,14 @@ pub fn upstream() -> (String, Log) {
     std::thread::spawn(move || {
         for request in server.incoming_requests() {
             let sink = sink.clone();
-            std::thread::spawn(move || serve_upstream(request, &sink));
+            let expected_key = expected_key.clone();
+            std::thread::spawn(move || serve_upstream(request, &sink, expected_key.as_deref()));
         }
     });
     (format!("http://127.0.0.1:{port}"), log)
 }
 
-fn serve_upstream(request: tiny_http::Request, sink: &Log) {
+fn serve_upstream(request: tiny_http::Request, sink: &Log, expected_key: Option<&str>) {
     let url = request.url().to_string();
     let headers: Vec<(String, String)> = request
         .headers()
@@ -89,9 +98,16 @@ fn serve_upstream(request: tiny_http::Request, sink: &Log) {
             )
     } else if url.starts_with("/v1/echo-key") {
         tiny_http::Response::from_data(authentication.into_bytes()).with_status_code(200)
-    } else {
+    } else if expected_key
+        .map(|key| authentication == format!("Bearer {key}"))
+        .unwrap_or(true)
+    {
         tiny_http::Response::from_data(br#"{"authenticated":true}"#.to_vec())
             .with_status_code(200)
+            .with_header(tiny_http::Header::from_bytes("content-type", "application/json").unwrap())
+    } else {
+        tiny_http::Response::from_data(br#"{"authenticated":false}"#.to_vec())
+            .with_status_code(401)
             .with_header(tiny_http::Header::from_bytes("content-type", "application/json").unwrap())
     };
     let _ = request.respond(response);

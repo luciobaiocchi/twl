@@ -4,12 +4,25 @@ use std::collections::HashMap;
 use std::fmt;
 #[cfg(test)]
 use std::sync::Mutex;
+#[cfg(test)]
+use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Opaque, secret-bearing record revision used to reject stale replacement.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct Revision(Vec<u8>);
 
 impl Revision {
+    pub(crate) const BYTES: usize = 32;
+
+    pub(crate) fn random() -> Self {
+        use rand::RngCore;
+
+        let mut bytes = vec![0_u8; Self::BYTES];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        Self(bytes)
+    }
+
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
         Self(bytes)
@@ -60,6 +73,8 @@ pub enum StoreError {
     AlreadyExists,
     Conflict,
     MalformedRecord,
+    OversizedRecord,
+    VaultUnlockFailed,
     UntrustedStore,
     UntrustedItem,
     UnsupportedPlatform,
@@ -74,12 +89,17 @@ impl fmt::Display for StoreError {
             Self::AlreadyExists => formatter.write_str("project already exists"),
             Self::Conflict => formatter.write_str("project changed while it was being edited"),
             Self::MalformedRecord => formatter.write_str("malformed stored project record"),
+            Self::OversizedRecord => {
+                formatter.write_str("stored project data exceeds the supported size limit")
+            }
+            Self::VaultUnlockFailed => formatter
+                .write_str("could not unlock the project vault: wrong password or damaged vault"),
             Self::UntrustedStore => formatter.write_str("trusted project store is unavailable"),
             Self::UntrustedItem => {
                 formatter.write_str("project record has untrusted access control")
             }
             Self::UnsupportedPlatform => {
-                formatter.write_str("project credentials are currently available only on macOS")
+                formatter.write_str("project credentials are unavailable on this platform")
             }
             Self::InvalidProject(error) => error.fmt(formatter),
             Self::Platform(message) => formatter.write_str(message),
@@ -234,9 +254,12 @@ where
 }
 
 #[cfg(test)]
+type MemoryRecord = (Zeroizing<Vec<u8>>, Revision);
+
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MemoryRepository {
-    records: Mutex<HashMap<String, (Vec<u8>, Revision)>>,
+    records: Mutex<HashMap<String, MemoryRecord>>,
 }
 
 #[cfg(test)]
@@ -265,7 +288,7 @@ impl ProjectRepository for MemoryRepository {
         }
         records.insert(
             project.name().into(),
-            (project.encode()?, random_revision()),
+            (project.encode()?, Revision::random()),
         );
         Ok(())
     }
@@ -279,7 +302,7 @@ impl ProjectRepository for MemoryRepository {
         }
         records.insert(
             project.name().into(),
-            (project.encode()?, random_revision()),
+            (project.encode()?, Revision::random()),
         );
         Ok(())
     }
@@ -292,14 +315,6 @@ impl ProjectRepository for MemoryRepository {
             .map(|_| ())
             .ok_or(StoreError::NotFound)
     }
-}
-
-#[cfg(test)]
-fn random_revision() -> Revision {
-    use rand::RngCore;
-    let mut bytes = vec![0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    Revision::from_bytes(bytes)
 }
 
 #[cfg(test)]
@@ -379,11 +394,19 @@ mod tests {
     }
 
     #[test]
+    fn random_revisions_have_one_cross_platform_size() {
+        assert_eq!(Revision::random().as_bytes().len(), Revision::BYTES);
+    }
+
+    #[test]
     fn malformed_memory_records_fail_generically() {
         let repository = MemoryRepository::default();
         repository.records.lock().unwrap().insert(
             "app".into(),
-            (b"secret-bearing-malformed-data".to_vec(), random_revision()),
+            (
+                Zeroizing::new(b"secret-bearing-malformed-data".to_vec()),
+                Revision::random(),
+            ),
         );
         assert_eq!(
             repository.get("app").unwrap_err(),

@@ -1,8 +1,9 @@
 # Towel (`twl`)
 
 Towel keeps destination-bound application API keys out of coding-agent
-processes. The macOS-only v0.1 stores a set of routes under one named project,
-then opens that project for a child command after one native authorization.
+processes. It stores a set of routes under one named project, then opens that
+project for a child command after one macOS authorization or Linux vault
+password prompt.
 
 ```bash
 twl project add my-app
@@ -16,11 +17,43 @@ twl run --project my-app -- codex
 > Experimental security software: it has not been independently audited. Use
 > disposable or tightly scoped development credentials while evaluating it.
 
+## Why this exists
+
+You want to run a coding agent on your machine. It needs to call some API, so
+you do what everybody does: you put the key in the environment and launch it.
+
+Now look at what you just did. The key is in `environ`. It is in every child
+process the agent spawns. It is one `echo $API_KEY` away from the transcript,
+one `curl` away from anywhere on the internet, and it stays valid long after
+you close the terminal. You did not grant the agent *use* of your API. You
+handed over the credential, and a credential does not expire when your patience
+does.
+
+Here is the thing though: the agent never wanted the key. It wanted the
+*effect* of the key — a request that arrives at the API and is accepted. That
+is a much smaller thing to give away, and it turns out you can give it away
+without giving anything up.
+
+So Towel keeps the key and lends out the effect. It starts a small HTTP broker
+on loopback, hands the child a random fake key and a `127.0.0.1` URL, and
+substitutes the real credential on the way out — only on the way out, and only
+towards the one destination you registered it for. The agent's code does not
+change. It still reads an API-key variable and a base URL. Those values just
+stopped being worth stealing.
+
+I would rather be clear about the limits than oversell this. While the session
+is running, the agent can reach the API through the broker, so it can spend
+your quota and touch your data. Towel does not sandbox it and is not trying to.
+What it takes away is the credential itself: nothing the agent can read, log,
+print, or copy out is worth anything once the session ends. That is a narrower
+promise than "your agent is contained", and it is the one I can actually keep.
+
 ## Projects and routes
 
-A project is the unit of authorization. One versioned, application-scoped
-macOS Data Protection Keychain record contains all of its trusted destinations
-and credentials. A project has one or more named routes; every route contains:
+A project is the unit of authorization. On macOS, one versioned Data Protection
+Keychain record contains the project. On Linux, one password-encrypted age
+vault contains every project and its revision. A project has one or more named
+routes; every route contains:
 
 - an exact HTTPS base URL, optionally including a base path;
 - one static Bearer API key;
@@ -42,15 +75,50 @@ route names, destinations, and environment variable names, but never secret
 values or secret-derived fingerprints. Project and route names are identifiers,
 not paths.
 
-Real project operations require macOS. Towel does not create a portable vault,
-password-encrypted file, Linux credential backend, daemon, or control plane.
+The commands and project format are the same on macOS and Linux. macOS uses the
+application-scoped Keychain backend. Linux uses `$XDG_DATA_HOME/twl/projects.age`,
+falling back to `~/.local/share/twl/projects.age`.
+
+## Linux encrypted vault
+
+The Linux backend uses the standard age passphrase format; Towel does not
+implement cryptography itself. The password is read directly from `/dev/tty`
+once per protected command or run session, and is confirmed when the first
+vault is created. It is never accepted through an argument or environment
+variable. Use a strong, unique password: it cannot be recovered, and a copied
+vault can be subjected to offline password guessing. Authenticated encryption
+detects modification, but cannot prevent deletion or rollback to an older
+valid vault; keep an appropriate backup.
+
+The vault directory is mode `0700`; vault and lock files are mode `0600`.
+Towel rejects symlinks, non-regular files, unexpected ownership, unsafe file
+modes, hard links, and oversized ciphertext or plaintext. Updates take an
+exclusive lock and use a same-directory temporary file, `fsync`, and atomic
+rename. Passwords, decoded vault records, and broker route credentials use
+zeroizing memory where their lifetimes end.
+
+Before reading a password or decrypting the vault, Towel disables Linux process
+dumpability. For `twl run`, it drops the password, decrypted vault, and open
+vault descriptors before starting the child. If `bwrap` is available, Towel
+also masks the vault directory and gives the child a separate PID namespace and
+private `/proc`. The rest of the host filesystem, Git, SSH/GPG, Docker socket,
+and network remain available. Towel accepts only a root-owned, non-writable
+system installation at `/usr/bin/bwrap` or `/usr/local/bin/bwrap`; it does not
+trust an agent-controlled `PATH`. If that profile is not used, the age-encrypted
+vault remains protected by its password.
+
+Inside an existing container, the same CLI requires an interactive TTY, a
+persistent mount for the vault directory, and a shared network namespace
+between Towel and its child so loopback broker URLs work. Towel does not create
+or manage that container.
 
 ## Session contract
 
-Starting `twl run --project NAME -- COMMAND` performs one macOS
-LocalAuthentication approval for the entire project session. Touch ID is used
-when available; macOS can fall back to the configured device-owner
-authentication. Authorization times out after 120 seconds.
+Starting `twl run --project NAME -- COMMAND` performs one authorization for the
+entire project session: LocalAuthentication on macOS or one vault-password
+prompt on Linux. Touch ID is used when available; macOS can fall back to the
+configured device-owner authentication. macOS authorization times out after
+120 seconds.
 
 The child receives, for every route, only:
 
@@ -58,7 +126,8 @@ The child receives, for every route, only:
 - a route-specific loopback broker URL in its base-URL variable.
 
 Real credentials and real upstream destinations are not placed in child
-environment variables, arguments, files, logs, or inherited file descriptors.
+environment variables, arguments, plaintext files, logs, or inherited file
+descriptors.
 They remain in the trusted Towel process and are bound together by the project
 record. The broker selects the upstream from the authenticated route path and
 injects only that route's key as `Authorization: Bearer`.
@@ -102,6 +171,38 @@ the identity is unset; that mode is for local build checks, not real credential
 deployment. `twl doctor` reports whether the current binary satisfies the
 hardened-runtime checks.
 
+## Linux build
+
+Linux needs no signing. The vault protects itself with a password, so an
+ordinary release build is a real deployment:
+
+```bash
+scripts/build-linux.sh
+```
+
+The script builds against musl when that target is installed, so the result is
+a static binary that runs on any glibc or musl distribution, then checks that
+the binary really is static and runs `twl doctor` against it. Set
+`TWL_TARGET` to override the target triple.
+
+`bwrap` (bubblewrap) is an optional runtime dependency. When it is present
+Towel additionally masks the vault directory and gives the child a private PID
+namespace; when it is absent Towel says so and the encrypted vault is unchanged.
+Nothing else is required at runtime.
+
+## Verifying a release
+
+Release archives carry a build-provenance attestation. Check it before you
+trust a downloaded binary:
+
+```bash
+gh attestation verify twl-<version>-<target>.tar.gz --repo luciobaiocchi/twl
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+macOS archives are Developer ID signed and notarized, so `spctl` and Gatekeeper
+accept them directly.
+
 ## Build and test
 
 Towel requires Rust 1.82 or newer:
@@ -113,7 +214,7 @@ cargo +1.82.0 clippy --all-targets --all-features --locked -- -D warnings
 cargo +1.82.0 build --release --locked
 ```
 
-The canary-only demo does not read Keychain credentials and works on supported
+The canary-only demo does not read stored credentials and works on supported
 development hosts:
 
 ```bash
@@ -123,10 +224,10 @@ development hosts:
 
 ## Explicit non-goals
 
-This version does not provide a custom encrypted vault, Argon2/password-based
-storage, Linux credentials, Docker or Kubernetes integration, a daemon or
-control plane, provider-specific profiles, repository-controlled destinations,
-arbitrary authentication templates, transparent TLS interception, release
-packaging, or Homebrew distribution. The agent's own Codex/OpenHands/model
-login and ambient files, sockets, and unrelated secrets are outside Towel's
-boundary.
+This version does not provide Linux Secret Service integration, custom
+cryptography, Docker or OCI image management, a dedicated Linux user, network
+isolation, configurable sandbox policies, a daemon or control plane,
+provider-specific profiles, repository-controlled destinations, arbitrary
+authentication templates, or transparent TLS interception. The agent's own
+Codex/OpenHands/model login and ambient files, sockets, and unrelated secrets
+are outside Towel's boundary.
