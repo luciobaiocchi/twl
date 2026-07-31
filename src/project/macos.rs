@@ -13,7 +13,6 @@ use core_foundation_sys::array::CFArrayRef;
 use core_foundation_sys::base::{kCFAllocatorDefault, CFGetTypeID, CFRelease, CFTypeRef, OSStatus};
 use core_foundation_sys::error::CFErrorRef;
 use core_foundation_sys::string::CFStringRef;
-use rand::RngCore;
 use security_framework::base::Error;
 use security_framework_sys::base::{errSecDuplicateItem, errSecItemNotFound, errSecSuccess};
 use security_framework_sys::item::{
@@ -34,7 +33,6 @@ const ACCESS_GROUP_SUFFIX: &str = "dev.towel.project";
 const APPLICATION_IDENTIFIER: &str = "application-identifier";
 const TEAM_IDENTIFIER: &str = "com.apple.developer.team-identifier";
 const KEYCHAIN_ACCESS_GROUPS: &str = "keychain-access-groups";
-const REVISION_BYTES: usize = 32;
 
 type SecTaskRef = *const c_void;
 
@@ -57,12 +55,6 @@ fn account(name: &str) -> String {
 
 fn platform(context: &str, status: OSStatus) -> StoreError {
     StoreError::Platform(format!("{context}: {}", Error::from_code(status)))
-}
-
-fn random_revision() -> Revision {
-    let mut bytes = vec![0_u8; REVISION_BYTES];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    Revision::from_bytes(bytes)
 }
 
 fn add_pair(dict: &mut CFMutableDictionary, key: CFTypeRef, value: CFTypeRef) {
@@ -182,7 +174,7 @@ impl MacKeychainRepository {
         let dictionary = unsafe { CFDictionary::wrap_under_create_rule(result.cast()) };
         let payload = data_value(&dictionary, unsafe { kSecValueData.cast() })?;
         let revision = data_value(&dictionary, unsafe { kSecAttrGeneric.cast() })?;
-        if revision.len() != REVISION_BYTES {
+        if revision.len() != Revision::BYTES {
             return Err(StoreError::MalformedRecord);
         }
         Ok(StoredRecord {
@@ -266,7 +258,7 @@ impl ProjectRepository for MacKeychainRepository {
         project.validate()?;
         let encoded = project.encode()?;
         let payload = CFData::from_buffer(&encoded);
-        let revision = random_revision();
+        let revision = Revision::random();
         let revision_data = CFData::from_buffer(revision.as_bytes());
         let mut attributes = query_for(&self.access_group, project.name());
         unsafe {
@@ -296,7 +288,7 @@ impl ProjectRepository for MacKeychainRepository {
 
     fn replace(&self, expected: &Revision, project: &Project) -> Result<(), StoreError> {
         project.validate()?;
-        if expected.as_bytes().len() != REVISION_BYTES {
+        if expected.as_bytes().len() != Revision::BYTES {
             return Err(StoreError::Conflict);
         }
         let expected_data = CFData::from_buffer(expected.as_bytes());
@@ -310,7 +302,7 @@ impl ProjectRepository for MacKeychainRepository {
         }
         let encoded = project.encode()?;
         let payload = CFData::from_buffer(&encoded);
-        let revision = random_revision();
+        let revision = Revision::random();
         let revision_data = CFData::from_buffer(revision.as_bytes());
         let mut update = CFMutableDictionary::new();
         unsafe {
@@ -439,9 +431,9 @@ mod tests {
 
     #[test]
     fn revisions_are_random_and_fixed_size() {
-        let first = random_revision();
-        let second = random_revision();
-        assert_eq!(first.as_bytes().len(), REVISION_BYTES);
+        let first = Revision::random();
+        let second = Revision::random();
+        assert_eq!(first.as_bytes().len(), Revision::BYTES);
         assert_ne!(first, second);
     }
 

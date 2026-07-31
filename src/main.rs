@@ -4,7 +4,7 @@ use twl::config::Config;
 use twl::project::{
     open_project_service, validate_identifier, PlatformProjectService, Project, ProjectRoute,
 };
-use twl::{child_command, prepare_demo, prepare_project, Prepared};
+use twl::{platform_child_command, prepare_demo, prepare_project, Prepared};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -309,10 +309,9 @@ fn run_prepared(
 ) -> Result<i32, String> {
     let (handle, overrides) = prepared.start(budget).map_err(|error| error.to_string())?;
     eprintln!("twl: project broker listening on loopback");
-    #[cfg(target_os = "linux")]
-    let mut child = if mask_vault {
-        let (child, vault_masked) =
-            twl::project::linux_project_child_command(command, command_args, &overrides)?;
+    let (mut child, vault_masked) =
+        platform_child_command(command, command_args, &overrides, mask_vault)?;
+    if let Some(vault_masked) = vault_masked {
         if vault_masked {
             eprintln!("twl: launching child through the Bubblewrap vault-masking profile");
         } else {
@@ -320,15 +319,7 @@ fn run_prepared(
                 "twl: Bubblewrap profile not used; the age-encrypted vault remains password-protected"
             );
         }
-        child
-    } else {
-        child_command(command, command_args, &overrides)
-    };
-    #[cfg(not(target_os = "linux"))]
-    let mut child = {
-        let _ = mask_vault;
-        child_command(command, command_args, &overrides)
-    };
+    }
     let status = child
         .status()
         .map_err(|error| format!("{command}: {error}"))?;

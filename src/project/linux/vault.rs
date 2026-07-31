@@ -1,8 +1,7 @@
-use super::{
-    Action, AuthorizationError, Project, ProjectRepository, ProjectService, Revision,
-    SessionAuthorizer, StoreError, StoredProject,
+use super::super::{
+    validate_identifier, Project, ProjectRepository, Revision, StoreError, StoredProject,
 };
-use age::secrecy::{ExposeSecret, SecretString};
+use age::secrecy::SecretString;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use fs2::FileExt;
@@ -14,20 +13,22 @@ use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const VAULT_FILE: &CStr = c"projects.age";
 const LOCK_FILE: &CStr = c"projects.age.lock";
 const VAULT_VERSION: u32 = 1;
-const REVISION_BYTES: usize = 32;
+// The count cap is independently reachable with small records; the aggregate plaintext cap
+// intentionally prevents 256 maximum-sized projects from occupying one authorization session.
 const MAX_PROJECTS: usize = 256;
 const MAX_PROJECT_BYTES: usize = 256 << 10;
+const MAX_ENCODED_PROJECT_BYTES: usize = ((MAX_PROJECT_BYTES + 2) / 3) * 4;
 const MAX_PLAINTEXT_BYTES: u64 = 8 << 20;
-const MAX_CIPHERTEXT_BYTES: u64 = 9 << 20;
+// Standard age framing is much smaller; one MiB is a conservative bounded header allowance.
+const MAX_AGE_OVERHEAD_BYTES: u64 = 1 << 20;
+const MAX_CIPHERTEXT_BYTES: u64 = MAX_PLAINTEXT_BYTES + MAX_AGE_OVERHEAD_BYTES;
 
 fn platform(context: &str, error: impl std::fmt::Display) -> StoreError {
     StoreError::Platform(format!("{context}: {error}"))
@@ -38,7 +39,36 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn vault_directory_path() -> Result<PathBuf, StoreError> {
+#[derive(Clone, Copy)]
+enum TrustScope {
+    Store,
+    Item,
+}
+
+impl TrustScope {
+    fn error(self) -> StoreError {
+        match self {
+            Self::Store => StoreError::UntrustedStore,
+            Self::Item => StoreError::UntrustedItem,
+        }
+    }
+}
+
+fn require_mode(file: &File, expected: u32, scope: TrustScope) -> Result<(), StoreError> {
+    let actual = file
+        .metadata()
+        .map_err(|_| scope.error())?
+        .permissions()
+        .mode()
+        & 0o777;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(scope.error())
+    }
+}
+
+pub(super) fn vault_directory_path() -> Result<PathBuf, StoreError> {
     if let Some(value) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
         let path = PathBuf::from(value);
         if path.is_absolute() {
@@ -56,12 +86,12 @@ fn vault_directory_path() -> Result<PathBuf, StoreError> {
     Ok(home.join(".local/share/twl"))
 }
 
-struct VaultDirectory {
+pub(super) struct VaultDirectory {
     file: File,
 }
 
 impl VaultDirectory {
-    fn open(path: PathBuf) -> Result<Self, StoreError> {
+    pub(super) fn open(path: PathBuf) -> Result<Self, StoreError> {
         let parent = path.parent().ok_or(StoreError::UntrustedStore)?;
         fs::create_dir_all(parent).map_err(|error| platform("creating data directory", error))?;
         let created = match DirBuilder::new().mode(0o700).create(&path) {
@@ -82,13 +112,8 @@ impl VaultDirectory {
         if created {
             file.set_permissions(Permissions::from_mode(0o700))
                 .map_err(|error| platform("securing project vault directory", error))?;
-        } else if metadata.permissions().mode() & 0o777 != 0o700 {
-            return Err(StoreError::UntrustedStore);
         }
-        let metadata = file.metadata().map_err(|_| StoreError::UntrustedStore)?;
-        if metadata.permissions().mode() & 0o777 != 0o700 {
-            return Err(StoreError::UntrustedStore);
-        }
+        require_mode(&file, 0o700, TrustScope::Store)?;
         Ok(Self { file })
     }
 
@@ -118,7 +143,7 @@ impl VaultDirectory {
         Ok(metadata)
     }
 
-    fn lock(&self, exclusive: bool) -> Result<VaultLock, StoreError> {
+    pub(super) fn lock(&self, exclusive: bool) -> Result<VaultLock, StoreError> {
         let (file, created) = match self.openat(
             LOCK_FILE,
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
@@ -132,23 +157,12 @@ impl VaultDirectory {
             ),
             Err(_) => return Err(StoreError::UntrustedItem),
         };
-        let metadata = Self::validate_file_identity(&file)?;
+        Self::validate_file_identity(&file)?;
         if created {
             file.set_permissions(Permissions::from_mode(0o600))
                 .map_err(|error| platform("securing project vault lock", error))?;
-        } else if metadata.permissions().mode() & 0o777 != 0o600 {
-            return Err(StoreError::UntrustedItem);
         }
-        if file
-            .metadata()
-            .map_err(|_| StoreError::UntrustedItem)?
-            .permissions()
-            .mode()
-            & 0o777
-            != 0o600
-        {
-            return Err(StoreError::UntrustedItem);
-        }
+        require_mode(&file, 0o600, TrustScope::Item)?;
         if exclusive {
             FileExt::lock_exclusive(&file)
         } else {
@@ -163,18 +177,21 @@ impl VaultDirectory {
         self.lock(false)
     }
 
-    fn open_vault(&self) -> Result<Option<(File, std::fs::Metadata)>, StoreError> {
+    pub(super) fn vault_exists(&self) -> Result<bool, StoreError> {
+        let _lock = self.shared_lock()?;
+        self.open_vault().map(|vault| vault.is_some())
+    }
+
+    pub(super) fn open_vault(&self) -> Result<Option<(File, std::fs::Metadata)>, StoreError> {
         let file = match self.openat(VAULT_FILE, libc::O_RDONLY, 0) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(_) => return Err(StoreError::UntrustedItem),
         };
         let metadata = Self::validate_file_identity(&file)?;
-        if metadata.permissions().mode() & 0o777 != 0o600 {
-            return Err(StoreError::UntrustedItem);
-        }
+        require_mode(&file, 0o600, TrustScope::Item)?;
         if metadata.len() > MAX_CIPHERTEXT_BYTES {
-            return Err(StoreError::VaultUnlockFailed);
+            return Err(StoreError::OversizedRecord);
         }
         Ok(Some((file, metadata)))
     }
@@ -186,16 +203,7 @@ impl VaultDirectory {
         Self::validate_file_identity(&file)?;
         file.set_permissions(Permissions::from_mode(0o600))
             .map_err(|error| platform("securing temporary project vault", error))?;
-        if file
-            .metadata()
-            .map_err(|_| StoreError::UntrustedItem)?
-            .permissions()
-            .mode()
-            & 0o777
-            != 0o600
-        {
-            return Err(StoreError::UntrustedItem);
-        }
+        require_mode(&file, 0o600, TrustScope::Item)?;
         Ok(file)
     }
 
@@ -229,7 +237,7 @@ impl VaultDirectory {
     }
 }
 
-struct VaultLock(File);
+pub(super) struct VaultLock(File);
 
 impl Drop for VaultLock {
     fn drop(&mut self) {
@@ -238,21 +246,21 @@ impl Drop for VaultLock {
 }
 
 #[derive(Default)]
-struct PasswordState {
-    password: Option<SecretString>,
-    operation_lock: Option<PendingLock>,
+pub(super) struct PasswordState {
+    pub(super) password: Option<SecretString>,
+    pub(super) operation_lock: Option<PendingLock>,
 }
 
-struct PendingLock {
-    exclusive: bool,
-    lock: VaultLock,
+pub(super) struct PendingLock {
+    pub(super) exclusive: bool,
+    pub(super) lock: VaultLock,
 }
 
 #[derive(Clone, Default)]
-struct PasswordSession(Arc<Mutex<PasswordState>>);
+pub(super) struct PasswordSession(Arc<Mutex<PasswordState>>);
 
 impl PasswordSession {
-    fn lock(&self) -> Result<MutexGuard<'_, PasswordState>, StoreError> {
+    pub(super) fn lock(&self) -> Result<MutexGuard<'_, PasswordState>, StoreError> {
         self.0
             .lock()
             .map_err(|_| StoreError::Platform("vault password session is unavailable".into()))
@@ -311,14 +319,15 @@ impl Vault {
         let mut seen = HashSet::with_capacity(wire.projects.len());
         let mut records = Vec::with_capacity(wire.projects.len());
         for record in &wire.projects {
-            super::validate_identifier(&record.name).map_err(|_| StoreError::MalformedRecord)?;
+            validate_identifier(&record.name).map_err(|_| StoreError::MalformedRecord)?;
             let revision = STANDARD_NO_PAD
                 .decode(record.revision.as_bytes())
                 .map_err(|_| StoreError::MalformedRecord)?;
-            if revision.len() != REVISION_BYTES
-                || record.project.len() > MAX_PROJECT_BYTES.saturating_mul(2)
-            {
+            if revision.len() != Revision::BYTES {
                 return Err(StoreError::MalformedRecord);
+            }
+            if record.project.len() > MAX_ENCODED_PROJECT_BYTES {
+                return Err(StoreError::OversizedRecord);
             }
             let payload = Zeroizing::new(
                 STANDARD_NO_PAD
@@ -326,7 +335,7 @@ impl Vault {
                     .map_err(|_| StoreError::MalformedRecord)?,
             );
             if payload.len() > MAX_PROJECT_BYTES {
-                return Err(StoreError::MalformedRecord);
+                return Err(StoreError::OversizedRecord);
             }
             let project = Project::decode(&payload).map_err(|_| StoreError::MalformedRecord)?;
             if project.name() != record.name || !seen.insert(record.name.clone()) {
@@ -343,7 +352,7 @@ impl Vault {
 
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>, StoreError> {
         if self.records.len() > MAX_PROJECTS {
-            return Err(StoreError::MalformedRecord);
+            return Err(StoreError::OversizedRecord);
         }
         let wire = WireVault {
             version: VAULT_VERSION,
@@ -363,7 +372,7 @@ impl Vault {
                 .into_bytes(),
         );
         if plaintext.len() as u64 > MAX_PLAINTEXT_BYTES {
-            return Err(StoreError::MalformedRecord);
+            return Err(StoreError::OversizedRecord);
         }
         Ok(plaintext)
     }
@@ -380,6 +389,7 @@ impl Vault {
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 struct WireVault {
+    #[zeroize(skip)]
     version: u32,
     projects: Vec<WireRecord>,
 }
@@ -387,28 +397,21 @@ struct WireVault {
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 struct WireRecord {
+    #[zeroize(skip)]
     name: String,
+    #[zeroize(skip)]
     revision: String,
     project: String,
 }
 
 /// Password-encrypted, age-compatible Linux project repository.
 pub struct LinuxAgeVaultRepository {
-    directory: Arc<VaultDirectory>,
-    session: PasswordSession,
-    scrypt_work_factor_override: Option<u8>,
+    pub(super) directory: Arc<VaultDirectory>,
+    pub(super) session: PasswordSession,
+    pub(super) scrypt_work_factor_override: Option<u8>,
 }
 
 impl LinuxAgeVaultRepository {
-    fn open(session: PasswordSession) -> Result<Self, StoreError> {
-        let directory = Arc::new(VaultDirectory::open(vault_directory_path()?)?);
-        Ok(Self {
-            directory,
-            session,
-            scrypt_work_factor_override: None,
-        })
-    }
-
     #[cfg(test)]
     fn open_for_test(path: PathBuf, password: &str) -> Result<Self, StoreError> {
         Ok(Self {
@@ -418,12 +421,7 @@ impl LinuxAgeVaultRepository {
         })
     }
 
-    fn vault_exists(&self) -> Result<bool, StoreError> {
-        let _lock = self.directory.shared_lock()?;
-        self.directory.open_vault().map(|vault| vault.is_some())
-    }
-
-    fn read_locked(&self) -> Result<Option<Vault>, StoreError> {
+    fn read_locked(&self, _lock: &VaultLock) -> Result<Option<Vault>, StoreError> {
         let Some((mut file, metadata)) = self.directory.open_vault()? else {
             return Ok(None);
         };
@@ -433,7 +431,7 @@ impl LinuxAgeVaultRepository {
             .read_to_end(&mut ciphertext)
             .map_err(|error| platform("reading project vault", error))?;
         if ciphertext.len() as u64 > MAX_CIPHERTEXT_BYTES {
-            return Err(StoreError::VaultUnlockFailed);
+            return Err(StoreError::OversizedRecord);
         }
 
         let password = self.session.password()?;
@@ -453,7 +451,7 @@ impl LinuxAgeVaultRepository {
             .read_to_end(&mut plaintext)
             .map_err(|_| StoreError::VaultUnlockFailed)?;
         if plaintext.len() as u64 > MAX_PLAINTEXT_BYTES {
-            return Err(StoreError::VaultUnlockFailed);
+            return Err(StoreError::OversizedRecord);
         }
         Vault::decode(&plaintext).map(Some)
     }
@@ -480,12 +478,12 @@ impl LinuxAgeVaultRepository {
                 .map_err(|error| platform("finishing project vault encryption", error))?;
         }
         if ciphertext.len() as u64 > MAX_CIPHERTEXT_BYTES {
-            return Err(StoreError::MalformedRecord);
+            return Err(StoreError::OversizedRecord);
         }
         Ok(ciphertext)
     }
 
-    fn write_locked(&self, vault: &Vault) -> Result<(), StoreError> {
+    fn write_locked(&self, _lock: &VaultLock, vault: &Vault) -> Result<(), StoreError> {
         // Revalidate a current target immediately before replacing it. The stable lock file
         // coordinates all cooperating TWL processes while the vault inode changes atomically.
         self.directory.open_vault()?;
@@ -510,17 +508,20 @@ impl LinuxAgeVaultRepository {
         result
     }
 
-    fn random_revision() -> Revision {
-        let mut bytes = vec![0_u8; REVISION_BYTES];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
-        Revision::from_bytes(bytes)
+    fn encode_project(project: &Project) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        project.validate()?;
+        let payload = project.encode()?;
+        if payload.len() > MAX_PROJECT_BYTES {
+            return Err(StoreError::OversizedRecord);
+        }
+        Ok(payload)
     }
 }
 
 impl ProjectRepository for LinuxAgeVaultRepository {
     fn list(&self) -> Result<Vec<String>, StoreError> {
-        let _lock = self.session.operation_lock(&self.directory, false)?;
-        let Some(vault) = self.read_locked()? else {
+        let lock = self.session.operation_lock(&self.directory, false)?;
+        let Some(vault) = self.read_locked(&lock)? else {
             return Ok(Vec::new());
         };
         let mut names: Vec<_> = vault
@@ -533,9 +534,9 @@ impl ProjectRepository for LinuxAgeVaultRepository {
     }
 
     fn get(&self, name: &str) -> Result<StoredProject, StoreError> {
-        super::validate_identifier(name)?;
-        let _lock = self.session.operation_lock(&self.directory, false)?;
-        let vault = self.read_locked()?.ok_or(StoreError::NotFound)?;
+        validate_identifier(name)?;
+        let lock = self.session.operation_lock(&self.directory, false)?;
+        let vault = self.read_locked(&lock)?.ok_or(StoreError::NotFound)?;
         let index = vault.find(name).ok_or(StoreError::NotFound)?;
         Ok(StoredProject::new(
             vault.decoded_at(index)?,
@@ -544,295 +545,55 @@ impl ProjectRepository for LinuxAgeVaultRepository {
     }
 
     fn create(&self, project: &Project) -> Result<(), StoreError> {
-        project.validate()?;
-        let payload = project.encode()?;
-        if payload.len() > MAX_PROJECT_BYTES {
-            return Err(StoreError::MalformedRecord);
-        }
-        let _lock = self.session.operation_lock(&self.directory, true)?;
-        let mut vault = self.read_locked()?.unwrap_or_default();
+        let payload = Self::encode_project(project)?;
+        let lock = self.session.operation_lock(&self.directory, true)?;
+        let mut vault = self.read_locked(&lock)?.unwrap_or_default();
         if vault.find(project.name()).is_some() {
             return Err(StoreError::AlreadyExists);
         }
         if vault.records.len() == MAX_PROJECTS {
-            return Err(StoreError::MalformedRecord);
+            return Err(StoreError::OversizedRecord);
         }
         vault.records.push(VaultRecord {
             name: project.name().to_owned(),
-            revision: Self::random_revision(),
+            revision: Revision::random(),
             payload,
         });
-        self.write_locked(&vault)
+        self.write_locked(&lock, &vault)
     }
 
     fn replace(&self, expected: &Revision, project: &Project) -> Result<(), StoreError> {
-        project.validate()?;
-        let payload = project.encode()?;
-        if payload.len() > MAX_PROJECT_BYTES {
-            return Err(StoreError::MalformedRecord);
-        }
-        let _lock = self.session.operation_lock(&self.directory, true)?;
-        let mut vault = self.read_locked()?.ok_or(StoreError::NotFound)?;
+        let payload = Self::encode_project(project)?;
+        let lock = self.session.operation_lock(&self.directory, true)?;
+        let mut vault = self.read_locked(&lock)?.ok_or(StoreError::NotFound)?;
         let index = vault.find(project.name()).ok_or(StoreError::NotFound)?;
         if &vault.records[index].revision != expected {
             return Err(StoreError::Conflict);
         }
         vault.records[index] = VaultRecord {
             name: project.name().to_owned(),
-            revision: Self::random_revision(),
+            revision: Revision::random(),
             payload,
         };
-        self.write_locked(&vault)
+        self.write_locked(&lock, &vault)
     }
 
     fn delete(&self, name: &str) -> Result<(), StoreError> {
-        super::validate_identifier(name)?;
-        let _lock = self.session.operation_lock(&self.directory, true)?;
-        let mut vault = self.read_locked()?.ok_or(StoreError::NotFound)?;
+        validate_identifier(name)?;
+        let lock = self.session.operation_lock(&self.directory, true)?;
+        let mut vault = self.read_locked(&lock)?.ok_or(StoreError::NotFound)?;
         let index = vault.find(name).ok_or(StoreError::NotFound)?;
         vault.records.remove(index);
-        self.write_locked(&vault)
+        self.write_locked(&lock, &vault)
     }
-}
-
-type PasswordPrompt = Arc<dyn Fn(&str) -> Result<SecretString, String> + Send + Sync>;
-
-/// Authorizes one Linux service session with one password read from `/dev/tty`.
-pub struct LinuxVaultAuthorizer {
-    repository: Arc<LinuxAgeVaultRepository>,
-    prompt: PasswordPrompt,
-}
-
-impl SessionAuthorizer for LinuxVaultAuthorizer {
-    fn authorize(&self, action: Action<'_>) -> Result<(), AuthorizationError> {
-        if self
-            .repository
-            .session
-            .lock()
-            .map_err(|error| AuthorizationError::platform(error.to_string()))?
-            .password
-            .is_some()
-        {
-            return Ok(());
-        }
-
-        loop {
-            let exists = self
-                .repository
-                .vault_exists()
-                .map_err(|error| AuthorizationError::platform(error.to_string()))?;
-            let password = if !exists && !matches!(action, Action::Create(_)) {
-                None
-            } else {
-                crate::secret::process_preflight().map_err(AuthorizationError::platform)?;
-                let password = (self.prompt)(if exists {
-                    "Towel vault password: "
-                } else {
-                    "Create Towel vault password: "
-                })
-                .map_err(AuthorizationError::platform)?;
-                if password.expose_secret().is_empty() {
-                    return Err(AuthorizationError::platform(
-                        "vault password must not be empty".into(),
-                    ));
-                }
-                if !exists {
-                    let confirmation = (self.prompt)("Confirm Towel vault password: ")
-                        .map_err(AuthorizationError::platform)?;
-                    if password.expose_secret() != confirmation.expose_secret() {
-                        return Err(AuthorizationError::platform(
-                            "vault passwords do not match".into(),
-                        ));
-                    }
-                }
-                Some(password)
-            };
-
-            let exclusive = matches!(
-                action,
-                Action::Create(_) | Action::Replace(_) | Action::Delete(_)
-            );
-            let operation_lock = self
-                .repository
-                .directory
-                .lock(exclusive)
-                .map_err(|error| AuthorizationError::platform(error.to_string()))?;
-            let still_exists = self
-                .repository
-                .directory
-                .open_vault()
-                .map_err(|error| AuthorizationError::platform(error.to_string()))?
-                .is_some();
-            if still_exists != exists {
-                continue;
-            }
-
-            let mut session = self
-                .repository
-                .session
-                .lock()
-                .map_err(|error| AuthorizationError::platform(error.to_string()))?;
-            if session.password.is_none() {
-                session.password = password;
-                session.operation_lock = Some(PendingLock {
-                    exclusive,
-                    lock: operation_lock,
-                });
-            }
-            return Ok(());
-        }
-    }
-}
-
-pub type LinuxProjectService = ProjectService<LinuxVaultAuthorizer, Arc<LinuxAgeVaultRepository>>;
-
-impl ProjectRepository for Arc<LinuxAgeVaultRepository> {
-    fn list(&self) -> Result<Vec<String>, StoreError> {
-        self.as_ref().list()
-    }
-    fn get(&self, name: &str) -> Result<StoredProject, StoreError> {
-        self.as_ref().get(name)
-    }
-    fn create(&self, project: &Project) -> Result<(), StoreError> {
-        self.as_ref().create(project)
-    }
-    fn replace(&self, expected: &Revision, project: &Project) -> Result<(), StoreError> {
-        self.as_ref().replace(expected, project)
-    }
-    fn delete(&self, name: &str) -> Result<(), StoreError> {
-        self.as_ref().delete(name)
-    }
-}
-
-pub fn open_project_service() -> Result<LinuxProjectService, StoreError> {
-    let session = PasswordSession::default();
-    let repository = Arc::new(LinuxAgeVaultRepository::open(session)?);
-    let authorizer = LinuxVaultAuthorizer {
-        repository: repository.clone(),
-        prompt: Arc::new(|label| {
-            rpassword::prompt_password(label)
-                .map(SecretString::from)
-                .map_err(|error| format!("reading vault password from /dev/tty: {error}"))
-        }),
-    };
-    Ok(ProjectService::new(authorizer, repository))
-}
-
-fn find_bubblewrap() -> Option<PathBuf> {
-    ["/usr/bin/bwrap", "/usr/local/bin/bwrap"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|candidate| {
-            fs::symlink_metadata(candidate).is_ok_and(|metadata| {
-                metadata.is_file()
-                    && metadata.uid() == 0
-                    && metadata.permissions().mode() & 0o111 != 0
-                    && metadata.permissions().mode() & 0o022 == 0
-            })
-        })
-}
-
-/// Builds the Linux child command, adding only vault masking and PID/proc isolation when
-/// Bubblewrap has a trusted system installation. Networking and the host filesystem otherwise
-/// remain shared.
-pub fn linux_project_child_command(
-    program: &str,
-    args: &[String],
-    overrides: &[(String, String)],
-) -> Result<(Command, bool), String> {
-    let (mut command, masked) = if let Some(bubblewrap) = find_bubblewrap() {
-        let vault_directory = vault_directory_path().map_err(|error| error.to_string())?;
-        (
-            bubblewrap_command(&bubblewrap, &vault_directory, program, args, overrides),
-            true,
-        )
-    } else {
-        (crate::child_command(program, args, overrides), false)
-    };
-    seal_inherited_descriptors(&mut command)?;
-    Ok((command, masked))
-}
-
-fn seal_inherited_descriptors(command: &mut Command) -> Result<(), String> {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: limit points to writable storage for the duration of getrlimit.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        return Err(format!(
-            "reading descriptor limit: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let maximum = limit.rlim_cur.min(i32::MAX as libc::rlim_t) as i32;
-    // SAFETY: the closure calls only async-signal-safe syscalls after fork. CLOEXEC preserves
-    // Rust's exec-error pipe until a successful exec while ensuring no descriptor above stderr
-    // reaches Bubblewrap or an unmasked child.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::syscall(
-                libc::SYS_close_range,
-                3_u32,
-                u32::MAX,
-                libc::CLOSE_RANGE_CLOEXEC,
-            ) == 0
-            {
-                return Ok(());
-            }
-
-            for descriptor in 3..maximum {
-                let flags = libc::fcntl(descriptor, libc::F_GETFD);
-                if flags < 0 {
-                    if io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
-                        continue;
-                    }
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0
-                    && io::Error::last_os_error().raw_os_error() != Some(libc::EBADF)
-                {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
-    Ok(())
-}
-
-fn bubblewrap_command(
-    bubblewrap: &Path,
-    vault_directory: &Path,
-    program: &str,
-    args: &[String],
-    overrides: &[(String, String)],
-) -> Command {
-    let mut command = Command::new(bubblewrap);
-    command
-        .arg("--die-with-parent")
-        .arg("--unshare-pid")
-        .args(["--dev-bind", "/", "/"])
-        .args(["--proc", "/proc"])
-        .arg("--tmpfs")
-        .arg(vault_directory)
-        .arg("--")
-        .arg(program)
-        .args(args);
-    for variable in crate::STRIP {
-        command.env_remove(variable);
-    }
-    for (key, value) in overrides {
-        command.env(key, value);
-    }
-    command
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::LinuxVaultAuthorizer;
     use super::*;
     use crate::project::repository::exercise_repository;
-    use crate::project::ProjectRoute;
+    use crate::project::{Action, ProjectRoute, SessionAuthorizer};
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1011,52 +772,7 @@ mod tests {
         let file = File::create(&vault_path).unwrap();
         file.set_len(MAX_CIPHERTEXT_BYTES + 1).unwrap();
         fs::set_permissions(&vault_path, Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(repository.list(), Err(StoreError::VaultUnlockFailed));
-    }
-
-    #[test]
-    fn bubblewrap_profile_only_adds_vault_and_process_masking() {
-        let command = bubblewrap_command(
-            Path::new("/usr/bin/bwrap"),
-            Path::new("/home/test/.local/share/twl"),
-            "codex",
-            &["--version".into()],
-            &[("APP_API_KEY".into(), "twl-app-fake".into())],
-        );
-        let arguments: Vec<_> = command
-            .get_args()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            arguments,
-            [
-                "--die-with-parent",
-                "--unshare-pid",
-                "--dev-bind",
-                "/",
-                "/",
-                "--proc",
-                "/proc",
-                "--tmpfs",
-                "/home/test/.local/share/twl",
-                "--",
-                "codex",
-                "--version",
-            ]
-        );
-        assert!(!arguments.iter().any(|argument| argument == "--unshare-net"));
-    }
-
-    #[test]
-    fn child_does_not_inherit_open_descriptors() {
-        let file = File::open("/dev/null").unwrap();
-        let descriptor = file.as_raw_fd();
-        // Deliberately make this descriptor inheritable so the launcher hardening is tested.
-        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_SETFD, 0) }, 0);
-        let args = vec!["-c".into(), format!("test ! -e /proc/self/fd/{descriptor}")];
-        let mut command = crate::child_command("/bin/sh", &args, &[]);
-        seal_inherited_descriptors(&mut command).unwrap();
-        assert!(command.status().unwrap().success());
+        assert_eq!(repository.list(), Err(StoreError::OversizedRecord));
     }
 
     #[test]
@@ -1077,15 +793,17 @@ mod tests {
     fn authorizer_prompts_twice_only_for_first_creation_and_once_afterward() {
         let directory = TestDirectory::new();
         let session = PasswordSession::default();
-        let repository = Arc::new(LinuxAgeVaultRepository {
-            directory: Arc::new(VaultDirectory::open(directory.0.clone()).unwrap()),
-            session,
+        let vault_directory = Arc::new(VaultDirectory::open(directory.0.clone()).unwrap());
+        let repository = LinuxAgeVaultRepository {
+            directory: vault_directory.clone(),
+            session: session.clone(),
             scrypt_work_factor_override: Some(2),
-        });
+        };
         let prompts = Arc::new(AtomicUsize::new(0));
         let marker = prompts.clone();
         let authorizer = LinuxVaultAuthorizer {
-            repository: repository.clone(),
+            session,
+            directory: vault_directory,
             prompt: Arc::new(move |_| {
                 marker.fetch_add(1, Ordering::SeqCst);
                 Ok(SecretString::from("password".to_owned()))
@@ -1097,15 +815,16 @@ mod tests {
         repository.create(&project("app", "key")).unwrap();
 
         let session = PasswordSession::default();
-        let existing = Arc::new(LinuxAgeVaultRepository {
+        let existing = LinuxAgeVaultRepository {
             directory: repository.directory.clone(),
-            session,
+            session: session.clone(),
             scrypt_work_factor_override: Some(2),
-        });
+        };
         let prompts = Arc::new(AtomicUsize::new(0));
         let marker = prompts.clone();
         let authorizer = LinuxVaultAuthorizer {
-            repository: existing,
+            session,
+            directory: existing.directory.clone(),
             prompt: Arc::new(move |_| {
                 marker.fetch_add(1, Ordering::SeqCst);
                 Ok(SecretString::from("password".to_owned()))
@@ -1120,16 +839,18 @@ mod tests {
     fn authorizer_reprompts_if_vault_appears_before_operation_lock() {
         let directory = TestDirectory::new();
         let session = PasswordSession::default();
-        let target = Arc::new(LinuxAgeVaultRepository {
-            directory: Arc::new(VaultDirectory::open(directory.0.clone()).unwrap()),
-            session,
+        let vault_directory = Arc::new(VaultDirectory::open(directory.0.clone()).unwrap());
+        let target = LinuxAgeVaultRepository {
+            directory: vault_directory.clone(),
+            session: session.clone(),
             scrypt_work_factor_override: Some(2),
-        });
+        };
         let competing = Arc::new(repository(&directory, "existing-password"));
         let prompts = Arc::new(AtomicUsize::new(0));
         let marker = prompts.clone();
         let authorizer = LinuxVaultAuthorizer {
-            repository: target.clone(),
+            session,
+            directory: vault_directory,
             prompt: Arc::new(move |label| {
                 let prompt = marker.fetch_add(1, Ordering::SeqCst);
                 if prompt == 0 {

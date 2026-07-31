@@ -16,7 +16,9 @@ const FORWARD_HEADERS: &[&str] = &["content-type", "accept"];
 /// The only destination and credential authorized for a session.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Route {
+    #[zeroize(skip)]
     pub name: String,
+    #[zeroize(skip)]
     pub upstream: String,
     pub key: String,
 }

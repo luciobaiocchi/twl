@@ -119,3 +119,25 @@ pub fn child_command(program: &str, args: &[String], overrides: &[(String, Strin
     }
     command
 }
+
+/// Builds the platform launcher and reports whether Linux applied its optional vault mask.
+pub fn platform_child_command(
+    program: &str,
+    args: &[String],
+    overrides: &[(String, String)],
+    mask_vault: bool,
+) -> Result<(Command, Option<bool>), String> {
+    #[cfg(target_os = "linux")]
+    {
+        if mask_vault {
+            return project::linux_project_child_command(program, args, overrides)
+                .map(|(command, masked)| (command, Some(masked)));
+        }
+        Ok((child_command(program, args, overrides), None))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = mask_vault;
+        Ok((child_command(program, args, overrides), None))
+    }
+}

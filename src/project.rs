@@ -70,7 +70,9 @@ impl std::error::Error for ModelError {}
 #[derive(Clone, PartialEq, Eq, Serialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
+    #[zeroize(skip)]
     version: u32,
+    #[zeroize(skip)]
     name: String,
     routes: Vec<ProjectRoute>,
 }
@@ -79,10 +81,14 @@ pub struct Project {
 #[derive(Clone, PartialEq, Eq, Serialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectRoute {
+    #[zeroize(skip)]
     name: String,
+    #[zeroize(skip)]
     base_url: String,
     api_key: String,
+    #[zeroize(skip)]
     api_key_env: String,
+    #[zeroize(skip)]
     base_url_env: String,
 }
 
@@ -212,17 +218,23 @@ impl Project {
         #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
         #[serde(deny_unknown_fields)]
         struct WireProject {
+            #[zeroize(skip)]
             version: u32,
+            #[zeroize(skip)]
             name: String,
             routes: Vec<WireRoute>,
         }
         #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
         #[serde(deny_unknown_fields)]
         struct WireRoute {
+            #[zeroize(skip)]
             name: String,
+            #[zeroize(skip)]
             base_url: String,
             api_key: String,
+            #[zeroize(skip)]
             api_key_env: String,
+            #[zeroize(skip)]
             base_url_env: String,
         }
 
@@ -394,6 +406,23 @@ mod tests {
             Project::decode(&project.encode().unwrap()).unwrap(),
             project
         );
+    }
+
+    #[test]
+    fn zeroize_marks_only_the_route_credential_as_secret() {
+        let mut route = route("billing", "BILLING_KEY", "BILLING_URL");
+        let name = route.name.clone();
+        let base_url = route.base_url.clone();
+        let api_key_env = route.api_key_env.clone();
+        let base_url_env = route.base_url_env.clone();
+
+        route.zeroize();
+
+        assert!(route.api_key.is_empty());
+        assert_eq!(route.name, name);
+        assert_eq!(route.base_url, base_url);
+        assert_eq!(route.api_key_env, api_key_env);
+        assert_eq!(route.base_url_env, base_url_env);
     }
 
     #[test]
