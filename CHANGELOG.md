@@ -5,6 +5,12 @@ All notable changes to Towel will be documented here. The project uses
 
 ## Unreleased
 
+## 0.1.0-alpha.1 - 2026-08-01
+
+First public prerelease. Linux artifacts only: macOS builds stay disabled
+until the Developer ID signing and entitlement path is verified on hardware,
+as described in `docs/macos-release.md`.
+
 ### Added
 
 - macOS Keychain-backed named projects with multiple destination-bound Bearer
