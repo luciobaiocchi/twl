@@ -10,12 +10,14 @@ on:
         type: choice
         options: [all, linux-only]
         default: all
-      publish:
+      tag:
         description: >-
-          Publish a prerelease. Requires running from a tag ref; leave off for
-          a dry run that builds and packages without publishing anything.
-        type: boolean
-        default: false
+          Release tag, for example v0.1.0-alpha.1. Must match the version in
+          Cargo.toml. Created on the selected branch once the build passes.
+          Leave empty for a dry run that builds and checks everything and
+          publishes nothing.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -30,6 +32,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      publish: ${{ steps.version.outputs.publish }}
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,18 +46,28 @@ jobs:
         run: |
           set -euo pipefail
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
-          # A tag ref is the release identity, so it must agree with Cargo.toml.
-          # A branch ref only ever reaches a dry run, which publishes nothing,
-          # so derive a name for the logs instead of failing the job.
+          # The tag is the release identity, so it must agree with Cargo.toml
+          # whether it already exists or is about to be created. Without a tag
+          # this is a dry run, which builds everything and publishes nothing.
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             test "v${version}" = "$GITHUB_REF_NAME"
             tag="$GITHUB_REF_NAME"
+            publish=true
+          elif [ -n "$INPUT_TAG" ]; then
+            if [ "v${version}" != "$INPUT_TAG" ]; then
+              echo "::error::tag $INPUT_TAG does not match Cargo.toml version $version; expected v$version"
+              exit 1
+            fi
+            tag="$INPUT_TAG"
+            publish=true
           else
             tag="v${version}"
+            publish=false
             echo "::notice::dry run from ${GITHUB_REF_NAME}; nothing will be published"
           fi
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'publish=%s\n' "$publish" >> "$GITHUB_OUTPUT"
 
           # A silently missing platform is worse than a loud one.
           if [ "$MACOS_RELEASE" = "true" ]; then
@@ -64,6 +77,7 @@ jobs:
           fi
         env:
           MACOS_RELEASE: ${{ vars.MACOS_RELEASE }}
+          INPUT_TAG: ${{ inputs.tag }}
 
       - name: Verify tagged source
         run: |
@@ -252,16 +266,15 @@ jobs:
     name: Publish GitHub prerelease
     needs: [verify-version, linux, macos]
     # macos is skipped for a linux-only run, which would skip this job too
-    # without always(). A dry run and a branch ref both stop before publishing:
-    # the release must be able to point at a real tag.
+    # without always(). A dry run stops here: verify-version only sets publish
+    # when a tag was pushed or a matching one was named.
     if: >-
       always()
       && needs.verify-version.result == 'success'
       && needs.linux.result == 'success'
       && needs.macos.result != 'failure'
       && needs.macos.result != 'cancelled'
-      && github.ref_type == 'tag'
-      && (github.event_name != 'workflow_dispatch' || inputs.publish)
+      && needs.verify-version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -295,6 +308,30 @@ jobs:
         with:
           subject-path: dist/*
 
+      - name: Create the release tag
+        if: github.ref_type != 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify-version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Created here rather than in verify-version so that a build which
+          # fails its artifact checks never leaves a tag behind. A ref created
+          # with GITHUB_TOKEN does not re-trigger this workflow.
+          if existing=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+            --jq .object.sha 2>/dev/null); then
+            if [ "$existing" != "$GITHUB_SHA" ]; then
+              echo "::error::tag $TAG already exists and points at $existing, not $GITHUB_SHA"
+              exit 1
+            fi
+            echo "::notice::tag $TAG already points at this commit"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" >/dev/null
+            echo "::notice::created tag $TAG at $GITHUB_SHA"
+          fi
+
       - name: Create prerelease
         env:
           GH_TOKEN: ${{ github.token }}
@@ -310,10 +347,18 @@ jobs:
           else
             : >"$notes"
           fi
-          gh release create "$TAG" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Towel $TAG" \
-            --notes-file "$notes" \
-            --generate-notes \
-            --prerelease \
-            --verify-tag
+          # A release can already exist if it was drafted through the Releases
+          # page, which creates the tag and triggers this workflow. Attach the
+          # artifacts to it instead of failing.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::release $TAG exists; uploading artifacts to it"
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Towel $TAG" \
+              --notes-file "$notes" \
+              --generate-notes \
+              --prerelease \
+              --verify-tag
+          fi

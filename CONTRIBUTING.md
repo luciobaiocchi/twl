@@ -64,14 +64,19 @@ Releases are driven by the tag, not by merging. The tag is the release
 identity, so `verify-version` refuses to build when it disagrees with the
 version in `Cargo.toml`.
 
-Before tagging, bump `version` in `Cargo.toml`, refresh `Cargo.lock`, and move
-the `Unreleased` changelog heading to the new version.
+Before releasing, bump `version` in `Cargo.toml`, refresh `Cargo.lock`, and
+move the `Unreleased` changelog heading to the new version.
 
-Pushing the tag is the whole ceremony:
+Then either push a tag:
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0
 ```
+
+or run the **Release** workflow from the Actions tab and put the tag in the
+`tag` input. The workflow creates it after the build and its artifact checks
+pass, so a failed run never leaves a tag behind, and the whole release can be
+done from the browser. Both routes run exactly the same jobs.
 
 macOS is opt-in. Signing and notarization need credentials and an entitlement
 configuration that has to be verified on a real Developer ID build, so the
@@ -81,18 +86,21 @@ has to be worked around, and the run reports which platforms it chose.
 [docs/macos-release.md](docs/macos-release.md) is the setup path, starting with
 a local check that needs no credentials.
 
-The **Release** workflow can also be started by hand from the Actions tab, with
-two inputs:
+The manual run takes two inputs:
 
+- `tag` — the tag to release, for example `v0.1.0-alpha.1`. It must match
+  `Cargo.toml` or the run stops before building anything. **Leave it empty for
+  a dry run** that builds, packages, and runs every artifact check without
+  creating a tag or a release.
 - `platforms` — `all`, or `linux-only` to skip macOS for one run even when
   `MACOS_RELEASE` is set.
-- `publish` — off by default. Leave it off for a dry run that builds, packages,
-  and runs every artifact check without creating a release. Turn it on only
-  when the run is started from an existing tag; a release cannot point at a
-  branch.
 
-Use a dry run from a branch to exercise the packaging steps before spending a
-tag on them.
+Do a dry run before a real one. It exercises the packaging steps for free, and
+a tag is awkward to withdraw once pushed.
+
+Drafting a release through the Releases page also works: that creates the tag,
+which triggers the workflow, and the artifacts are uploaded to the release you
+made rather than a second one.
 
 Unless explicitly stated otherwise, contributions submitted for inclusion are
 licensed under the Apache License, Version 2.0, as described in Section 5 of
