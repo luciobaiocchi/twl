@@ -1,7 +1,8 @@
 use crate::config::validate_upstream;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
+use std::str::FromStr;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 mod repository;
@@ -31,7 +32,10 @@ pub use linux::{
 #[cfg(target_os = "linux")]
 pub type PlatformProjectService = LinuxProjectService;
 
-const FORMAT_VERSION: u32 = 1;
+const LEGACY_FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+pub const DEFAULT_CAPABILITY_RESPONSE_BYTES: u64 = 1 << 20;
+pub const MAX_CAPABILITY_RESPONSE_BYTES: u64 = 16 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelError {
@@ -39,10 +43,18 @@ pub enum ModelError {
     InvalidEnvironment,
     InvalidBaseUrl,
     InvalidBearer,
+    InvalidDescription,
+    EmptyMethods,
+    InvalidMethod,
+    EmptyPathPrefixes,
+    InvalidPathPrefix,
+    InvalidResponseLimit,
     UnsupportedVersion,
     EmptyRoutes,
     DuplicateRoute,
     DuplicateEnvironment,
+    DuplicateCapability,
+    MissingCapabilityRoute,
     MalformedPayload,
     Serialization,
 }
@@ -54,10 +66,22 @@ impl fmt::Display for ModelError {
             Self::InvalidEnvironment => "invalid or reserved environment variable name",
             Self::InvalidBaseUrl => "base URL must be canonical HTTPS without control characters",
             Self::InvalidBearer => "API key is not a valid Bearer value",
+            Self::InvalidDescription => {
+                "description must be at most 512 characters without control characters"
+            }
+            Self::EmptyMethods => "capability must allow at least one HTTP method",
+            Self::InvalidMethod => "unsupported HTTP method",
+            Self::EmptyPathPrefixes => "capability must allow at least one path prefix",
+            Self::InvalidPathPrefix => "capability path prefix is not normalized origin-form",
+            Self::InvalidResponseLimit => {
+                "capability response limit is outside the supported range"
+            }
             Self::UnsupportedVersion => "unsupported project format version",
             Self::EmptyRoutes => "a project must contain at least one route",
             Self::DuplicateRoute => "duplicate route name",
             Self::DuplicateEnvironment => "duplicate environment variable name",
+            Self::DuplicateCapability => "duplicate capability name",
+            Self::MissingCapabilityRoute => "capability references an unknown route",
             Self::MalformedPayload => "malformed stored project payload",
             Self::Serialization => "serializing project failed",
         })
@@ -67,7 +91,7 @@ impl fmt::Display for ModelError {
 impl std::error::Error for ModelError {}
 
 /// A validated, versioned collection of destination-bound credentials.
-#[derive(Clone, PartialEq, Eq, Serialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
     #[zeroize(skip)]
@@ -75,10 +99,13 @@ pub struct Project {
     #[zeroize(skip)]
     name: String,
     routes: Vec<ProjectRoute>,
+    #[zeroize(skip)]
+    #[serde(default)]
+    capabilities: Vec<AgentCapability>,
 }
 
 /// A validated route containing a real secret; `Debug` always redacts the key.
-#[derive(Clone, PartialEq, Eq, Serialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectRoute {
     #[zeroize(skip)]
@@ -87,9 +114,43 @@ pub struct ProjectRoute {
     base_url: String,
     api_key: String,
     #[zeroize(skip)]
+    application: Option<ApplicationBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationBinding {
+    #[zeroize(skip)]
     api_key_env: String,
     #[zeroize(skip)]
     base_url_env: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum HttpMethod {
+    GET,
+    POST,
+    PUT,
+    PATCH,
+    DELETE,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpPolicy {
+    methods: BTreeSet<HttpMethod>,
+    path_prefixes: Vec<String>,
+    max_response_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCapability {
+    name: String,
+    description: String,
+    route: String,
+    #[serde(flatten)]
+    policy: HttpPolicy,
 }
 
 pub fn validate_identifier(value: &str) -> Result<(), ModelError> {
@@ -142,6 +203,7 @@ impl fmt::Debug for Project {
             .field("version", &self.version)
             .field("name", &self.name)
             .field("routes", &self.routes)
+            .field("capabilities", &self.capabilities)
             .finish()
     }
 }
@@ -153,18 +215,225 @@ impl fmt::Debug for ProjectRoute {
             .field("name", &self.name)
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
-            .field("api_key_env", &self.api_key_env)
-            .field("base_url_env", &self.base_url_env)
+            .field("application", &self.application)
             .finish()
+    }
+}
+
+impl HttpMethod {
+    pub const ALL: [Self; 5] = [Self::GET, Self::POST, Self::PUT, Self::PATCH, Self::DELETE];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GET => "GET",
+            Self::POST => "POST",
+            Self::PUT => "PUT",
+            Self::PATCH => "PATCH",
+            Self::DELETE => "DELETE",
+        }
+    }
+}
+
+impl fmt::Display for HttpMethod {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for HttpMethod {
+    type Err = ModelError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_uppercase().as_str() {
+            "GET" => Ok(Self::GET),
+            "POST" => Ok(Self::POST),
+            "PUT" => Ok(Self::PUT),
+            "PATCH" => Ok(Self::PATCH),
+            "DELETE" => Ok(Self::DELETE),
+            _ => Err(ModelError::InvalidMethod),
+        }
+    }
+}
+
+impl HttpPolicy {
+    pub fn new(
+        methods: impl IntoIterator<Item = HttpMethod>,
+        path_prefixes: Vec<String>,
+        max_response_bytes: u64,
+    ) -> Result<Self, ModelError> {
+        let policy = Self {
+            methods: methods.into_iter().collect(),
+            path_prefixes,
+            max_response_bytes,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn methods(&self) -> &BTreeSet<HttpMethod> {
+        &self.methods
+    }
+
+    pub fn path_prefixes(&self) -> &[String] {
+        &self.path_prefixes
+    }
+
+    pub fn max_response_bytes(&self) -> u64 {
+        self.max_response_bytes
+    }
+
+    pub fn allows_method(&self, method: HttpMethod) -> bool {
+        self.methods.contains(&method)
+    }
+
+    pub fn allows_path(&self, path: &str) -> bool {
+        self.path_prefixes.iter().any(|prefix| {
+            if prefix.ends_with('/') {
+                path.starts_with(prefix)
+            } else {
+                path == prefix
+                    || path
+                        .strip_prefix(prefix)
+                        .is_some_and(|remainder| remainder.starts_with('/'))
+            }
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.methods.is_empty() {
+            return Err(ModelError::EmptyMethods);
+        }
+        if self.path_prefixes.is_empty() {
+            return Err(ModelError::EmptyPathPrefixes);
+        }
+        if self
+            .path_prefixes
+            .iter()
+            .any(|prefix| !crate::http::origin_path_is_normalized(prefix))
+        {
+            return Err(ModelError::InvalidPathPrefix);
+        }
+        if !(1..=MAX_CAPABILITY_RESPONSE_BYTES).contains(&self.max_response_bytes) {
+            return Err(ModelError::InvalidResponseLimit);
+        }
+        Ok(())
+    }
+}
+
+impl AgentCapability {
+    pub fn new(
+        name: String,
+        description: String,
+        route: String,
+        methods: impl IntoIterator<Item = HttpMethod>,
+        path_prefixes: Vec<String>,
+        max_response_bytes: u64,
+    ) -> Result<Self, ModelError> {
+        Self::with_policy(
+            name,
+            description,
+            route,
+            HttpPolicy::new(methods, path_prefixes, max_response_bytes)?,
+        )
+    }
+
+    pub fn with_policy(
+        name: String,
+        description: String,
+        route: String,
+        policy: HttpPolicy,
+    ) -> Result<Self, ModelError> {
+        let capability = Self {
+            name,
+            description,
+            route,
+            policy,
+        };
+        capability.validate()?;
+        Ok(capability)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn route(&self) -> &str {
+        &self.route
+    }
+
+    pub fn policy(&self) -> &HttpPolicy {
+        &self.policy
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        validate_identifier(&self.name)?;
+        validate_identifier(&self.route)?;
+        if self.description.len() > 512
+            || self
+                .description
+                .bytes()
+                .any(|byte| byte < 0x20 || byte == 0x7f)
+        {
+            return Err(ModelError::InvalidDescription);
+        }
+        self.policy.validate()
+    }
+}
+
+impl ApplicationBinding {
+    pub fn new(api_key_env: String, base_url_env: String) -> Result<Self, ModelError> {
+        let binding = Self {
+            api_key_env,
+            base_url_env,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    pub fn api_key_env(&self) -> &str {
+        &self.api_key_env
+    }
+
+    pub fn base_url_env(&self) -> &str {
+        &self.base_url_env
+    }
+
+    pub fn into_parts(mut self) -> (String, String) {
+        (
+            std::mem::take(&mut self.api_key_env),
+            std::mem::take(&mut self.base_url_env),
+        )
+    }
+
+    fn validate(&self) -> Result<(), ModelError> {
+        validate_env_name(&self.api_key_env)?;
+        validate_env_name(&self.base_url_env)?;
+        if self.api_key_env == self.base_url_env {
+            return Err(ModelError::DuplicateEnvironment);
+        }
+        Ok(())
     }
 }
 
 impl Project {
     pub fn new(name: String, routes: Vec<ProjectRoute>) -> Result<Self, ModelError> {
+        Self::with_capabilities(name, routes, Vec::new())
+    }
+
+    pub fn with_capabilities(
+        name: String,
+        routes: Vec<ProjectRoute>,
+        capabilities: Vec<AgentCapability>,
+    ) -> Result<Self, ModelError> {
         let project = Self {
             version: FORMAT_VERSION,
             name,
             routes,
+            capabilities,
         };
         project.validate()?;
         Ok(project)
@@ -178,8 +447,16 @@ impl Project {
         &self.routes
     }
 
-    pub fn into_routes(mut self) -> Vec<ProjectRoute> {
-        std::mem::take(&mut self.routes)
+    pub fn capabilities(&self) -> &[AgentCapability] {
+        &self.capabilities
+    }
+
+    pub fn into_parts(mut self) -> (String, Vec<ProjectRoute>, Vec<AgentCapability>) {
+        (
+            std::mem::take(&mut self.name),
+            std::mem::take(&mut self.routes),
+            std::mem::take(&mut self.capabilities),
+        )
     }
 
     pub fn validate(&self) -> Result<(), ModelError> {
@@ -197,10 +474,22 @@ impl Project {
             if !route_names.insert(route.name()) {
                 return Err(ModelError::DuplicateRoute);
             }
-            for name in [route.api_key_env(), route.base_url_env()] {
-                if !env_names.insert(name) {
-                    return Err(ModelError::DuplicateEnvironment);
+            if let Some(application) = route.application() {
+                for name in [application.api_key_env(), application.base_url_env()] {
+                    if !env_names.insert(name) {
+                        return Err(ModelError::DuplicateEnvironment);
+                    }
                 }
+            }
+        }
+        let mut capability_names = HashSet::new();
+        for capability in &self.capabilities {
+            capability.validate()?;
+            if !capability_names.insert(capability.name()) {
+                return Err(ModelError::DuplicateCapability);
+            }
+            if !route_names.contains(capability.route()) {
+                return Err(ModelError::MissingCapabilityRoute);
             }
         }
         Ok(())
@@ -215,18 +504,22 @@ impl Project {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
+        #[derive(Deserialize)]
+        struct VersionProbe {
+            version: u32,
+        }
         #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
         #[serde(deny_unknown_fields)]
-        struct WireProject {
+        struct LegacyProject {
             #[zeroize(skip)]
             version: u32,
             #[zeroize(skip)]
             name: String,
-            routes: Vec<WireRoute>,
+            routes: Vec<LegacyRoute>,
         }
         #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
         #[serde(deny_unknown_fields)]
-        struct WireRoute {
+        struct LegacyRoute {
             #[zeroize(skip)]
             name: String,
             #[zeroize(skip)]
@@ -239,9 +532,22 @@ impl Project {
         }
 
         let raw = std::str::from_utf8(bytes).map_err(|_| ModelError::MalformedPayload)?;
-        let mut wire: WireProject =
+        let probe: VersionProbe =
             serde_yaml_ng::from_str(raw).map_err(|_| ModelError::MalformedPayload)?;
-        if wire.version != FORMAT_VERSION {
+        if probe.version == FORMAT_VERSION {
+            let project: Project =
+                serde_yaml_ng::from_str(raw).map_err(|_| ModelError::MalformedPayload)?;
+            project
+                .validate()
+                .map_err(|_| ModelError::MalformedPayload)?;
+            return Ok(project);
+        }
+        if probe.version != LEGACY_FORMAT_VERSION {
+            return Err(ModelError::MalformedPayload);
+        }
+        let mut wire: LegacyProject =
+            serde_yaml_ng::from_str(raw).map_err(|_| ModelError::MalformedPayload)?;
+        if wire.version != LEGACY_FORMAT_VERSION {
             return Err(ModelError::MalformedPayload);
         }
         let routes = std::mem::take(&mut wire.routes)
@@ -267,11 +573,42 @@ impl Project {
     }
 
     pub fn description(&self) -> String {
-        let mut output = format!("Project: {}\nRoutes: {}\n", self.name, self.routes.len());
+        let mut output = format!(
+            "Project: {}\nRoutes: {}\nCapabilities: {}\n",
+            self.name,
+            self.routes.len(),
+            self.capabilities.len()
+        );
         for route in &self.routes {
             output.push_str(&format!(
-                "  {}\n    Base URL: {}\n    API-key environment: {}\n    Base-URL environment: {}\n",
-                route.name, route.base_url, route.api_key_env, route.base_url_env
+                "  {}\n    Base URL: {}\n",
+                route.name, route.base_url
+            ));
+            if let Some(application) = route.application() {
+                output.push_str(&format!(
+                    "    Application binding: yes\n    API-key environment: {}\n    Base-URL environment: {}\n",
+                    application.api_key_env, application.base_url_env
+                ));
+            } else {
+                output.push_str("    Application binding: no\n");
+            }
+        }
+        for capability in &self.capabilities {
+            let methods = capability
+                .policy
+                .methods
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            output.push_str(&format!(
+                "  {}\n    Description: {}\n    Route: {}\n    Methods: {}\n    Path prefixes: {}\n    Maximum response bytes: {}\n",
+                capability.name,
+                capability.description,
+                capability.route,
+                methods,
+                capability.policy.path_prefixes.join(", "),
+                capability.policy.max_response_bytes
             ));
         }
         output
@@ -286,12 +623,29 @@ impl ProjectRoute {
         api_key_env: String,
         base_url_env: String,
     ) -> Result<Self, ModelError> {
+        Self::with_application(
+            name,
+            base_url,
+            api_key,
+            Some(ApplicationBinding::new(api_key_env, base_url_env)?),
+        )
+    }
+
+    pub fn agent_only(name: String, base_url: String, api_key: String) -> Result<Self, ModelError> {
+        Self::with_application(name, base_url, api_key, None)
+    }
+
+    pub fn with_application(
+        name: String,
+        base_url: String,
+        api_key: String,
+        application: Option<ApplicationBinding>,
+    ) -> Result<Self, ModelError> {
         let route = Self {
             name,
             base_url: canonical_base_url(&base_url)?,
             api_key,
-            api_key_env,
-            base_url_env,
+            application,
         };
         route.validate()?;
         Ok(route)
@@ -303,20 +657,16 @@ impl ProjectRoute {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
-    pub fn api_key_env(&self) -> &str {
-        &self.api_key_env
-    }
-    pub fn base_url_env(&self) -> &str {
-        &self.base_url_env
+    pub fn application(&self) -> Option<&ApplicationBinding> {
+        self.application.as_ref()
     }
 
-    pub fn into_parts(mut self) -> (String, String, String, String, String) {
+    pub fn into_parts(mut self) -> (String, String, String, Option<ApplicationBinding>) {
         (
             std::mem::take(&mut self.name),
             std::mem::take(&mut self.base_url),
             std::mem::take(&mut self.api_key),
-            std::mem::take(&mut self.api_key_env),
-            std::mem::take(&mut self.base_url_env),
+            std::mem::take(&mut self.application),
         )
     }
 
@@ -333,10 +683,8 @@ impl ProjectRoute {
         {
             return Err(ModelError::InvalidBearer);
         }
-        validate_env_name(&self.api_key_env)?;
-        validate_env_name(&self.base_url_env)?;
-        if self.api_key_env == self.base_url_env {
-            return Err(ModelError::DuplicateEnvironment);
+        if let Some(application) = &self.application {
+            application.validate()?;
         }
         Ok(())
     }
@@ -392,6 +740,18 @@ mod tests {
         .unwrap()
     }
 
+    fn capability(name: &str, route: &str) -> AgentCapability {
+        AgentCapability::new(
+            name.into(),
+            "Read repository data.".into(),
+            route.into(),
+            [HttpMethod::GET],
+            vec!["/repos/".into()],
+            DEFAULT_CAPABILITY_RESPONSE_BYTES,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn versioned_project_round_trips_with_multiple_routes() {
         let project = Project::new(
@@ -409,20 +769,135 @@ mod tests {
     }
 
     #[test]
+    fn v1_project_migrates_in_memory_without_changing_secret_or_binding() {
+        let fixture = b"version: 1\nname: legacy-app\nroutes:\n- name: github\n  base_url: https://api.github.com\n  api_key: exact-legacy-secret+/=\n  api_key_env: GITHUB_TOKEN\n  base_url_env: GITHUB_API_URL\n";
+        let project = Project::decode(fixture).unwrap();
+
+        assert_eq!(project.name(), "legacy-app");
+        assert!(project.capabilities().is_empty());
+        let route = &project.routes()[0];
+        assert_eq!(route.name(), "github");
+        assert_eq!(route.base_url(), "https://api.github.com");
+        assert_eq!(route.application().unwrap().api_key_env(), "GITHUB_TOKEN");
+        assert_eq!(
+            route.application().unwrap().base_url_env(),
+            "GITHUB_API_URL"
+        );
+        assert_eq!(route.clone().into_parts().2, "exact-legacy-secret+/=");
+
+        let encoded = project.encode().unwrap();
+        let encoded = std::str::from_utf8(&encoded).unwrap();
+        assert!(encoded.starts_with("version: 2\n"));
+        assert!(encoded.contains("application:"));
+        assert!(encoded.contains("capabilities: []"));
+    }
+
+    #[test]
+    fn v2_capability_only_project_round_trips() {
+        let project = Project::with_capabilities(
+            "agent-project".into(),
+            vec![ProjectRoute::agent_only(
+                "github".into(),
+                "https://api.github.com".into(),
+                "private-token".into(),
+            )
+            .unwrap()],
+            vec![capability("github-read", "github")],
+        )
+        .unwrap();
+
+        let decoded = Project::decode(&project.encode().unwrap()).unwrap();
+        assert_eq!(decoded, project);
+        assert!(decoded.routes()[0].application().is_none());
+        assert!(!decoded.description().contains("private-token"));
+        assert!(!format!("{decoded:?}").contains("private-token"));
+    }
+
+    #[test]
+    fn capability_references_and_names_fail_closed() {
+        let routes = vec![route("github", "GITHUB_KEY", "GITHUB_URL")];
+        assert_eq!(
+            Project::with_capabilities(
+                "app".into(),
+                routes.clone(),
+                vec![
+                    capability("github-read", "github"),
+                    capability("github-read", "github")
+                ]
+            )
+            .unwrap_err(),
+            ModelError::DuplicateCapability
+        );
+        assert_eq!(
+            Project::with_capabilities(
+                "app".into(),
+                routes,
+                vec![capability("github-read", "missing")]
+            )
+            .unwrap_err(),
+            ModelError::MissingCapabilityRoute
+        );
+    }
+
+    #[test]
+    fn capability_policy_rejects_empty_or_malformed_authority() {
+        assert_eq!(
+            HttpPolicy::new([], vec!["/repos/".into()], 1).unwrap_err(),
+            ModelError::EmptyMethods
+        );
+        assert_eq!(
+            HttpPolicy::new([HttpMethod::GET], Vec::new(), 1).unwrap_err(),
+            ModelError::EmptyPathPrefixes
+        );
+        for invalid in [
+            "repos/",
+            "https://api.github.com/repos/",
+            "/repos/../admin",
+            "/repos/%2e%2e/admin",
+            "/repos\\admin",
+            "/repos/#fragment",
+        ] {
+            assert_eq!(
+                HttpPolicy::new([HttpMethod::GET], vec![invalid.into()], 1).unwrap_err(),
+                ModelError::InvalidPathPrefix,
+                "accepted {invalid}"
+            );
+        }
+        for invalid in [0, MAX_CAPABILITY_RESPONSE_BYTES + 1] {
+            assert_eq!(
+                HttpPolicy::new([HttpMethod::GET], vec!["/repos/".into()], invalid).unwrap_err(),
+                ModelError::InvalidResponseLimit
+            );
+        }
+    }
+
+    #[test]
+    fn path_prefix_matching_has_segment_boundaries() {
+        let slash = HttpPolicy::new([HttpMethod::GET], vec!["/repos/".into()], 1).unwrap();
+        assert!(slash.allows_path("/repos/a"));
+        assert!(slash.allows_path("/repos/a/b"));
+        assert!(!slash.allows_path("/repos"));
+        assert!(!slash.allows_path("/repositories/a"));
+
+        let exact = HttpPolicy::new([HttpMethod::GET], vec!["/user".into()], 1).unwrap();
+        assert!(exact.allows_path("/user"));
+        assert!(exact.allows_path("/user/repos"));
+        assert!(!exact.allows_path("/users"));
+    }
+
+    #[test]
     fn zeroize_marks_only_the_route_credential_as_secret() {
         let mut route = route("billing", "BILLING_KEY", "BILLING_URL");
         let name = route.name.clone();
         let base_url = route.base_url.clone();
-        let api_key_env = route.api_key_env.clone();
-        let base_url_env = route.base_url_env.clone();
+        let application = route.application.clone();
 
         route.zeroize();
 
         assert!(route.api_key.is_empty());
         assert_eq!(route.name, name);
         assert_eq!(route.base_url, base_url);
-        assert_eq!(route.api_key_env, api_key_env);
-        assert_eq!(route.base_url_env, base_url_env);
+        assert_eq!(route.application, application);
     }
 
     #[test]

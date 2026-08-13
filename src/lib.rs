@@ -1,4 +1,7 @@
+pub mod broker;
+pub mod capability;
 pub mod config;
+mod http;
 pub mod project;
 pub mod proxy;
 pub mod secret;
@@ -28,11 +31,15 @@ struct RouteEnvironment {
 
 pub fn prepare_project(project: Project) -> Result<Prepared, String> {
     project.validate().map_err(|error| error.to_string())?;
-    let project_routes = project.into_routes();
+    let (_, project_routes, _) = project.into_parts();
     let mut routes = Vec::with_capacity(project_routes.len());
     let mut environment = Vec::with_capacity(project_routes.len());
     for route in project_routes {
-        let (name, base_url, key, api_key_env, base_url_env) = route.into_parts();
+        let (name, base_url, key, application) = route.into_parts();
+        let Some(application) = application else {
+            continue;
+        };
+        let (api_key_env, base_url_env) = application.into_parts();
         routes.push(proxy::Route {
             name: name.clone(),
             upstream: base_url,
@@ -44,6 +51,9 @@ pub fn prepare_project(project: Project) -> Result<Prepared, String> {
             base_url_env,
             fake_key: secret::mock(),
         });
+    }
+    if routes.is_empty() {
+        return Err("project has no application-bound routes".into());
     }
     Ok(Prepared {
         routes,

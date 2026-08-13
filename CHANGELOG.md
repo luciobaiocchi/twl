@@ -5,6 +5,25 @@ All notable changes to Towel will be documented here. The project uses
 
 ## Unreleased
 
+### Added
+
+- V1 agent-native, credential-backed HTTP capabilities with explicit method,
+  normalized path-prefix, and response-size policy.
+- Versioned, bounded stdio capability discovery/invocation service and a
+  generated canary demo that needs no real credential or protected store.
+- Interactive capability add/list/show/delete commands and capability-only
+  routes without application environment bindings.
+- DeepSeek Harness `twl_request` adapter with effect-owned process lifecycle,
+  bounded result rendering, and protocol/lifecycle tests.
+
+### Changed
+
+- Project storage format is now v2; v1 records remain readable through an
+  in-memory, secret-preserving migration and are written as v2 only when saved.
+- Application loopback proxying and agent capability invocation now share one
+  broker executor for credential injection, redirect policy, ambient-proxy
+  disabling, body bounds, header filtering, and reflection checks.
+
 ## 0.1.0-alpha.1 - 2026-08-01
 
 First public prerelease. Linux artifacts only: macOS builds stay disabled

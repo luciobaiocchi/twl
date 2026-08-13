@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+
+exec "${TWL_DEMO_BINARY:?TWL_DEMO_BINARY is required}" capability demo --stdio

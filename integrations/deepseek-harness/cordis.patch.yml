@@ -1,0 +1,8 @@
+- insert:
+    - id: towel-capabilities
+      name: dsh-towel
+      config:
+        project: !!js process.env.TWL_PROJECT
+        twlBinary: !!js process.env.TWL_BINARY ?? 'twl'
+        maxModelOutputBytes: 65536
+        shutdownGraceMs: 1500

@@ -1,8 +1,12 @@
 use std::io::{self, Write};
 use std::process::exit;
+use std::str::FromStr;
+use twl::broker::Route;
+use twl::capability::{serve_stdio, CapabilityBroker};
 use twl::config::Config;
 use twl::project::{
-    open_project_service, validate_identifier, PlatformProjectService, Project, ProjectRoute,
+    open_project_service, validate_identifier, AgentCapability, ApplicationBinding, HttpMethod,
+    PlatformProjectService, Project, ProjectRoute, DEFAULT_CAPABILITY_RESPONSE_BYTES,
 };
 use twl::{platform_child_command, prepare_demo, prepare_project, Prepared};
 
@@ -10,6 +14,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("project") => project_command(&args[1..]).map(|_| 0),
+        Some("capability") => capability_command(&args[1..]).map(|_| 0),
         Some("run") => run(&args[1..]),
         Some("demo") => demo(&args[1..]),
         Some("doctor") if args.len() == 1 => {
@@ -35,6 +40,12 @@ fn usage() -> String {
      twl project show <name>\n\
      twl project edit <name>\n\
      twl project delete <name>\n\
+     twl capability add --project <name>\n\
+     twl capability list --project <name>\n\
+     twl capability show --project <name> <capability>\n\
+     twl capability delete --project <name> <capability>\n\
+     twl capability serve --project <name> --stdio\n\
+     twl capability demo --stdio\n\
      twl run --project <name> -- <command> [args...]\n\
      twl demo [--config towel.yaml] -- <command> [args...]\n\
      twl doctor"
@@ -103,6 +114,263 @@ fn project_command(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn capability_command(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let name = capability_project_option(&args[1..], "add")?;
+            let store = project_service()?;
+            let stored = store.get(&name).map_err(|error| error.to_string())?;
+            let (project, revision) = stored.into_parts();
+            let (_, routes, mut capabilities) = project.into_parts();
+            eprintln!(
+                "Available routes: {}",
+                routes
+                    .iter()
+                    .map(ProjectRoute::name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let capability = prompt_capability(&routes)?;
+            let capability_name = capability.name().to_string();
+            capabilities.push(capability);
+            let project = Project::with_capabilities(name, routes, capabilities)
+                .map_err(|error| error.to_string())?;
+            store
+                .replace(&revision, &project)
+                .map_err(|error| error.to_string())?;
+            println!("Added capability {capability_name}.");
+            Ok(())
+        }
+        Some("list") => {
+            let name = capability_project_option(&args[1..], "list")?;
+            let store = project_service()?;
+            let stored = store.get(&name).map_err(|error| error.to_string())?;
+            for capability in stored.project().capabilities() {
+                println!("{}\t{}", capability.name(), capability.description());
+            }
+            Ok(())
+        }
+        Some("show") => {
+            let (name, capability_name) = capability_project_and_name(&args[1..], "show")?;
+            let store = project_service()?;
+            let stored = store.get(&name).map_err(|error| error.to_string())?;
+            let capability = stored
+                .project()
+                .capabilities()
+                .iter()
+                .find(|candidate| candidate.name() == capability_name)
+                .ok_or("capability not found")?;
+            print_capability(capability);
+            Ok(())
+        }
+        Some("delete") => {
+            let (name, capability_name) = capability_project_and_name(&args[1..], "delete")?;
+            let store = project_service()?;
+            let stored = store.get(&name).map_err(|error| error.to_string())?;
+            let (project, revision) = stored.into_parts();
+            let (_, routes, mut capabilities) = project.into_parts();
+            let original_len = capabilities.len();
+            capabilities.retain(|candidate| candidate.name() != capability_name);
+            if capabilities.len() == original_len {
+                return Err("capability not found".into());
+            }
+            let project = Project::with_capabilities(name, routes, capabilities)
+                .map_err(|error| error.to_string())?;
+            store
+                .replace(&revision, &project)
+                .map_err(|error| error.to_string())?;
+            println!("Deleted capability {capability_name}.");
+            Ok(())
+        }
+        Some("serve") => {
+            let name = capability_serve_project(&args[1..])?;
+            let store = project_service()?;
+            let stored = store.get(&name).map_err(|error| error.to_string())?;
+            let capability_count = stored.project().capabilities().len();
+            let project = stored.into_parts().0;
+            drop(store);
+            let broker =
+                CapabilityBroker::from_project(project).map_err(|error| error.to_string())?;
+            eprintln!(
+                "twl: authorized project {name} with {capability_count} capability(s) for this session"
+            );
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            install_stdio_shutdown()?;
+            serve_stdio(broker, stdin.lock(), stdout.lock()).map_err(|error| error.to_string())
+        }
+        Some("demo") if args.get(1).map(String::as_str) == Some("--stdio") && args.len() == 2 => {
+            capability_demo()
+        }
+        _ => Err(usage()),
+    }
+}
+
+fn capability_project_option(args: &[String], operation: &str) -> Result<String, String> {
+    let [option, name] = args else {
+        return Err(format!(
+            "usage: twl capability {operation} --project <name>"
+        ));
+    };
+    if option != "--project" {
+        return Err(format!("unknown option: {option}"));
+    }
+    validate_identifier(name).map_err(|error| error.to_string())?;
+    Ok(name.clone())
+}
+
+fn capability_project_and_name(
+    args: &[String],
+    operation: &str,
+) -> Result<(String, String), String> {
+    let [option, project, capability] = args else {
+        return Err(format!(
+            "usage: twl capability {operation} --project <name> <capability>"
+        ));
+    };
+    if option != "--project" {
+        return Err(format!("unknown option: {option}"));
+    }
+    validate_identifier(project).map_err(|error| error.to_string())?;
+    validate_identifier(capability).map_err(|error| error.to_string())?;
+    Ok((project.clone(), capability.clone()))
+}
+
+fn capability_serve_project(args: &[String]) -> Result<String, String> {
+    let [option, name, stdio] = args else {
+        return Err("usage: twl capability serve --project <name> --stdio".into());
+    };
+    if option != "--project" {
+        return Err(format!("unknown option: {option}"));
+    }
+    if stdio != "--stdio" {
+        return Err(format!("unknown option: {stdio}"));
+    }
+    validate_identifier(name).map_err(|error| error.to_string())?;
+    Ok(name.clone())
+}
+
+fn prompt_capability(routes: &[ProjectRoute]) -> Result<AgentCapability, String> {
+    let name = terminal_line("Capability name")?;
+    let description = terminal_line("Description")?;
+    let route = terminal_line("Route")?;
+    if !routes.iter().any(|candidate| candidate.name() == route) {
+        return Err("capability route was not found in the project".into());
+    }
+    let methods = parse_methods(&terminal_line("Allowed methods (comma-separated)")?)?;
+    let path_prefixes =
+        parse_path_prefixes(&terminal_line("Allowed path prefixes (comma-separated)")?);
+    let shown_default = DEFAULT_CAPABILITY_RESPONSE_BYTES.to_string();
+    let maximum = ask(
+        &mut terminal_line,
+        "Maximum response bytes",
+        Some(&shown_default),
+    )?
+    .parse::<u64>()
+    .map_err(|_| "maximum response bytes must be an integer")?;
+    AgentCapability::new(name, description, route, methods, path_prefixes, maximum)
+        .map_err(|error| error.to_string())
+}
+
+fn parse_methods(value: &str) -> Result<Vec<HttpMethod>, String> {
+    let methods = value
+        .split(|character: char| character == ',' || character.is_ascii_whitespace())
+        .filter(|method| !method.is_empty())
+        .map(HttpMethod::from_str)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if methods.is_empty() {
+        return Err("capability must allow at least one HTTP method".into());
+    }
+    Ok(methods)
+}
+
+fn parse_path_prefixes(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn print_capability(capability: &AgentCapability) {
+    println!("Capability: {}", capability.name());
+    println!("Description: {}", capability.description());
+    println!("Route: {}", capability.route());
+    println!(
+        "Methods: {}",
+        capability
+            .policy()
+            .methods()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "Path prefixes: {}",
+        capability.policy().path_prefixes().join(", ")
+    );
+    println!(
+        "Maximum response bytes: {}",
+        capability.policy().max_response_bytes()
+    );
+}
+
+fn capability_demo() -> Result<(), String> {
+    let upstream = spawn_demo_upstream()?;
+    let key = twl::secret::demo();
+    let capability = AgentCapability::new(
+        "demo-read".into(),
+        "Read the local Towel capability canary endpoint.".into(),
+        "demo".into(),
+        [HttpMethod::GET],
+        vec!["/allowed/".into()],
+        DEFAULT_CAPABILITY_RESPONSE_BYTES,
+    )
+    .map_err(|error| error.to_string())?;
+    let github_capability = AgentCapability::new(
+        "github-read".into(),
+        "Read mock GitHub repository resources from the local canary upstream.".into(),
+        "demo".into(),
+        [HttpMethod::GET],
+        vec!["/repos/".into()],
+        DEFAULT_CAPABILITY_RESPONSE_BYTES,
+    )
+    .map_err(|error| error.to_string())?;
+    let broker = CapabilityBroker::new(
+        vec![Route {
+            name: "demo".into(),
+            upstream,
+            key,
+        }],
+        vec![capability, github_capability],
+    )
+    .map_err(|error| error.to_string())?;
+    eprintln!("twl: capability demo uses a generated canary; no real credential is read");
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    install_stdio_shutdown()?;
+    serve_stdio(broker, stdin.lock(), stdout.lock()).map_err(|error| error.to_string())
+}
+
+fn install_stdio_shutdown() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        ctrlc::set_handler(|| {
+            // SAFETY: closing the process's stdin descriptor is async-signal-safe on Unix. The
+            // capability loop treats the resulting EOF/read error as shutdown and drops its
+            // credential-bearing broker before main exits.
+            unsafe {
+                libc::close(libc::STDIN_FILENO);
+            }
+        })
+        .map_err(|error| format!("installing capability shutdown handler: {error}"))?;
+    }
+    Ok(())
+}
+
 fn project_service() -> Result<PlatformProjectService, String> {
     open_project_service().map_err(|error| error.to_string())
 }
@@ -148,6 +416,9 @@ fn collect_project(
 ) -> Result<Project, String> {
     eprintln!("Enter routes. Leave the route name blank when finished.");
     let mut routes = Vec::new();
+    let capabilities = existing
+        .map(|project| project.capabilities().to_vec())
+        .unwrap_or_default();
     if let Some(project) = existing {
         for (position, old) in project.routes().iter().enumerate() {
             let action = ask(
@@ -166,7 +437,8 @@ fn collect_project(
                 }
                 "f" | "finish" | "done" => {
                     routes.extend(project.routes()[position..].iter().cloned());
-                    return Project::new(name, routes).map_err(|error| error.to_string());
+                    return Project::with_capabilities(name, routes, capabilities)
+                        .map_err(|error| error.to_string());
                 }
                 _ => return Err("route action must be keep, edit, delete, or finish".into()),
             }
@@ -186,7 +458,7 @@ fn collect_project(
             &mut read_password,
         )?);
     }
-    Project::new(name, routes).map_err(|error| error.to_string())
+    Project::with_capabilities(name, routes, capabilities).map_err(|error| error.to_string())
 }
 
 fn prompt_route(
@@ -210,16 +482,39 @@ fn prompt_route_with_name(
         "Exact HTTPS base URL",
         existing.map(ProjectRoute::base_url),
     )?;
-    let api_key_env = ask(
+    let existing_application = existing.and_then(ProjectRoute::application);
+    let application_default = if existing_application.is_some() {
+        "y"
+    } else {
+        "n"
+    };
+    let application = match ask(
         read_line,
-        "Application API-key environment variable",
-        existing.map(ProjectRoute::api_key_env),
-    )?;
-    let base_url_env = ask(
-        read_line,
-        "Application base-URL environment variable",
-        existing.map(ProjectRoute::base_url_env),
-    )?;
+        "Application environment binding? (y/n)",
+        Some(application_default),
+    )?
+    .to_ascii_lowercase()
+    .as_str()
+    {
+        "y" | "yes" => {
+            let api_key_env = ask(
+                read_line,
+                "Application API-key environment variable",
+                existing_application.map(ApplicationBinding::api_key_env),
+            )?;
+            let base_url_env = ask(
+                read_line,
+                "Application base-URL environment variable",
+                existing_application.map(ApplicationBinding::base_url_env),
+            )?;
+            Some(
+                ApplicationBinding::new(api_key_env, base_url_env)
+                    .map_err(|error| error.to_string())?,
+            )
+        }
+        "n" | "no" => None,
+        _ => return Err("application environment binding must be yes or no".into()),
+    };
     let key_label = if existing.is_some() {
         "Static Bearer API key (leave blank to keep existing): "
     } else {
@@ -230,12 +525,12 @@ fn prompt_route_with_name(
         existing
             .cloned()
             .map(ProjectRoute::into_parts)
-            .map(|(_, _, key, _, _)| key)
+            .map(|(_, _, key, _)| key)
             .ok_or("API key must not be empty")?
     } else {
         entered
     };
-    ProjectRoute::new(route_name, base_url, api_key, api_key_env, base_url_env)
+    ProjectRoute::with_application(route_name, base_url, api_key, application)
         .map_err(|error| error.to_string())
 }
 
@@ -425,7 +720,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut lines: VecDeque<String> = ["d", "e", "renamed", "", "", "", ""]
+        let mut lines: VecDeque<String> = ["d", "e", "renamed", "", "", "", "", ""]
             .into_iter()
             .map(str::to_string)
             .collect();
