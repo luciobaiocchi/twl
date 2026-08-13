@@ -5,7 +5,7 @@ Validation date: 2026-08-13
 ## Build information
 
 ```text
-Towel implementation commit: IMPLEMENTATION_COMMIT
+Towel implementation commit: 4a02fde0c7f41205be32d798261f3debd5bb6542
 Towel version: 0.1.0-alpha.1
 Operating system: macOS 15.5 (24F74)
 Architecture: arm64
@@ -18,7 +18,7 @@ Node version: 22.22.2
 npm version: 10.9.7
 pnpm version used for isolated profile: 11.21.0 (Corepack)
 
-DeepSeek Towel plugin commit: IMPLEMENTATION_COMMIT
+DeepSeek Towel plugin commit: 4a02fde0c7f41205be32d798261f3debd5bb6542
 ```
 
 The issue baseline referenced Harness `0.1.0-rc.5`. Its matching
