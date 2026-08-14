@@ -1,6 +1,10 @@
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::io::{BufReader, Read};
 use std::process::exit;
 use std::str::FromStr;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use twl::broker::Route;
 use twl::capability::{serve_stdio, CapabilityBroker};
 use twl::config::Config;
@@ -194,10 +198,7 @@ fn capability_command(args: &[String]) -> Result<(), String> {
             eprintln!(
                 "twl: authorized project {name} with {capability_count} capability(s) for this session"
             );
-            let stdin = io::stdin();
-            let stdout = io::stdout();
-            install_stdio_shutdown()?;
-            serve_stdio(broker, stdin.lock(), stdout.lock()).map_err(|error| error.to_string())
+            serve_capability_stdio(broker)
         }
         Some("demo") if args.get(1).map(String::as_str) == Some("--stdio") && args.len() == 2 => {
             capability_demo()
@@ -349,22 +350,90 @@ fn capability_demo() -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
     eprintln!("twl: capability demo uses a generated canary; no real credential is read");
-    let stdin = io::stdin();
-    let stdout = io::stdout();
+    serve_capability_stdio(broker)
+}
+
+#[cfg(unix)]
+static STDIO_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+struct InterruptibleStdin;
+
+#[cfg(unix)]
+impl Read for InterruptibleStdin {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if STDIO_SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                return Ok(0);
+            }
+            let mut descriptor = libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // A short timeout closes the race between checking the flag and entering poll.
+            // SAFETY: `descriptor` is valid for one pollfd entry for the duration of the call.
+            let ready = unsafe { libc::poll(&mut descriptor, 1, 100) };
+            if ready == 0 {
+                continue;
+            }
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "capability stdin is unavailable",
+                ));
+            }
+            if descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                // SAFETY: stdin is readable according to poll, and `buffer` is a valid writable
+                // allocation whose exact length is passed to read.
+                let read = unsafe {
+                    libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len())
+                };
+                if read >= 0 {
+                    return Ok(read as usize);
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+fn serve_capability_stdio(broker: CapabilityBroker) -> Result<(), String> {
     install_stdio_shutdown()?;
-    serve_stdio(broker, stdin.lock(), stdout.lock()).map_err(|error| error.to_string())
+    let stdout = io::stdout();
+    #[cfg(unix)]
+    {
+        let stdin = BufReader::new(InterruptibleStdin);
+        serve_stdio(broker, stdin, stdout.lock()).map_err(|error| error.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let stdin = io::stdin();
+        serve_stdio(broker, stdin.lock(), stdout.lock()).map_err(|error| error.to_string())
+    }
 }
 
 fn install_stdio_shutdown() -> Result<(), String> {
     #[cfg(unix)]
     {
+        STDIO_SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
         ctrlc::set_handler(|| {
-            // SAFETY: closing the process's stdin descriptor is async-signal-safe on Unix. The
-            // capability loop treats the resulting EOF/read error as shutdown and drops its
-            // credential-bearing broker before main exits.
-            unsafe {
-                libc::close(libc::STDIN_FILENO);
-            }
+            // Cross-thread close does not reliably wake a blocked read on Linux. The
+            // interruptible reader observes this flag and returns EOF so normal drops run.
+            STDIO_SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
         })
         .map_err(|error| format!("installing capability shutdown handler: {error}"))?;
     }
