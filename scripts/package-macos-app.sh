@@ -157,6 +157,52 @@ codesign --force --options runtime --timestamp \
 codesign --verify --deep --strict --verbose=2 "$staged_bundle"
 codesign -d --entitlements - "$staged_bundle"
 
+# A profile can authorize the right Team ID and entitlements while naming a
+# different Developer ID certificate from the one codesign selected. macOS
+# rejects that combination at launch, usually as an otherwise opaque SIGKILL.
+certificate_prefix="$work_dir/signing-certificate-"
+codesign -d --extract-certificates "$certificate_prefix" "$staged_bundle"
+signing_certificate="${certificate_prefix}0"
+if [ ! -f "$signing_certificate" ]; then
+    echo "codesign did not expose the leaf signing certificate" >&2
+    exit 1
+fi
+
+python3 - "$profile_plist" "$signing_certificate" <<'PY'
+import hashlib
+import plistlib
+import sys
+from pathlib import Path
+
+profile_path, signing_certificate_path = sys.argv[1:]
+with open(profile_path, "rb") as source:
+    profile = plistlib.load(source)
+signing_certificate = Path(signing_certificate_path).read_bytes()
+profile_certificates = profile.get("DeveloperCertificates", [])
+if not isinstance(profile_certificates, list) or any(
+    not isinstance(item, bytes) for item in profile_certificates
+):
+    raise SystemExit(
+        "invalid Developer ID provisioning profile: DeveloperCertificates "
+        "must be an array of certificates"
+    )
+
+def fingerprint(certificate):
+    digest = hashlib.sha256(certificate).hexdigest().upper()
+    return ":".join(digest[index:index + 2] for index in range(0, len(digest), 2))
+
+if signing_certificate not in profile_certificates:
+    actual = fingerprint(signing_certificate)
+    available = ", ".join(fingerprint(item) for item in profile_certificates)
+    raise SystemExit(
+        "invalid Developer ID provisioning profile: the leaf signing certificate "
+        f"SHA-256 {actual} is not included; profile certificates: "
+        f"{available or '<none>'}"
+    )
+
+print(f"validated signing certificate SHA-256 {fingerprint(signing_certificate)}")
+PY
+
 if [ -d "$bundle" ]; then
     rm -rf "$bundle"
 fi

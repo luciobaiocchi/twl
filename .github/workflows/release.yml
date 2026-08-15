@@ -248,7 +248,20 @@ jobs:
           # assert on the line. This is the only automated check that the signed
           # entitlements and access group actually work; without it a binary
           # that fails closed on every project command still ships.
+          set +e
           "$app/Contents/MacOS/twl" doctor | tee "$RUNNER_TEMP/doctor.txt"
+          doctor_status=${PIPESTATUS[0]}
+          set -e
+          if [ "$doctor_status" -ne 0 ]; then
+            echo "::error::$name was terminated while checking protected Keychain access (status $doctor_status)"
+            # codesign verification does not explain AMFI/taskgated launch
+            # rejection. Capture only the relevant system services from this
+            # ephemeral runner so the next failure has an actionable reason.
+            /usr/bin/log show --last 2m --style compact \
+              --predicate 'process == "amfid" OR process == "taskgated-helper" OR process == "syspolicyd"' \
+              | tail -200 || true
+            exit "$doctor_status"
+          fi
           if ! grep -q "protected macOS project sessions: available" "$RUNNER_TEMP/doctor.txt"; then
             echo "::error::$name cannot open the protected Keychain store"
             exit 1
