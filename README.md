@@ -202,21 +202,26 @@ generated canary demos.
 
 ## Protected macOS build
 
-Real Keychain sessions require a signed binary with hardened runtime, library
-validation, runtime enforcement, debugging disabled, and Towel's
-code-signing-scoped Keychain access group. At startup Towel verifies its Team
-ID, application identifier, and access-group entitlements. An ordinary `cargo
-build` binary intentionally fails closed.
+Real Keychain sessions require a Developer ID-signed app-like bundle with an
+embedded provisioning profile, hardened runtime, library validation, runtime
+enforcement, debugging disabled, and Towel's code-signing-scoped Keychain
+access group. At startup Towel verifies its Team ID, application identifier,
+and access-group entitlements. An ordinary `cargo build` binary intentionally
+fails closed.
 
 ```bash
+export TWL_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+export TWL_TEAM_ID=TEAMID
+export TWL_PROVISIONING_PROFILE=/path/to/TowelCLI.provisionprofile
 scripts/build-macos.sh
 ```
 
-Set `TWL_CODESIGN_IDENTITY` to a stable signing identity and `TWL_TEAM_ID` to
-its Apple Team ID for a real deployment. The script uses ad-hoc signing when
-the identity is unset; that mode is for local build checks, not real credential
-deployment. `twl doctor` reports whether the current binary satisfies the
-hardened-runtime checks.
+The script validates the profile's team, app identifier, Keychain access group,
+expiry, and distribution settings before signing
+`target/release/TowelCLI.app`. It then runs
+`TowelCLI.app/Contents/MacOS/twl doctor` and fails unless protected project
+sessions are available. Ad-hoc signing is not supported because it cannot
+authorize this restricted entitlement.
 
 ## Linux build
 
@@ -247,8 +252,9 @@ gh attestation verify twl-<version>-<target>.tar.gz --repo luciobaiocchi/twl
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-macOS archives are Developer ID signed and notarized, so `spctl` and Gatekeeper
-accept them directly.
+macOS ZIP archives contain a Developer ID-signed, provisioned, notarized, and
+stapled `TowelCLI.app`, so `spctl` and Gatekeeper accept it directly. Preserve
+the bundle and invoke its command at `TowelCLI.app/Contents/MacOS/twl`.
 
 ## Build and test
 

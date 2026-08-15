@@ -25,6 +25,8 @@ All notable changes to Towel will be documented here. The project uses
 - Application loopback proxying and agent capability invocation now share one
   broker executor for credential injection, redirect policy, ambient-proxy
   disabling, body bounds, header filtering, and reflection checks.
+- macOS release artifacts now preserve Towel inside a provisioned, Developer
+  ID-signed app-like bundle and staple the notarization ticket before packaging.
 
 ## 0.1.0-alpha.1 - 2026-08-01
 

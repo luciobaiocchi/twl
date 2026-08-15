@@ -146,11 +146,8 @@ jobs:
   macos:
     name: macOS (${{ matrix.target }})
     needs: verify-version
-    # Opt-in. Signing and notarization need credentials and an entitlement
-    # configuration that has not been exercised on a Developer ID build yet, so
-    # a tag must be able to ship Linux on its own. Set the MACOS_RELEASE
-    # repository variable to "true" once that path is verified; until then this
-    # job never runs and publish still produces a Linux-only prerelease.
+    # Opt-in. Signing, provisioning, and notarization require protected Apple
+    # credentials, so a tag must still be able to ship Linux on its own.
     if: >-
       vars.MACOS_RELEASE == 'true'
       && (github.event_name != 'workflow_dispatch' || inputs.platforms == 'all')
@@ -198,58 +195,106 @@ jobs:
             -s -k "$keychain_password" "$keychain"
           security list-keychains -d user -s "$keychain"
 
-      - name: Sign, notarize, and package
+      - name: Decode Developer ID provisioning profile
+        env:
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, binascii, os, pathlib
+
+          encoded = "".join(os.environ.get("PROVISIONING_PROFILE_BASE64", "").split())
+          if not encoded:
+              raise SystemExit("APPLE_PROVISIONING_PROFILE_BASE64 is missing")
+          try:
+              decoded = base64.b64decode(encoded, validate=True)
+          except binascii.Error as error:
+              raise SystemExit(
+                  f"APPLE_PROVISIONING_PROFILE_BASE64 is invalid: {error}"
+              ) from error
+          destination = pathlib.Path(
+              os.environ["RUNNER_TEMP"], "twl.provisionprofile"
+          )
+          destination.write_bytes(decoded)
+          destination.chmod(0o600)
+          PY
+
+      - name: Build and sign provisioned app bundle
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="twl-${{ needs.verify-version.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp README.md LICENSE NOTICE "dist/$name/"
+          TWL_BINARY="target/${{ matrix.target }}/release/twl" \
+          TWL_APP_BUNDLE="dist/$name/TowelCLI.app" \
+          TWL_PROVISIONING_PROFILE="$RUNNER_TEMP/twl.provisionprofile" \
+          TWL_CODESIGN_IDENTITY="$APPLE_SIGNING_IDENTITY" \
+          TWL_TEAM_ID="$APPLE_TEAM_ID" \
+          TWL_VERSION="${{ needs.verify-version.outputs.version }}" \
+            scripts/package-macos-app.sh
+
+      - name: Exercise protected Keychain access
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="twl-${{ needs.verify-version.outputs.version }}-${{ matrix.target }}"
+          app="dist/$name/TowelCLI.app"
+          # doctor reports an unusable Keychain on stdout and still exits 0, so
+          # assert on the line. This is the only automated check that the signed
+          # entitlements and access group actually work; without it a binary
+          # that fails closed on every project command still ships.
+          "$app/Contents/MacOS/twl" doctor | tee "$RUNNER_TEMP/doctor.txt"
+          if ! grep -q "protected macOS project sessions: available" "$RUNNER_TEMP/doctor.txt"; then
+            echo "::error::$name cannot open the protected Keychain store"
+            exit 1
+          fi
+
+      - name: Notarize, staple, and package
+        env:
           APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
         shell: bash
         run: |
           set -euo pipefail
-          # A missing secret expands to an empty string, which set -u does not
-          # catch. Without this guard the entitlements get an empty Team ID,
-          # codesign still succeeds, and every project command in the released
-          # binary fails closed at runtime.
-          case "${APPLE_TEAM_ID:-}" in
-            "" | *[!A-Za-z0-9]*)
-              echo "::error::APPLE_TEAM_ID is missing or not alphanumeric"
-              exit 1
-              ;;
-          esac
           name="twl-${{ needs.verify-version.outputs.version }}-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/twl" README.md LICENSE NOTICE "dist/$name/"
-          entitlements="$RUNNER_TEMP/twl.entitlements"
-          sed "s/__TEAM_ID__/$APPLE_TEAM_ID/g" config/macos.entitlements >"$entitlements"
-          codesign --force --options runtime --timestamp \
-            --entitlements "$entitlements" \
-            --sign "$APPLE_SIGNING_IDENTITY" "dist/$name/twl"
-          codesign --verify --strict --verbose=2 "dist/$name/twl"
-          codesign -d --entitlements - "dist/$name/twl"
-          # doctor reports an unusable Keychain on stdout and still exits 0, so
-          # assert on the line. This is the only automated check that the signed
-          # entitlements and access group actually work; without it a binary
-          # that fails closed on every project command still ships.
-          "dist/$name/twl" doctor | tee "$RUNNER_TEMP/doctor.txt"
-          if ! grep -q "protected macOS project sessions: available" "$RUNNER_TEMP/doctor.txt"; then
-            echo "::error::$name cannot open the protected Keychain store"
-            exit 1
-          fi
-          ditto -c -k --keepParent "dist/$name" "dist/$name.zip"
+          app="dist/$name/TowelCLI.app"
+          notarization_archive="$RUNNER_TEMP/$name-notarization.zip"
+          # A ZIP cannot itself carry a stapled ticket. Submit an app-only ZIP,
+          # staple the accepted ticket to the app, then create the release ZIP.
+          ditto -c -k --keepParent "$app" "$notarization_archive"
           python3 - <<'PY'
-          import base64, os, pathlib
+          import base64, binascii, os, pathlib
+
           key_id = os.environ["APPLE_API_KEY_ID"]
-          pathlib.Path(os.environ["RUNNER_TEMP"], f"AuthKey_{key_id}.p8").write_bytes(
-              base64.b64decode(os.environ["APPLE_API_KEY_P8_BASE64"])
+          encoded = "".join(os.environ.get("APPLE_API_KEY_P8_BASE64", "").split())
+          if not encoded:
+              raise SystemExit("APPLE_API_KEY_P8_BASE64 is missing")
+          try:
+              decoded = base64.b64decode(encoded, validate=True)
+          except binascii.Error as error:
+              raise SystemExit(f"APPLE_API_KEY_P8_BASE64 is invalid: {error}") from error
+          destination = pathlib.Path(
+              os.environ["RUNNER_TEMP"], f"AuthKey_{key_id}.p8"
           )
+          destination.write_bytes(decoded)
+          destination.chmod(0o600)
           PY
-          xcrun notarytool submit "dist/$name.zip" \
+          xcrun notarytool submit "$notarization_archive" \
             --key "$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8" \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID" \
             --wait
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+          ditto -c -k --keepParent "dist/$name" "dist/$name.zip"
 
       - name: Remove signing keychain
         if: always()

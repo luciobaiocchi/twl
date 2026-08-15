@@ -1,12 +1,8 @@
 # Enabling macOS releases
 
 macOS is opt-in. Until the `MACOS_RELEASE` repository variable is set to
-`true`, tagging builds and publishes Linux alone. This document is the path
-from there to a signed, notarized macOS artifact.
-
-Work through it in order. Part 2 answers the only genuinely open question, and
-it costs nothing — do not buy notarization credentials or touch repository
-settings before it passes.
+`true`, tagging builds and publishes Linux alone. This document is the path to
+a provisioned, Developer ID-signed, notarized macOS artifact.
 
 ## 0. What you need
 
@@ -15,6 +11,8 @@ settings before it passes.
 - A Mac. Signing and notarization both require Apple tooling; neither can be
   done from Linux or from CI without the certificate.
 - Xcode Command Line Tools: `xcode-select --install`.
+- An explicit macOS App ID for `dev.towel.twl` with the Keychain access group
+  `TEAMID.dev.towel.project`, plus a Developer ID provisioning profile for it.
 
 ## 1. Team ID and signing certificate
 
@@ -32,23 +30,46 @@ security find-identity -v -p codesigning
 The line you want reads `Developer ID Application: Your Name (TEAMID)`. Keep
 that full string; it is the signing identity.
 
-## 2. The local test that decides everything
+Create a Developer ID provisioning profile for the explicit bundle identifier
+`dev.towel.twl` in the developer portal. Download the resulting
+`.provisionprofile` file. Towel validates that it is unexpired and authorizes
+the expected team, application identifier, and Keychain access group before it
+signs anything.
+
+## 2. Build and test the provisioned app locally
 
 Towel verifies its own entitlements at startup: the Team ID, the application
 identifier, and the `keychain-access-groups` entry must all be present and
-consistent, or it refuses to open the Keychain. Whether those entitlements
-take effect on a Developer ID binary — as opposed to an App Store one — has
-not been confirmed on real hardware. This is the check that confirms it.
+consistent, or it refuses to open the Keychain.
+
+A real CI run confirmed that a correctly signed bare executable is killed by
+macOS as soon as it starts with the restricted Keychain entitlement. Apple
+requires a provisioning profile, and macOS expects that profile at
+`TowelCLI.app/Contents/embedded.provisionprofile`. Towel therefore follows
+Apple's [app-like bundle layout for command-line
+programs](https://developer.apple.com/documentation/xcode/signing-a-daemon-with-a-restricted-entitlement).
 
 ```bash
 export TWL_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
 export TWL_TEAM_ID=TEAMID
+export TWL_PROVISIONING_PROFILE=/path/to/TowelCLI.provisionprofile
 scripts/build-macos.sh
 ```
 
-The script builds, signs with `config/macos.entitlements`, verifies the
-signature, prints the applied entitlements, and runs `twl doctor`. Read the
-last lines:
+The script creates this bundle, embeds and validates the profile, signs the
+bundle with `config/macos.entitlements`, verifies the signature, prints the
+applied entitlements, and runs `twl doctor`:
+
+```text
+target/release/TowelCLI.app/
+└── Contents/
+    ├── Info.plist
+    ├── MacOS/
+    │   └── twl
+    └── embedded.provisionprofile
+```
+
+Read the last lines:
 
 ```
 protected macOS project sessions: available
@@ -63,7 +84,8 @@ Anything else means it did not work:
 |---|---|
 | `unavailable (trusted project store is unavailable)` | Entitlements did not take effect — see 2.1 |
 | `unavailable (this binary is not protected…)` | Signing or hardened runtime failed; re-check the identity |
-| `TWL_TEAM_ID is required` | The variable is unset |
+| `TWL_TEAM_ID must contain…` | The variable is unset or malformed |
+| `invalid Developer ID provisioning profile: …` | The profile is expired or does not authorize Towel's team, app ID, and access group |
 
 Note that `twl doctor` exits `0` in every case, so read the text rather than
 the exit status.
@@ -71,35 +93,30 @@ the exit status.
 Then exercise it for real, which `doctor` does not do:
 
 ```bash
-./target/release/twl project add scratch     # Touch ID should prompt
-./target/release/twl project list
-./target/release/twl project delete scratch
+./target/release/TowelCLI.app/Contents/MacOS/twl project add scratch
+./target/release/TowelCLI.app/Contents/MacOS/twl project list
+./target/release/TowelCLI.app/Contents/MacOS/twl project delete scratch
 ```
 
 Use a disposable credential. `add` prompting for Touch ID and `list` returning
 the project is the proof that reading and writing both work.
 
-### 2.1 If the access group did not resolve
+### 2.1 If the access group does not resolve
 
-The likely cause is that `application-identifier` and `keychain-access-groups`
-need a provisioning profile to be honoured outside the App Store. Options, in
-the order worth trying:
+Do not remove or weaken the entitlement checks. Inspect the embedded profile
+and signed entitlements instead:
 
-1. Create a macOS Developer ID provisioning profile for the app ID
-   `TEAMID.dev.towel.twl` in the developer portal, and embed it. For a
-   command-line binary this means `--entitlements` plus an embedded profile
-   rather than a bundle, which may require shipping Towel inside an `.app`.
-2. Drop `application-identifier` from `config/macos.entitlements` and keep only
-   `com.apple.developer.team-identifier` and `keychain-access-groups`, then
-   relax the matching check in `effective_access_group()`. This weakens the
-   startup check to team plus access group; decide whether that is acceptable
-   before doing it.
-3. Fall back to the default Keychain by dropping
-   `kSecUseDataProtectionKeychain`. This gives up the guarantee that the store
-   is not a mutable user-selected keychain, and is the option to avoid.
+```bash
+security cms -D -i \
+  target/release/TowelCLI.app/Contents/embedded.provisionprofile
+codesign -d --entitlements - target/release/TowelCLI.app
+```
 
-Whatever the outcome, record it in issue #36 (item A2) — it is the answer to a
-question that is currently open.
+Both must contain `TEAMID.dev.towel.twl` under
+`com.apple.application-identifier` and authorize
+`TEAMID.dev.towel.project` under `keychain-access-groups`. Apple explains why a
+[standalone executable cannot claim a restricted
+entitlement](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles).
 
 ## 3. Prove the conformance suite against a real Keychain
 
@@ -136,10 +153,12 @@ An empty history is success. An authentication error means the values are wrong.
 ## 5. Repository configuration
 
 Export the signing certificate with its private key from Keychain Access as a
-`.p12`, giving it a password, then base64 both files:
+`.p12`, giving it a password, then base64 the certificate, provisioning
+profile, and notarization key:
 
 ```bash
 base64 -i certificate.p12 | pbcopy
+base64 -i TowelCLI.provisionprofile | pbcopy
 base64 -i AuthKey_KEYID.p8 | pbcopy
 ```
 
@@ -152,32 +171,32 @@ job is scoped to it and will not start without it. Add these secrets there:
 | `APPLE_CERTIFICATE_PASSWORD` | password chosen during export |
 | `APPLE_SIGNING_IDENTITY` | `Developer ID Application: Your Name (TEAMID)` |
 | `APPLE_TEAM_ID` | the ten-character Team ID |
+| `APPLE_PROVISIONING_PROFILE_BASE64` | base64 of the Developer ID `.provisionprofile` |
 | `APPLE_API_KEY_P8_BASE64` | base64 of the `.p8` |
 | `APPLE_API_KEY_ID` | Key ID |
 | `APPLE_API_ISSUER_ID` | Issuer ID |
 
-`APPLE_TEAM_ID` is checked before signing: empty or non-alphanumeric fails the
-job rather than producing a binary that cannot open its own Keychain.
+The profile and `APPLE_TEAM_ID` are checked before signing. Missing, expired,
+debug-enabled, or mismatched values fail the job rather than producing a bundle
+that macOS kills or that cannot open its own Keychain.
 
 ## 6. First macOS run
 
-Do not enable macOS and tag in the same step. Dry-run it first:
+Do not add a tag on the first run. Set this repository variable first so the
+macOS jobs are included:
 
-**Actions → Release → Run workflow**, select your branch, `platforms: all`,
-leave `publish` off.
-
-This builds, signs, notarizes, and asserts on `doctor` without publishing.
-Notarization can take several minutes. A failure here costs nothing.
-
-When it is green, set the variable under Settings → Secrets and variables →
-Actions → Variables:
-
-```
+```text
 MACOS_RELEASE = true
 ```
 
-From then on a tag builds and publishes both platforms, and the release run
-reports which platforms it selected.
+If the `release` environment restricts deployment branches, allow the patch
+branch before testing it. Then use **Actions → Release → Run workflow**, select
+that branch, choose `platforms: all`, and leave `tag` empty.
+
+An empty tag makes this a dry run: it builds both Linux packages, creates and
+signs both macOS app bundles, asserts on `doctor`, notarizes and staples them,
+and publishes nothing. Notarization can take several minutes. When all four
+jobs are green, a matching tag can publish both platforms.
 
 ## 7. Recovering a bad release
 
