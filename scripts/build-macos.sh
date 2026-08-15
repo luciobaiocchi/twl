@@ -1,33 +1,30 @@
 #!/bin/sh
 set -eu
 
-identity=${TWL_CODESIGN_IDENTITY:--}
-team_id=${TWL_TEAM_ID:-}
-if [ -z "$team_id" ]; then
-    echo "TWL_TEAM_ID is required for the protected Keychain access group" >&2
-    exit 1
-fi
-case "$team_id" in
-    *[!A-Za-z0-9]*)
-        echo "TWL_TEAM_ID must contain only ASCII letters and digits" >&2
-        exit 1
-        ;;
-esac
+script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
+repository_dir=$(CDPATH= cd "$script_dir/.." && pwd)
+
 if command -v cargo >/dev/null 2>&1; then
     cargo_path=$(command -v cargo)
-elif [ -x "$HOME/.cargo/bin/cargo" ]; then
-    cargo_path="$HOME/.cargo/bin/cargo"
 else
     echo "cargo was not found" >&2
     exit 1
 fi
 
+cd "$repository_dir"
 "$cargo_path" build --release --locked
-entitlements=$(mktemp "${TMPDIR:-/tmp}/twl-entitlements.XXXXXX")
-trap 'rm -f "$entitlements"' EXIT HUP INT TERM
-sed "s/__TEAM_ID__/$team_id/g" config/macos.entitlements >"$entitlements"
-codesign --force --sign "$identity" --options runtime \
-    --entitlements "$entitlements" target/release/twl
-codesign --verify --strict target/release/twl
-codesign -d --entitlements - target/release/twl >/dev/null
-target/release/twl doctor
+version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
+
+TWL_BINARY="$repository_dir/target/release/twl" \
+TWL_APP_BUNDLE="$repository_dir/target/release/TowelCLI.app" \
+TWL_VERSION="$version" \
+    "$script_dir/package-macos-app.sh"
+
+doctor_output=$(mktemp "${TMPDIR:-/tmp}/twl-doctor.XXXXXX")
+trap 'rm -f "$doctor_output"' EXIT HUP INT TERM
+"$repository_dir/target/release/TowelCLI.app/Contents/MacOS/twl" doctor \
+    | tee "$doctor_output"
+if ! grep -q "protected macOS project sessions: available" "$doctor_output"; then
+    echo "signed app bundle cannot open the protected Keychain store" >&2
+    exit 1
+fi

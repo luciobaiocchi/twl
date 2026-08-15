@@ -30,7 +30,7 @@ use std::ptr;
 const SERVICE: &str = "dev.towel.project.v1";
 const ACCOUNT_PREFIX: &str = "project-v1:";
 const ACCESS_GROUP_SUFFIX: &str = "dev.towel.project";
-const APPLICATION_IDENTIFIER: &str = "application-identifier";
+const APPLICATION_IDENTIFIER: &str = "com.apple.application-identifier";
 const TEAM_IDENTIFIER: &str = "com.apple.developer.team-identifier";
 const KEYCHAIN_ACCESS_GROUPS: &str = "keychain-access-groups";
 const ERR_SEC_SUCCESS: OSStatus = errSecSuccess;
@@ -442,5 +442,13 @@ mod tests {
     #[test]
     fn account_names_are_versioned() {
         assert_eq!(account("my-app"), "project-v1:my-app");
+    }
+
+    #[test]
+    fn distribution_template_uses_the_macos_application_identifier() {
+        let entitlements = include_str!("../../config/macos.entitlements");
+        assert_eq!(APPLICATION_IDENTIFIER, "com.apple.application-identifier");
+        assert!(entitlements.contains("<key>com.apple.application-identifier</key>"));
+        assert!(!entitlements.contains("<key>application-identifier</key>"));
     }
 }
