@@ -161,7 +161,7 @@ codesign -d --entitlements - "$staged_bundle"
 # different Developer ID certificate from the one codesign selected. macOS
 # rejects that combination at launch, usually as an otherwise opaque SIGKILL.
 certificate_prefix="$work_dir/signing-certificate-"
-codesign -d --extract-certificates "$certificate_prefix" "$staged_bundle"
+codesign -d --extract-certificates="$certificate_prefix" "$staged_bundle"
 signing_certificate="${certificate_prefix}0"
 if [ ! -f "$signing_certificate" ]; then
     echo "codesign did not expose the leaf signing certificate" >&2
