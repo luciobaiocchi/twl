@@ -12,7 +12,7 @@ on:
         default: all
       tag:
         description: >-
-          Release tag, for example v0.1.0-alpha.1. Must match the version in
+          Release tag, for example v0.1.0-dev.0. Must match the version in
           Cargo.toml. Created on the selected branch once the build passes.
           Leave empty for a dry run that builds and checks everything and
           publishes nothing.

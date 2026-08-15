@@ -1,6 +1,6 @@
 [package]
 name = "twl"
-version = "0.1.0-alpha.1"
+version = "0.1.0-dev.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Keep project credentials out of coding-agent processes"

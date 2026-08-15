@@ -5,6 +5,8 @@ All notable changes to Towel will be documented here. The project uses
 
 ## Unreleased
 
+## 0.1.0-dev.0 - 2026-08-15
+
 ### Added
 
 - V1 agent-native, credential-backed HTTP capabilities with explicit method,
