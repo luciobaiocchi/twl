@@ -144,6 +144,31 @@ fn hostile_host_and_auth_headers_are_ignored() {
 }
 
 #[test]
+fn valid_unknown_header_names_are_ignored() {
+    let (upstream, log) = upstream();
+    let (handle, prefix) = test_proxy(&upstream, None);
+
+    for name in ["X_Test", "X.Test", "X*Test"] {
+        assert_eq!(
+            raw(
+                handle.port,
+                &format!("GET {prefix}/v1/models HTTP/1.1\r\n{name}: ignored"),
+            ),
+            200,
+            "valid unknown header {name} should be ignored",
+        );
+    }
+
+    let seen = log.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    for request in seen.iter() {
+        for name in ["x_test", "x.test", "x*test"] {
+            assert_eq!(request.header(name), None);
+        }
+    }
+}
+
+#[test]
 fn missing_or_wrong_session_token_reaches_nothing() {
     let (upstream, log) = upstream();
     let (handle, _prefix) = test_proxy(&upstream, None);

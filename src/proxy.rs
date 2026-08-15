@@ -1,6 +1,6 @@
 use crate::broker::{
     read_limited, target_url, Broker, BrokerError, BrokerRequest, RequestLimits,
-    DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_MAX_BODY_BYTES, FORWARD_HEADERS,
 };
 use crate::project::HttpMethod;
 use rand::distributions::Alphanumeric;
@@ -191,11 +191,11 @@ fn serve(
     let headers: Vec<(String, String)> = request
         .headers()
         .iter()
-        .map(|header| {
-            (
-                header.field.to_string().to_ascii_lowercase(),
-                header.value.to_string(),
-            )
+        .filter_map(|header| {
+            let name = header.field.to_string().to_ascii_lowercase();
+            FORWARD_HEADERS
+                .contains(&name.as_str())
+                .then(|| (name, header.value.to_string()))
         })
         .collect();
     let body = match read_limited(request.as_reader(), DEFAULT_MAX_BODY_BYTES) {

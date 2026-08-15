@@ -336,7 +336,7 @@ fn cli_canary_demo_proves_protocol_allow_and_deny_without_a_secret_store() {
 
 #[cfg(unix)]
 #[test]
-fn stdio_service_shuts_down_cleanly_on_sigterm() {
+fn stdio_service_refuses_requests_after_sigterm_and_shuts_down_cleanly() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_twl"))
         .args(["capability", "demo", "--stdio"])
         .stdin(Stdio::piped())
@@ -357,9 +357,31 @@ fn stdio_service_shuts_down_cleanly_on_sigterm() {
         true
     );
 
+    // Let the service return to its stdin poll before delivering the signal. This pins the
+    // post-poll latch check rather than only the top-of-loop shutdown check.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
     // SAFETY: the child pid is live and belongs to this test; SIGTERM is handled by the
     // capability service and this test retains the Child handle for cleanup.
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let post_signal_request = b"{\"id\":\"after-signal\",\"op\":\"invoke\",\"capability\":\"demo-read\",\"method\":\"GET\",\"path\":\"/allowed/resource\"}\n";
+    match stdin.write_all(post_signal_request) {
+        Ok(()) => {
+            let _ = stdin.flush();
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("writing post-signal request: {error}"),
+    }
+    drop(stdin);
+
+    let mut post_signal_response = String::new();
+    stdout.read_line(&mut post_signal_response).unwrap();
+    assert!(
+        post_signal_response.is_empty(),
+        "capability service emitted a frame after SIGTERM: {post_signal_response}"
+    );
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {

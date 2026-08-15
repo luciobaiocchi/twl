@@ -387,6 +387,9 @@ impl Read for InterruptibleStdin {
                 }
                 return Err(error);
             }
+            if STDIO_SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                return Ok(0);
+            }
             if descriptor.revents & libc::POLLNVAL != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
