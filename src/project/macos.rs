@@ -33,6 +33,9 @@ const ACCESS_GROUP_SUFFIX: &str = "dev.towel.project";
 const APPLICATION_IDENTIFIER: &str = "application-identifier";
 const TEAM_IDENTIFIER: &str = "com.apple.developer.team-identifier";
 const KEYCHAIN_ACCESS_GROUPS: &str = "keychain-access-groups";
+const ERR_SEC_SUCCESS: OSStatus = errSecSuccess;
+const ERR_SEC_ITEM_NOT_FOUND: OSStatus = errSecItemNotFound;
+const ERR_SEC_DUPLICATE_ITEM: OSStatus = errSecDuplicateItem;
 
 type SecTaskRef = *const c_void;
 
@@ -187,8 +190,8 @@ impl MacKeychainRepository {
         let query = query_for(&self.access_group, name);
         let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), ptr::null_mut()) };
         match status {
-            errSecSuccess => Ok(true),
-            errSecItemNotFound => Ok(false),
+            ERR_SEC_SUCCESS => Ok(true),
+            ERR_SEC_ITEM_NOT_FOUND => Ok(false),
             status => Err(platform("checking protected project", status)),
         }
     }
@@ -280,8 +283,8 @@ impl ProjectRepository for MacKeychainRepository {
         }
         let status = unsafe { SecItemAdd(attributes.as_concrete_TypeRef(), ptr::null_mut()) };
         match status {
-            errSecSuccess => Ok(()),
-            errSecDuplicateItem => Err(StoreError::AlreadyExists),
+            ERR_SEC_SUCCESS => Ok(()),
+            ERR_SEC_DUPLICATE_ITEM => Err(StoreError::AlreadyExists),
             status => Err(platform("creating protected project", status)),
         }
     }
@@ -333,8 +336,8 @@ impl ProjectRepository for MacKeychainRepository {
         let query = query_for(&self.access_group, name);
         let status = unsafe { SecItemDelete(query.as_concrete_TypeRef()) };
         match status {
-            errSecSuccess => Ok(()),
-            errSecItemNotFound => Err(StoreError::NotFound),
+            ERR_SEC_SUCCESS => Ok(()),
+            ERR_SEC_ITEM_NOT_FOUND => Err(StoreError::NotFound),
             status => Err(platform("deleting protected project", status)),
         }
     }
@@ -388,8 +391,7 @@ fn effective_access_group() -> Result<String, StoreError> {
             unsafe { CFArray::wrap_under_get_rule(groups.as_CFTypeRef().cast()) };
         let present = groups.iter().any(|group| {
             group.type_of() == CFString::type_id()
-                && unsafe { CFString::wrap_under_get_rule(group.as_CFTypeRef().cast()) }.to_string()
-                    == expected
+                && unsafe { CFString::wrap_under_get_rule(group.as_CFTypeRef().cast()) } == expected
         });
         if !present {
             return Err(StoreError::UntrustedStore);

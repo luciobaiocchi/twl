@@ -1,9 +1,9 @@
 # Towel (`twl`)
 
-Towel keeps destination-bound application API keys out of coding-agent
-processes. It stores a set of routes under one named project, then opens that
-project for a child command after one macOS authorization or Linux vault
-password prompt.
+Towel keeps destination-bound API keys out of coding-agent processes. It can
+lend the credential's effect through either an application-compatible loopback
+broker or a named, method/path-constrained agent capability. Both interfaces
+use the same trusted routes, protected storage, and credential-injection core.
 
 ```bash
 twl project add my-app
@@ -34,12 +34,12 @@ Here is the thing though: the agent never wanted the key. It wanted the
 is a much smaller thing to give away, and it turns out you can give it away
 without giving anything up.
 
-So Towel keeps the key and lends out the effect. It starts a small HTTP broker
-on loopback, hands the child a random fake key and a `127.0.0.1` URL, and
-substitutes the real credential on the way out — only on the way out, and only
-towards the one destination you registered it for. The agent's code does not
-change. It still reads an API-key variable and a base URL. Those values just
-stopped being worth stealing.
+So Towel keeps the key and lends out the effect. For existing applications, it
+starts a small HTTP broker on loopback, hands the child a random fake key and a
+`127.0.0.1` URL, and substitutes the real credential on the way out. For an
+agent-native operation, a Harness adapter invokes a named capability over a
+private stdio channel instead. In both cases the destination comes from the
+trusted route and the credential stays in Towel.
 
 I would rather be clear about the limits than oversell this. While the session
 is running, the agent can reach the API through the broker, so it can spend
@@ -57,8 +57,16 @@ routes; every route contains:
 
 - an exact HTTPS base URL, optionally including a base path;
 - one static Bearer API key;
-- the API-key environment variable expected by the application;
-- the base-URL environment variable expected by the application.
+- an optional application binding: the API-key and base-URL environment
+  variables expected by an application.
+
+A route can have an application binding, agent capabilities, or both. An agent
+capability stores a name and description, references exactly one route, and
+narrows it with explicit HTTP methods, normalized path prefixes, and a maximum
+response size. Capability policy lives in the same protected project record as
+the credential; repository files cannot create or widen it. Stored format v2
+adds this model, while v1 project records are migrated in memory and remain
+readable without being silently rewritten.
 
 Create and maintain projects with the interactive CLI:
 
@@ -71,9 +79,36 @@ twl project delete <name>
 ```
 
 `add` and `edit` prompt for each route and hide API-key input. `show` displays
-route names, destinations, and environment variable names, but never secret
-values or secret-derived fingerprints. Project and route names are identifiers,
-not paths.
+route names, destinations, optional application bindings, and capability
+policy, but never secret values or secret-derived fingerprints. Project,
+route, and capability names are identifiers, not paths.
+
+Manage v1 HTTP capabilities through the protected project service:
+
+```text
+twl capability add --project <name>
+twl capability list --project <name>
+twl capability show --project <name> <capability>
+twl capability delete --project <name> <capability>
+twl capability serve --project <name> --stdio
+```
+
+`serve` is a private, versioned NDJSON service intended for trusted Harness
+adapters. It exposes discovery and invocation results, never route credentials,
+credential fingerprints, or arbitrary destination selection. The generated
+canary service exercises the same contract without protected storage or a real
+credential:
+
+```bash
+twl capability demo --stdio
+```
+
+The first adapter is the out-of-tree
+[DeepSeek Harness integration](integrations/deepseek-harness/README.md). It
+registers `twl_request`, owns one Towel child process through Harness lifecycle
+effects, and contains no credential-resolution logic. The reproducible mock
+provider run is recorded in the
+[V1 capability validation report](docs/v1-capability-validation.md).
 
 The commands and project format are the same on macOS and Linux. macOS uses the
 application-scoped Keychain backend. Linux uses `$XDG_DATA_HOME/twl/projects.age`,
@@ -112,7 +147,7 @@ persistent mount for the vault directory, and a shared network namespace
 between Towel and its child so loopback broker URLs work. Towel does not create
 or manage that container.
 
-## Session contract
+## Application session contract
 
 Starting `twl run --project NAME -- COMMAND` performs one authorization for the
 entire project session: LocalAuthentication on macOS or one vault-password
@@ -120,7 +155,7 @@ prompt on Linux. Touch ID is used when available; macOS can fall back to the
 configured device-owner authentication. macOS authorization times out after
 120 seconds.
 
-The child receives, for every route, only:
+The child receives, for every application-bound route, only:
 
 - a random fake value in the route's application-facing API-key variable; and
 - a route-specific loopback broker URL in its base-URL variable.
@@ -139,9 +174,18 @@ Towel does not directly place a reusable credential in the child contract. Use
 narrowly scoped, development-only keys and end the child process to end the
 session.
 
+Capability-only routes are not mounted in the application loopback broker. A
+native capability session instead starts
+`twl capability serve --project NAME --stdio`; its adapter owns the child
+pipes, and normal agent-launched subprocesses are not given those descriptors.
+Towel validates the capability name, HTTP method, normalized path, query,
+headers, and body bounds before resolving the trusted route or executing an
+upstream request. Closing stdin, unloading the adapter, or SIGINT/SIGTERM ends
+the session and drops its in-memory route credentials.
+
 ## Broker protections
 
-The broker binds only to loopback and uses an unguessable session prefix. It
+The application broker binds only to loopback and uses an unguessable session prefix. It
 accepts ordinary `GET`, `POST`, `PUT`, `PATCH`, and `DELETE` requests. It
 ignores client authentication, `Host`, proxy, and forwarding headers; never
 follows redirects; rejects malformed paths; disables ambient proxy settings;
@@ -150,8 +194,11 @@ and blocks direct plaintext or common-Base64 credential reflection. It does not
 protect against an authorized upstream that transforms, reflects, or otherwise
 exposes a credential. Responses remain buffered, so streaming is not supported.
 
-Upstreams must use HTTPS. Loopback HTTP exists only for automated tests and the
-generated canary demo.
+The same upstream executor handles application and capability requests, so
+credential injection, header filtering, redirect denial, ambient-proxy
+disabling, request/response bounds, and reflection checks do not diverge.
+Upstreams must use HTTPS. Loopback HTTP exists only for automated tests and
+generated canary demos.
 
 ## Protected macOS build
 
@@ -222,6 +269,15 @@ development hosts:
   python3 examples/application_client.py
 ```
 
+The DeepSeek adapter is checked separately with Node 22 or newer. Its exact
+tested Harness API version is documented in the integration README.
+
+```bash
+cd integrations/deepseek-harness
+npm ci --ignore-scripts
+npm run check
+```
+
 ## Explicit non-goals
 
 This version does not provide Linux Secret Service integration, custom
@@ -230,4 +286,7 @@ isolation, configurable sandbox policies, a daemon or control plane,
 provider-specific profiles, repository-controlled destinations, arbitrary
 authentication templates, or transparent TLS interception. The agent's own
 Codex/OpenHands/model login and ambient files, sockets, and unrelated secrets
-are outside Towel's boundary.
+are outside Towel's boundary. V1 capabilities cover only credential-backed HTTP
+requests; filesystem, shell/process, Git, generic secret retrieval, approval
+flows, profiles, skill manifests, OAuth minting, delegation, and remote or
+multi-user grants are intentionally not implemented.

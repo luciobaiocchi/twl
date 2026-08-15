@@ -1,0 +1,35 @@
+#!/usr/bin/env node
+import readline from 'node:readline'
+
+const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
+for await (const line of lines) {
+  const request = JSON.parse(line)
+  if (request.op === 'hello') {
+    write({ ok: true, protocol: 1, server: 'twl', capability_count: 1 })
+  } else if (request.op === 'list') {
+    write({
+      id: request.id,
+      ok: true,
+      capabilities: [{
+        name: 'github-read',
+        description: 'Read repository data.',
+        methods: ['GET'],
+        path_prefixes: ['/repos/'],
+        max_response_bytes: 1048576,
+      }],
+    })
+  } else if (request.op === 'invoke') {
+    write({
+      id: request.id,
+      ok: true,
+      status: 200,
+      content_type: 'application/json',
+      body_encoding: 'base64',
+      body: Buffer.from('{"adapter":true}').toString('base64'),
+    })
+  }
+}
+
+function write(value) {
+  process.stdout.write(`${JSON.stringify(value)}\n`)
+}

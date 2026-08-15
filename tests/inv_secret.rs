@@ -1,5 +1,5 @@
 use twl::config::{validate_upstream, Config};
-use twl::project::{Project, ProjectRoute};
+use twl::project::{AgentCapability, HttpMethod, Project, ProjectRoute};
 use twl::{child_command, prepare_project};
 
 const BILLING_KEY: &str = "billing-canary-real-key-0123456789";
@@ -61,6 +61,69 @@ fn child_receives_fake_keys_and_route_specific_loopback_urls() {
         assert!(!value.contains("billing.example.test"));
         assert!(!value.contains("search.example.test"));
     }
+}
+
+#[test]
+fn application_sessions_exclude_capability_only_routes() {
+    let project = Project::with_capabilities(
+        "mixed".into(),
+        vec![
+            ProjectRoute::new(
+                "application".into(),
+                "https://application.example.test".into(),
+                "application-real-key".into(),
+                "APP_KEY".into(),
+                "APP_URL".into(),
+            )
+            .unwrap(),
+            ProjectRoute::agent_only(
+                "github".into(),
+                "https://api.github.com".into(),
+                "github-real-key".into(),
+            )
+            .unwrap(),
+        ],
+        vec![AgentCapability::new(
+            "github-read".into(),
+            "Read repository data.".into(),
+            "github".into(),
+            [HttpMethod::GET],
+            vec!["/repos/".into()],
+            1 << 20,
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    let prepared = prepare_project(project).unwrap();
+    let (handle, variables) = prepared.start(None).unwrap();
+    assert!(variables.iter().all(|(_, value)| !value.contains("github")));
+    let hidden = format!(
+        "http://127.0.0.1:{}/{}/github/repos/luciobaiocchi/twl",
+        handle.port, handle.token
+    );
+    assert!(matches!(
+        ureq::get(&hidden).call(),
+        Err(ureq::Error::Status(404, _))
+    ));
+}
+
+#[test]
+fn application_mode_rejects_projects_without_application_bindings() {
+    let project = Project::new(
+        "agent-only".into(),
+        vec![ProjectRoute::agent_only(
+            "github".into(),
+            "https://api.github.com".into(),
+            "github-real-key".into(),
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    let error = match prepare_project(project) {
+        Ok(_) => panic!("agent-only project unexpectedly entered application mode"),
+        Err(error) => error,
+    };
+    assert_eq!(error, "project has no application-bound routes");
 }
 
 #[test]
