@@ -33,8 +33,9 @@ that full string; it is the signing identity.
 Create a Developer ID provisioning profile for the explicit bundle identifier
 `dev.towel.twl` in the developer portal. Download the resulting
 `.provisionprofile` file. Towel validates that it is unexpired and authorizes
-the expected team, application identifier, and Keychain access group before it
-signs anything.
+the expected team, application identifier, and Keychain access group. After
+signing, it also verifies that the profile contains the exact leaf certificate
+selected by `codesign`.
 
 ## 2. Build and test the provisioned app locally
 

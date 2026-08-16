@@ -217,7 +217,7 @@ scripts/build-macos.sh
 ```
 
 The script validates the profile's team, app identifier, Keychain access group,
-expiry, and distribution settings before signing
+expiry, distribution settings, and exact signing certificate before packaging
 `target/release/TowelCLI.app`. It then runs
 `TowelCLI.app/Contents/MacOS/twl doctor` and fails unless protected project
 sessions are available. Ad-hoc signing is not supported because it cannot
