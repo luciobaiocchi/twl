@@ -5,18 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="Towel keeps project API keys out of coding-agent processes while letting local applications use them through a constrained broker."
+      content="Towel lets AI agents use authenticated services — GitHub, internal APIs, paid SaaS — while the reusable credentials stay in a separate trusted process."
     />
     <meta name="theme-color" content="#f52f9a" />
-    <meta property="og:title" content="Towel — project credentials for agent-run apps" />
+    <meta property="og:title" content="Towel — give agents capabilities, not credentials" />
     <meta
       property="og:description"
-      content="Let the agent run the app. Keep the real project key in a separate process."
+      content="Give AI agents access to APIs without giving them the API keys."
     />
     <meta property="og:type" content="website" />
-    <meta property="og:image" content="twl_logo.svg" />
-    <title>Towel — keep project keys out of agent processes</title>
-    <link rel="icon" href="twl_logo.svg" type="image/svg+xml" />
+    <meta property="og:image" content="https://luciobaiocchi.github.io/twl/twl_logo.png" />
+    <title>Towel — give agents capabilities, not credentials</title>
+    <link rel="icon" href="twl_logo.png" type="image/png" />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -24,7 +24,7 @@
 
     <header class="site-header">
       <a class="brand" href="#top" aria-label="Towel home">
-        <img src="twl_logo.svg" width="38" height="38" alt="" />
+        <img src="twl_logo.png" width="38" height="38" alt="" />
         <span>Towel</span>
         <code>twl</code>
       </a>
@@ -41,52 +41,50 @@
       <section class="hero" id="top">
         <div class="hero-copy">
           <div class="eyebrow"><span></span> Experimental · macOS + Linux</div>
-          <h1>Let the agent run the app.<br /><em>Keep the key out of sight.</em></h1>
+          <h1>Give agents capabilities,<br /><em>not credentials.</em></h1>
           <p class="hero-lead">
-            Towel is a small credential broker for projects operated by coding
-            agents. One named project holds multiple protected routes.
-            The child gets fake keys and loopback URLs; real keys stay in the
-            trusted parent and reach only their fixed services.
+            Your agent needs GitHub, an internal API, or another authenticated
+            service. Normally that means putting a reusable secret inside the
+            agent process. Towel keeps the credential in a separate trusted
+            process and gives the agent only the authority it needs.
           </p>
           <div class="hero-actions">
-            <a class="button primary" href="https://github.com/luciobaiocchi/twl">View the source</a>
-            <a class="button secondary" href="#try-it">Run the canary demo</a>
+            <a class="button primary" href="#try-it">Try it in 30 seconds</a>
+            <a class="button secondary" href="https://github.com/luciobaiocchi/twl">View the source</a>
           </div>
           <p class="small-print">Apache-2.0 · Keychain or age vault · no TLS interception</p>
         </div>
 
         <div class="hero-stage">
           <div class="logo-card">
-            <span class="pixel-label">PROJECT CREDENTIAL ARMOR</span>
-            <img src="twl_logo.svg" alt="A bright pink pixel-art towel on a rail" />
-            <span class="pixel-sticker" aria-hidden="true">SAFE<br />BY<br />DESIGN</span>
+            <span class="pixel-label">CAPABILITIES, NOT KEYS</span>
+            <img src="twl_logo.png" alt="A bright pink pixel-art towel on a rail" />
+            <span class="pixel-sticker" aria-hidden="true">DON'T<br />PANIC</span>
           </div>
 
-          <div class="terminal-wrap" aria-label="Example Towel terminal session">
+          <div class="terminal-wrap" aria-label="Example Towel capability flow">
             <div class="terminal-bar">
               <div class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></div>
-              <span>project — twl</span>
+              <span>capability — twl</span>
               <strong>DON'T PANIC</strong>
             </div>
-            <pre><code><span class="prompt">$</span> twl project add my-app
-<span class="muted"># interactively add one or more HTTPS Bearer routes</span>
+            <pre><code><span class="muted"># The agent asks for a named capability</span>
+<span class="prompt">→</span> twl_request <span class="safe">github-read</span>
+    GET /repos/my-org/my-repo/pulls
 
-<span class="prompt">$</span> twl run --project my-app -- codex
-<span class="muted"># authorize once with Touch ID or the Linux vault password</span>
+<span class="muted"># Towel adds the real token and forwards it</span>
+<span class="prompt">←</span> <span class="safe">200 application/json</span>
 
 <span class="muted"># Inside the agent process</span>
-<span class="prompt">$</span> printenv APP_API_KEY
-<span class="safe">twl-app-N7m...fake</span>
-
-<span class="prompt">$</span> python app.py
-<span class="safe">✓ authenticated through the fixed upstream</span></code></pre>
+<span class="prompt">$</span> printenv GITHUB_TOKEN
+<span class="muted">(nothing — the token never went there)</span></code></pre>
           </div>
         </div>
       </section>
 
       <div class="signal-strip" aria-label="Towel properties">
-        <span>PROTECTED STORAGE</span><i></i>
-        <span>LOOPBACK ONLY</span><i></i>
+        <span>NAMED CAPABILITIES</span><i></i>
+        <span>METHOD + PATH LIMITS</span><i></i>
         <span>FIXED DESTINATION</span><i></i>
         <span>REAL KEYS STAY HIDDEN</span>
       </div>
@@ -95,30 +93,30 @@
         <div class="section-heading">
           <span>01 / Architecture</span>
           <h2>One small process boundary</h2>
-          <p>No provider catalog or custom cryptography. A macOS Keychain record or Linux password-encrypted age vault binds every project route to its credential and exact destination.</p>
+          <p>The agent names a capability. It never names a host, and it never holds the key. A macOS Keychain record or Linux password-encrypted age vault binds every route to its credential, its exact destination, and the capability policy that narrows it.</p>
         </div>
 
         <div class="flow" aria-label="Request flow">
-          <article class="flow-card trusted">
-            <div class="flow-icon key-icon" aria-hidden="true"></div>
-            <small>Trusted parent</small>
-            <h3>Towel</h3>
-            <p>Opens one authorized project record before launching the agent.</p>
-            <code>real keys · fixed URLs</code>
-          </article>
-          <div class="flow-arrow" aria-hidden="true"><span>fake env</span>→</div>
           <article class="flow-card agent">
             <div class="flow-icon eye-icon" aria-hidden="true"></div>
-            <small>Child process</small>
-            <h3>Agent + app</h3>
-            <p>Uses normal environment-based application configuration.</p>
-            <code>twl-app-… · 127.0.0.1</code>
+            <small>Untrusted</small>
+            <h3>Agent + Harness</h3>
+            <p>Invokes a capability by name through a private stdio channel.</p>
+            <code>github-read</code>
           </article>
-          <div class="flow-arrow" aria-hidden="true"><span>HTTP request</span>→</div>
+          <div class="flow-arrow" aria-hidden="true"><span>capability</span>→</div>
+          <article class="flow-card trusted">
+            <div class="flow-icon key-icon" aria-hidden="true"></div>
+            <small>Trusted process</small>
+            <h3>Towel</h3>
+            <p>Checks method, path and bounds, then injects the real credential.</p>
+            <code>real keys · fixed URLs</code>
+          </article>
+          <div class="flow-arrow" aria-hidden="true"><span>HTTPS request</span>→</div>
           <article class="flow-card service">
             <div class="flow-icon node-icon" aria-hidden="true"></div>
             <small>Allowed destination</small>
-            <h3>Project service</h3>
+            <h3>External service</h3>
             <p>Receives the request with real Bearer authentication.</p>
             <code>HTTPS · no redirects</code>
           </article>
@@ -128,18 +126,18 @@
       <section class="features">
         <article>
           <span class="feature-number">A</span>
-          <h3>Zero real key in the child</h3>
-          <p>Stored values and destinations are never supplied through child environment variables, arguments, plaintext files, or descriptors.</p>
+          <h3>Agent-native capabilities</h3>
+          <p>A Harness invokes named capabilities such as <code>github-read</code>, constrained by HTTP method, normalized path prefix, destination, and response size.</p>
         </article>
         <article>
           <span class="feature-number">B</span>
-          <h3>Destination stays fixed</h3>
-          <p>Repository-controlled files cannot redirect where the broker places authentication.</p>
+          <h3>Existing applications too</h3>
+          <p>For software that already reads a key from the environment, Towel hands the child a fake key and a loopback URL, then substitutes the real credential on the way out.</p>
         </article>
         <article>
           <span class="feature-number">C</span>
-          <h3>Small enough to inspect</h3>
-          <p>A focused Rust binary with route-binding regressions, a demo-only request budget, and explicit limitations.</p>
+          <h3>First integration: DeepSeek Harness</h3>
+          <p>A <code>twl_request</code> tool owns one Towel child process through Harness lifecycle effects and contains no credential-resolution logic.</p>
         </article>
       </section>
 
@@ -147,14 +145,15 @@
         <div class="section-heading">
           <span>02 / Security boundary</span>
           <h2>Useful protection, precise claims</h2>
+          <p>Towel keeps the reusable credential out of the agent. It does not make the authority behind that credential harmless: anything the granted capability can legitimately access is still available to the agent.</p>
         </div>
         <div class="boundary-grid">
           <div class="boundary-column protects">
             <h3><span>✓</span> Towel protects</h3>
             <ul>
-              <li>Real project keys and destinations from the child environment</li>
-              <li>Trusted-store destinations from workspace edits</li>
-              <li>Authentication from hostile client headers</li>
+              <li>The reusable credential from the agent process, its environment, and its descriptors</li>
+              <li>Trusted-store destinations from workspace edits and prompt injection</li>
+              <li>Method, path, and response bounds, enforced before any upstream request</li>
               <li>Direct plaintext and common-Base64 key reflection</li>
             </ul>
           </div>
@@ -162,8 +161,8 @@
             <h3><span>×</span> Towel is not</h3>
             <ul>
               <li>A sandbox or general-purpose secret manager</li>
+              <li>A limit on what the granted capability can legitimately reach</li>
               <li>Protection for the agent's own model login</li>
-              <li>A guard against actions performed through the broker</li>
               <li>Protection from an authorized upstream that transforms or exposes a key</li>
             </ul>
           </div>
@@ -178,9 +177,9 @@
           </div>
           <p>
             The demo creates a canary credential and a local service, then runs
-            the same Python application contract used by a real session. This
-            canary demo works cross-platform; real project sessions use a
-            protected macOS binary or the Linux password-encrypted age vault.
+            the same application contract used by a real session. Nothing
+            touches a real account. <code>twl capability demo --stdio</code>
+            exercises the capability protocol the same way.
           </p>
           <div class="status-line"><i></i> No account, no credential, no install — the demo generates both sides.</div>
         </div>
@@ -191,7 +190,9 @@
     --config examples/towel.yaml \
     -- python3 examples/application_client.py
 
-<span class="safe">{"app":"ok","authenticated":true}</span></code></pre>
+<span class="muted">twl: demo mode uses a generated canary; no real credential is read</span>
+<span class="safe">{"app": "ok", "upstream": {"path": "/v1/models",
+  "headers": {"authorization": "&lt;received, 47 bytes&gt;", …}}}</span></code></pre>
         </div>
       </section>
 
@@ -199,24 +200,24 @@
         <div class="try-copy">
           <div class="section-heading">
             <span>04 / Install</span>
-            <h2>Static binaries, verified</h2>
+            <h2>Signed, notarized, verified</h2>
           </div>
           <p>
-            Prebuilt musl binaries for x86_64 and aarch64 are statically linked,
-            so they run on any distribution with nothing else installed.
-            Bubblewrap is optional and only adds vault masking. Every archive
-            carries a build-provenance attestation — check it before you trust
-            a security tool you downloaded.
+            Prebuilt archives cover macOS (Apple Silicon and Intel) and Linux
+            (x86-64 and ARM64). Linux binaries are statically linked against
+            musl and run on any distribution with nothing else installed. macOS
+            archives contain a Developer ID-signed, notarized and stapled
+            <code>TowelCLI.app</code>, so Gatekeeper accepts it directly.
           </p>
-          <div class="status-line"><i></i> The first alpha publishes Linux artifacts only. macOS runs from a signed local build until its Developer ID path is verified.</div>
+          <div class="status-line"><i></i> Every archive carries a build-provenance attestation — check it before you trust a security tool you downloaded.</div>
           <div class="hero-actions">
             <a class="button primary" href="https://github.com/luciobaiocchi/twl/releases">Releases <b>↗</b></a>
-            <a class="button secondary" href="https://github.com/luciobaiocchi/twl/blob/main/docs/macos-release.md">macOS setup <b>↗</b></a>
+            <a class="button secondary" href="https://github.com/luciobaiocchi/twl#try-it-in-30-seconds">Download commands <b>↗</b></a>
           </div>
         </div>
         <div class="code-card">
           <div class="code-title"><span>Install + verify</span><code>bash</code></div>
-          <pre><code><span class="muted"># download from the releases page, then</span>
+          <pre><code><span class="muted"># Linux — download from the releases page, then</span>
 <span class="prompt">$</span> tar xzf twl-*-x86_64-unknown-linux-musl.tar.gz
 <span class="prompt">$</span> gh attestation verify twl-*/twl \
     --repo luciobaiocchi/twl
@@ -229,7 +230,7 @@
       </section>
 
       <section class="lore">
-        <img src="twl_logo.svg" width="86" height="86" alt="Pink pixel-art towel logo" />
+        <img src="twl_logo.png" width="86" height="86" alt="Pink pixel-art towel logo" />
         <div>
           <span>A small literary nod</span>
           <h2>Why a towel?</h2>
@@ -257,7 +258,7 @@
 
     <footer>
       <a class="brand" href="#top">
-        <img src="twl_logo.svg" width="30" height="30" alt="" />
+        <img src="twl_logo.png" width="30" height="30" alt="" />
         <span>Towel</span>
       </a>
       <p>Experimental security software. Use narrow, disposable credentials.</p>
