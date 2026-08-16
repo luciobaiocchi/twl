@@ -99,20 +99,38 @@ pub fn authorize(_reason: &str) -> Result<(), String> {
     Err("project credentials are currently available only on macOS".into())
 }
 
+#[cfg(any(target_os = "macos", test))]
+const CS_VALID: u32 = 0x0000_0001;
+#[cfg(any(target_os = "macos", test))]
+const CS_GET_TASK_ALLOW: u32 = 0x0000_0004;
+#[cfg(any(target_os = "macos", test))]
+const CS_ENTITLEMENTS_VALIDATED: u32 = 0x0000_4000;
+#[cfg(any(target_os = "macos", test))]
+const CS_RUNTIME: u32 = 0x0001_0000;
+#[cfg(any(target_os = "macos", test))]
+const CS_DEBUGGED: u32 = 0x1000_0000;
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_macos_code_signing_flags(flags: u32) -> Result<(), String> {
+    // CS_RUNTIME is the authoritative hardened-runtime bit. codesign(1)
+    // documents that it includes enforcement, library validation, hard/kill,
+    // and debugging restrictions. Modern macOS does not necessarily mirror
+    // those inherited policies into the older individual CS_* status bits.
+    let required = CS_VALID | CS_ENTITLEMENTS_VALIDATED | CS_RUNTIME;
+    let forbidden = CS_GET_TASK_ALLOW | CS_DEBUGGED;
+    if flags & required != required || flags & forbidden != 0 {
+        return Err(format!(
+            "this binary is not protected for real credentials (code-signing flags {flags:#010x}); build it with `scripts/build-macos.sh`"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 pub fn process_preflight() -> Result<(), String> {
     use std::ffi::c_void;
 
     const CS_OPS_STATUS: u32 = 0;
-    const CS_VALID: u32 = 0x0000_0001;
-    const CS_GET_TASK_ALLOW: u32 = 0x0000_0004;
-    const CS_FORCED_LV: u32 = 0x0000_0010;
-    const CS_HARD: u32 = 0x0000_0100;
-    const CS_KILL: u32 = 0x0000_0200;
-    const CS_ENFORCEMENT: u32 = 0x0000_1000;
-    const CS_REQUIRE_LV: u32 = 0x0000_2000;
-    const CS_RUNTIME: u32 = 0x0001_0000;
-    const CS_DEBUGGED: u32 = 0x1000_0000;
 
     unsafe extern "C" {
         fn csops(pid: i32, ops: u32, address: *mut c_void, size: usize) -> i32;
@@ -134,17 +152,7 @@ pub fn process_preflight() -> Result<(), String> {
         ));
     }
 
-    let required = CS_VALID | CS_HARD | CS_KILL | CS_ENFORCEMENT | CS_RUNTIME;
-    let library_validation = flags & (CS_FORCED_LV | CS_REQUIRE_LV) != 0;
-    if flags & required != required
-        || !library_validation
-        || flags & (CS_GET_TASK_ALLOW | CS_DEBUGGED) != 0
-    {
-        return Err(format!(
-            "this binary is not protected for real credentials (code-signing flags {flags:#010x}); build it with `scripts/build-macos.sh`"
-        ));
-    }
-    Ok(())
+    validate_macos_code_signing_flags(flags)
 }
 
 #[cfg(target_os = "linux")]
@@ -208,5 +216,27 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("timed out"));
         assert!(invalidated.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn current_macos_hardened_runtime_flags_are_accepted() {
+        // Observed on both GitHub macOS runners for a Developer ID-signed,
+        // profile-authorized app using `codesign --options runtime`.
+        assert!(validate_macos_code_signing_flags(0x2201_4201).is_ok());
+    }
+
+    #[test]
+    fn macos_preflight_requires_each_security_property() {
+        let protected = CS_VALID | CS_ENTITLEMENTS_VALIDATED | CS_RUNTIME;
+        for required in [CS_VALID, CS_ENTITLEMENTS_VALIDATED, CS_RUNTIME] {
+            assert!(validate_macos_code_signing_flags(protected & !required).is_err());
+        }
+    }
+
+    #[test]
+    fn macos_preflight_rejects_debuggable_processes() {
+        let protected = CS_VALID | CS_ENTITLEMENTS_VALIDATED | CS_RUNTIME;
+        assert!(validate_macos_code_signing_flags(protected | CS_GET_TASK_ALLOW).is_err());
+        assert!(validate_macos_code_signing_flags(protected | CS_DEBUGGED).is_err());
     }
 }
